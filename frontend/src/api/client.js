@@ -399,6 +399,16 @@ export const getContributors = () => api.get('/github/contributors').then(r => r
 export const getSupporters = () => api.get('/community/supporters').then(r => r.data)
 export const getRescueDonations = () => api.get('/github/rescue-donations').then(r => r.data)
 
+// Decks (preconstructed-deck completion tracking)
+export const searchDecks = (q) => api.get('/decks/search', { params: { q } }).then(r => r.data)
+export const parseDeckPage = (title, productType = null) =>
+  api.post('/decks/parse', { title, product_type: productType }).then(r => r.data)
+export const saveDeck = (data) => api.post('/decks/', data).then(r => r.data)
+export const getDeckInstances = () => api.get('/decks/instances').then(r => r.data)
+export const getDeckInstance = (id) => api.get(`/decks/instances/${id}`).then(r => r.data)
+export const resetDeckInstance = (id) => api.post(`/decks/instances/${id}/reset`).then(r => r.data)
+export const deleteDeckInstance = (id) => api.delete(`/decks/instances/${id}`).then(r => r.data)
+
 // Social
 export const getLeaderboard = (params = {}) => api.get('/social/leaderboard', { params })
 export const compareUsers = (userId, params = {}) => api.get(`/social/compare/${userId}`, { params })

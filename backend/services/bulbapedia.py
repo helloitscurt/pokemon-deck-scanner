@@ -11,6 +11,7 @@ a two-deck box), so parsing returns every block found; callers let the user
 pick which one if there's more than one.
 """
 import datetime
+import html
 import re
 from typing import Any, Dict, List, Optional
 
@@ -59,7 +60,10 @@ def search_bulbapedia(query: str, limit: int = 8) -> List[dict]:
     results = []
     for row in data.get("query", {}).get("search", []):
         title = row["title"]
-        snippet = re.sub(r"<[^>]+>", "", row.get("snippet", ""))
+        # MediaWiki's search snippet is HTML: strip the <span> highlight tags,
+        # then decode entities (its own &amp; escaping) so "&" doesn't render
+        # literally as "&amp;" in the UI.
+        snippet = html.unescape(re.sub(r"<[^>]+>", "", row.get("snippet", "")))
         results.append({
             "title": title,
             "url": BULBAPEDIA_WIKI + title.replace(" ", "_"),
