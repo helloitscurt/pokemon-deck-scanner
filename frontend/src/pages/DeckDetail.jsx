@@ -7,10 +7,10 @@ import { getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection
 import { useSettings } from '../contexts/SettingsContext'
 import { useConfirmDialog } from '../contexts/ConfirmDialogContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
-import { CardRow } from '../components/card-system'
 import { CardModal } from '../components/CardItem'
+import { CompactCardArtwork } from '../components/UnifiedCard'
 import DeckCardScanner from '../components/DeckCardScanner'
-import { isDeckCardMissing, missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
+import { missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
 
 export default function DeckDetail() {
   const { instanceId } = useParams()
@@ -108,7 +108,6 @@ export default function DeckDetail() {
   const progress = Math.min(100, Math.max(0, Number(data.progress) || 0))
   const hpClass = progress >= 66 ? 'healthy' : progress >= 33 ? 'medium' : 'low'
   const cards = data.cards || []
-  const missingCards = cards.filter(isDeckCardMissing)
   const visibleCards = selectVisibleDeckCards(cards, filter)
 
   return (
@@ -156,9 +155,9 @@ export default function DeckDetail() {
 
       <div className="flex w-full min-w-0 gap-2 overflow-x-auto pb-1">
         {[
-          { key: 'missing', label: `${t('decks.detail.missing')} (${missingCards.length})` },
-          { key: 'found', label: `${t('decks.detail.found')} (${cards.length - missingCards.length})` },
-          { key: 'all', label: `${t('decks.detail.all')} (${cards.length})` },
+          { key: 'missing', label: `${t('decks.detail.missing')} (${data.total_count - data.scanned_count})` },
+          { key: 'found', label: `${t('decks.detail.found')} (${data.scanned_count})` },
+          { key: 'all', label: `${t('decks.detail.all')} (${data.total_count})` },
         ].map(({ key, label }) => (
           <button
             key={key}
@@ -185,19 +184,22 @@ export default function DeckDetail() {
           {visibleCards.map((deckCard) => {
             const missing = missingQuantity(deckCard)
             return (
-              <CardRow
+              <button
                 key={deckCard.card_id}
-                card={deckCard.card}
-                image={resolveCardImageUrl(deckCard.card, 'small')}
-                name={deckCard.card?.name}
-                subtext={deckCard.card?.set_ref?.name}
-                setNumber={deckCard.card?.number ? `#${deckCard.card.number}` : null}
-                badges={[{
-                  label: missing > 0 ? `${missing} ${t('decks.detail.missingCount')}` : t('decks.detail.foundLabel'),
-                  variant: missing > 0 ? 'red' : 'green',
-                }]}
                 onClick={() => setSelectedCard(deckCard.card)}
-              />
+                className="flex w-full items-center gap-3 rounded-xl border border-[rgba(255,255,255,0.05)] bg-[rgba(20,20,40,0.6)] p-3 text-left backdrop-blur-xl transition-all duration-200 hover:border-brand-red/30 hover:bg-bg-elevated hover:shadow-glow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red/70"
+              >
+                <CompactCardArtwork card={deckCard.card} image={resolveCardImageUrl(deckCard.card, 'small')} alt={deckCard.card?.name} />
+                <div className="min-w-0 flex-1">
+                  <p className="truncate text-sm font-semibold text-text-primary">{deckCard.card?.name}</p>
+                  {deckCard.card?.number && (
+                    <p className="font-mono text-[10px] text-text-muted">#{deckCard.card.number}</p>
+                  )}
+                </div>
+                <p className={`flex-shrink-0 text-lg font-bold ${missing > 0 ? 'text-brand-red' : 'text-green'}`}>
+                  {missing > 0 ? `${missing} ${t('decks.detail.missingCount')}` : t('decks.detail.foundLabel')}
+                </p>
+              </button>
             )
           })}
         </div>
