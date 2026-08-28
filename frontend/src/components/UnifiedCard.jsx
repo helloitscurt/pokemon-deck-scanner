@@ -1,5 +1,5 @@
 import clsx from 'clsx'
-import { Check, Plus, X } from 'lucide-react'
+import { Check, Plus, X, ZoomIn } from 'lucide-react'
 import { useEffect, useId, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { useSettings } from '../contexts/SettingsContext'
@@ -7,6 +7,7 @@ import { getCardVariantEffectClass } from '../utils/cardVariantEffect'
 import CardImage from './CardImage'
 import FallbackBadges from './FallbackBadges'
 import CardStateIndicators from './CardStateIndicators'
+import ImageZoomOverlay from './ImageZoomOverlay'
 import { CARD_SYSTEM_TOKENS } from './card-system/tokens'
 
 export const FALLBACK_KIND_ORDER = ['data', 'price', 'image']
@@ -242,10 +243,15 @@ export function UnifiedCardDialog({
   const onCloseRef = useRef(onClose)
   const dialogRef = useRef(null)
   const tabIdPrefix = useId().replace(/:/g, '')
+  const [imageZoomOpen, setImageZoomOpen] = useState(false)
 
   useEffect(() => {
     onCloseRef.current = onClose
   }, [onClose])
+
+  useEffect(() => {
+    setImageZoomOpen(false)
+  }, [card?.id])
 
   useEffect(() => {
     if (!card) return undefined
@@ -321,16 +327,32 @@ export function UnifiedCardDialog({
         <div className="grid gap-4 p-4 sm:grid-cols-[minmax(220px,300px)_minmax(0,1fr)] sm:gap-6 sm:p-6">
           <aside className="min-w-0 sm:border-r sm:border-white/8 sm:pr-6">
             <div className="flex items-start gap-4 sm:block">
-              <div className="w-24 flex-shrink-0 sm:w-full">
-                <CardArtworkFrame
-                  card={card}
-                  image={image}
-                  overlay={imageOverlay}
-                  alt={card.name}
-                  variantEffectSource={variantEffectSource}
-                  showStateIndicators={false}
-                  loading="eager"
-                />
+              <div className="relative w-24 flex-shrink-0 sm:w-full">
+                <button
+                  type="button"
+                  className={clsx('block w-full rounded-xl text-left', image && 'cursor-zoom-in')}
+                  onClick={() => image && setImageZoomOpen(true)}
+                  disabled={!image}
+                  aria-label={image ? `${t('card.zoomImage')} — ${card.name}` : undefined}
+                >
+                  <CardArtworkFrame
+                    card={card}
+                    image={image}
+                    overlay={imageOverlay}
+                    alt={card.name}
+                    variantEffectSource={variantEffectSource}
+                    showStateIndicators={false}
+                    loading="eager"
+                  />
+                </button>
+                {image && (
+                  <span
+                    className="pointer-events-none absolute right-2 top-2 z-20 grid h-7 w-7 place-items-center rounded-full border border-white/15 bg-black/75 text-white shadow-lg"
+                    aria-hidden="true"
+                  >
+                    <ZoomIn size={14} />
+                  </span>
+                )}
               </div>
               <div className="min-w-0 flex-1 pr-9 sm:mt-4 sm:pr-0">
                 <h2 className="break-words text-base font-black text-text-primary sm:text-xl">{card.name}</h2>
@@ -404,7 +426,14 @@ export function UnifiedCardDialog({
     </div>
   )
 
-  return createPortal(dialog, document.body)
+  return (
+    <>
+      {createPortal(dialog, document.body)}
+      {imageZoomOpen && image && (
+        <ImageZoomOverlay src={image} alt={card.name} onClose={() => setImageZoomOpen(false)} />
+      )}
+    </>
+  )
 }
 
 export function CardCaption({

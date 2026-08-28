@@ -1238,6 +1238,7 @@ const en = {
 
   // Card modal
   card: {
+    zoomImage: 'View full size',
     rarity: 'Rarity',
     availableVariants: 'Available',
     type: 'Type',
