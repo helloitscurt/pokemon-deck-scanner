@@ -138,6 +138,10 @@ class CollectionItemCreate(BaseModel):
     variant: Optional[str] = "Normal"
     purchase_price: Optional[float] = None
     lang: str = "en"  # fixed TCGdex language of this card item
+    # When set, also counts this card toward the given deck-instance's scan
+    # progress (see api/decks.py::register_scan). No effect if the instance
+    # isn't the current user's, or this card isn't part of that deck.
+    deck_instance_id: Optional[int] = None
 
 
 class CollectionItemUpdate(BaseModel):
@@ -546,3 +550,87 @@ class SyncLogResponse(BaseModel):
 class ProfileUpdate(BaseModel):
     is_profile_public: Optional[bool] = None
     public_show_values: Optional[bool] = None
+
+
+class DeckCardEntry(BaseModel):
+    card_id: str
+    expected_quantity: int = Field(default=1, ge=1, le=99)
+
+
+class DeckCreate(BaseModel):
+    name: str
+    product_type: Optional[str] = None
+    source_url: Optional[str] = None
+    cards: List[DeckCardEntry] = Field(min_length=1)
+
+
+class DeckCardResponse(BaseModel):
+    card_id: str
+    expected_quantity: int
+    scanned_quantity: int = 0
+    card: Optional[CardWithSet] = None
+
+    class Config:
+        from_attributes = True
+
+
+class DeckInstanceResponse(BaseModel):
+    id: int
+    deck_id: int
+    name: str
+    product_type: Optional[str] = None
+    source_url: Optional[str] = None
+    created_at: Optional[datetime] = None
+    total_count: int = 0
+    scanned_count: int = 0
+    progress: float = 0
+    is_complete: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+class DeckInstanceDetailResponse(DeckInstanceResponse):
+    cards: List[DeckCardResponse] = Field(default_factory=list)
+
+
+class DeckSearchResult(BaseModel):
+    title: str
+    url: str
+    snippet: Optional[str] = None
+
+
+class DeckParseRequest(BaseModel):
+    title: str
+    product_type: Optional[str] = None
+
+
+class DeckParseCandidate(BaseModel):
+    id: str
+    name: Optional[str] = None
+    image: Optional[str] = None
+
+
+class DeckParseEntry(BaseModel):
+    raw_name: str
+    expected_quantity: int = 1
+    card_id: Optional[str] = None
+    confident: bool = False
+    candidates: List[DeckParseCandidate] = Field(default_factory=list)
+    card: Optional[CardWithSet] = None
+
+
+class DeckParseBlock(BaseModel):
+    name: str
+    # Unique per deck, not just per page — one Bulbapedia page can hold more
+    # than one deck (e.g. a two-deck box), so this is the page URL plus a
+    # block-specific anchor. Pass this straight through as DeckCreate.source_url.
+    source_url: str
+    entries: List[DeckParseEntry] = Field(default_factory=list)
+
+
+class DeckParseResponse(BaseModel):
+    title: str
+    page_url: str
+    product_type: Optional[str] = None
+    blocks: List[DeckParseBlock] = Field(default_factory=list)

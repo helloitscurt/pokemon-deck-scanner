@@ -634,6 +634,82 @@ class GeminiQuotaState(Base):
     updated_at = Column(DateTime, default=func.now(), nullable=False)
 
 
+class Deck(Base):
+    """A preconstructed deck product template (e.g. one specific Battle Deck).
+
+    Created on demand when a user confirms it via the deck search-and-add flow,
+    not pre-seeded — shared across users the same way Set/Card catalogue rows are.
+    """
+    __tablename__ = "decks"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String, nullable=False)
+    product_type = Column(String, nullable=True)  # "battle_deck" / "battle_academy" / "custom"
+    source_url = Column(String, nullable=True, unique=True)
+    created_by_id = Column(Integer, ForeignKey("users.id"), nullable=True)
+    created_at = Column(DateTime, default=func.now())
+
+    deck_cards = relationship("DeckCard", back_populates="deck", cascade="all, delete-orphan")
+
+
+class DeckCard(Base):
+    """One entry in a deck template's card list, with the quantity expected."""
+    __tablename__ = "deck_cards"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    deck_id = Column(Integer, ForeignKey("decks.id", ondelete="CASCADE"), nullable=False)
+    card_id = Column(String, ForeignKey("cards.id", ondelete="SET NULL"), nullable=True)
+    expected_quantity = Column(Integer, default=1, nullable=False)
+
+    deck = relationship("Deck", back_populates="deck_cards")
+    card = relationship("Card")
+
+    __table_args__ = (
+        CheckConstraint("expected_quantity >= 1 AND expected_quantity <= 99", name="ck_deck_card_quantity_range"),
+        UniqueConstraint("deck_id", "card_id", name="uq_deck_card"),
+    )
+
+
+class DeckInstance(Base):
+    """A user's own in-progress copy of a Deck template being scanned toward.
+
+    At most one instance per (user, deck) — adding an already-tracked deck
+    reopens this row instead of creating a duplicate.
+    """
+    __tablename__ = "deck_instances"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    deck_id = Column(Integer, ForeignKey("decks.id", ondelete="CASCADE"), nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
+    created_at = Column(DateTime, default=func.now())
+
+    deck = relationship("Deck")
+    scanned_cards = relationship("ScannedCard", back_populates="instance", cascade="all, delete-orphan")
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "deck_id", name="uq_deck_instance_user_deck"),
+    )
+
+
+class ScannedCard(Base):
+    """Progress: how many of one deck card have been scanned within one instance."""
+    __tablename__ = "scanned_cards"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    deck_instance_id = Column(Integer, ForeignKey("deck_instances.id", ondelete="CASCADE"), nullable=False)
+    card_id = Column(String, ForeignKey("cards.id", ondelete="CASCADE"), nullable=False)
+    scanned_quantity = Column(Integer, default=0, nullable=False)
+    last_scanned_at = Column(DateTime, nullable=True)
+
+    instance = relationship("DeckInstance", back_populates="scanned_cards")
+    card = relationship("Card")
+
+    __table_args__ = (
+        CheckConstraint("scanned_quantity >= 0", name="ck_scanned_card_quantity_non_negative"),
+        UniqueConstraint("deck_instance_id", "card_id", name="uq_scanned_card"),
+    )
+
+
 class ScannerProviderLimitState(Base):
     """Persisted non-Gemini provider blocks without storing credentials or URLs."""
 

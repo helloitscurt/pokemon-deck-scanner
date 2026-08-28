@@ -559,6 +559,42 @@ def _run_migrations(conn):
                     FOREIGN KEY (custom_owner_id) REFERENCES users(id) ON DELETE CASCADE;
             END IF;
         END$$""",
+        # v60: Preconstructed-deck completion tracking.
+        """CREATE TABLE IF NOT EXISTS decks (
+            id SERIAL PRIMARY KEY,
+            name VARCHAR NOT NULL,
+            product_type VARCHAR,
+            source_url VARCHAR UNIQUE,
+            created_by_id INTEGER REFERENCES users(id),
+            created_at TIMESTAMP DEFAULT NOW()
+        )""",
+        """CREATE TABLE IF NOT EXISTS deck_cards (
+            id SERIAL PRIMARY KEY,
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            card_id VARCHAR REFERENCES cards(id) ON DELETE SET NULL,
+            expected_quantity INTEGER NOT NULL DEFAULT 1,
+            CONSTRAINT ck_deck_card_quantity_range CHECK (expected_quantity >= 1 AND expected_quantity <= 99),
+            CONSTRAINT uq_deck_card UNIQUE (deck_id, card_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS deck_instances (
+            id SERIAL PRIMARY KEY,
+            deck_id INTEGER NOT NULL REFERENCES decks(id) ON DELETE CASCADE,
+            user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+            created_at TIMESTAMP DEFAULT NOW(),
+            CONSTRAINT uq_deck_instance_user_deck UNIQUE (user_id, deck_id)
+        )""",
+        """CREATE TABLE IF NOT EXISTS scanned_cards (
+            id SERIAL PRIMARY KEY,
+            deck_instance_id INTEGER NOT NULL REFERENCES deck_instances(id) ON DELETE CASCADE,
+            card_id VARCHAR NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
+            scanned_quantity INTEGER NOT NULL DEFAULT 0,
+            last_scanned_at TIMESTAMP,
+            CONSTRAINT ck_scanned_card_quantity_non_negative CHECK (scanned_quantity >= 0),
+            CONSTRAINT uq_scanned_card UNIQUE (deck_instance_id, card_id)
+        )""",
+        "CREATE INDEX IF NOT EXISTS ix_deck_cards_deck_id ON deck_cards(deck_id)",
+        "CREATE INDEX IF NOT EXISTS ix_deck_instances_user_id ON deck_instances(user_id)",
+        "CREATE INDEX IF NOT EXISTS ix_scanned_cards_deck_instance_id ON scanned_cards(deck_instance_id)",
     ]
     for stmt in migrations:
         try:

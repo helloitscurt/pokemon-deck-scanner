@@ -551,6 +551,9 @@ def add_to_collection(
         existing.quantity += item.quantity or 1
         db.commit()
         db.refresh(existing)
+        if item.deck_instance_id:
+            from api.decks import register_scan
+            register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
         return _annotate_collection_item(db, current_user, existing)
     else:
         db_item = CollectionItem(
@@ -566,6 +569,9 @@ def add_to_collection(
         db.add(db_item)
         db.commit()
         db.refresh(db_item)
+        if item.deck_instance_id:
+            from api.decks import register_scan
+            register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
         return _annotate_collection_item(db, current_user, db_item)
 
 
@@ -633,6 +639,10 @@ def bulk_add_to_collection(
                 ))
                 db.commit()
                 added += 1
+
+            if item.deck_instance_id:
+                from api.decks import register_scan
+                register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
         except HTTPException as exc:
             db.rollback()
             failed += 1
