@@ -16,6 +16,7 @@ from services.digital_sets import digital_sets_enabled
 from services.standard_legality import is_standard_legal_card, is_standard_regulation_mark
 from services.tcgdex_languages import SUPPORTED_TCGDEX_LANGUAGES, has_lang_suffix, is_supported_tcgdex_language, normalize_tcgdex_language
 from services.collection_csv import collection_import_key, is_valid_collection_purchase_price, merge_collection_import_item, normalize_collection_variant
+from services.deck_progress import register_scan
 import datetime
 import csv
 import io
@@ -77,6 +78,26 @@ def _product_source_payload(product_card: ProductCard, product) -> dict:
 def _chunks(values: list, size: int):
     for start in range(0, len(values), size):
         yield values[start:start + size]
+
+
+def _apply_deck_scan(db: Session, current_user: User, item: CollectionItemCreate, effective_card_id: str) -> None:
+    """Update deck-instance progress for a confirmed collection add, if requested.
+
+    A failure here must never make an already-committed collection add look
+    like it failed — this is a secondary effect of the add, not part of it.
+    Callers with their own try/except (e.g. bulk-add) would otherwise catch an
+    exception raised after their own db.commit() already succeeded and
+    mis-report a successfully added card as failed.
+    """
+    if not item.deck_instance_id:
+        return
+    try:
+        register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
+    except Exception:
+        logger.exception(
+            "Failed to update deck instance %s progress for card %s",
+            item.deck_instance_id, effective_card_id,
+        )
 
 
 def _annotate_product_sources(db: Session, current_user: User, items: list[CollectionItem]) -> list[CollectionItem]:
@@ -551,9 +572,7 @@ def add_to_collection(
         existing.quantity += item.quantity or 1
         db.commit()
         db.refresh(existing)
-        if item.deck_instance_id:
-            from api.decks import register_scan
-            register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
+        _apply_deck_scan(db, current_user, item, effective_card_id)
         return _annotate_collection_item(db, current_user, existing)
     else:
         db_item = CollectionItem(
@@ -569,9 +588,7 @@ def add_to_collection(
         db.add(db_item)
         db.commit()
         db.refresh(db_item)
-        if item.deck_instance_id:
-            from api.decks import register_scan
-            register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
+        _apply_deck_scan(db, current_user, item, effective_card_id)
         return _annotate_collection_item(db, current_user, db_item)
 
 
@@ -640,9 +657,7 @@ def bulk_add_to_collection(
                 db.commit()
                 added += 1
 
-            if item.deck_instance_id:
-                from api.decks import register_scan
-                register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
+            _apply_deck_scan(db, current_user, item, effective_card_id)
         except HTTPException as exc:
             db.rollback()
             failed += 1

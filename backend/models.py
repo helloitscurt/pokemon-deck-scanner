@@ -705,7 +705,7 @@ class ScannedCard(Base):
     card = relationship("Card")
 
     __table_args__ = (
-        CheckConstraint("scanned_quantity >= 0", name="ck_scanned_card_quantity_non_negative"),
+        CheckConstraint("scanned_quantity >= 0 AND scanned_quantity <= 99", name="ck_scanned_card_quantity_range"),
         UniqueConstraint("deck_instance_id", "card_id", name="uq_scanned_card"),
     )
 

@@ -589,7 +589,7 @@ def _run_migrations(conn):
             card_id VARCHAR NOT NULL REFERENCES cards(id) ON DELETE CASCADE,
             scanned_quantity INTEGER NOT NULL DEFAULT 0,
             last_scanned_at TIMESTAMP,
-            CONSTRAINT ck_scanned_card_quantity_non_negative CHECK (scanned_quantity >= 0),
+            CONSTRAINT ck_scanned_card_quantity_range CHECK (scanned_quantity >= 0 AND scanned_quantity <= 99),
             CONSTRAINT uq_scanned_card UNIQUE (deck_instance_id, card_id)
         )""",
         "CREATE INDEX IF NOT EXISTS ix_deck_cards_deck_id ON deck_cards(deck_id)",

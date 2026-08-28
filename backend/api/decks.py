@@ -20,7 +20,14 @@ router = APIRouter()
 
 def _instance_response(db: Session, instance: DeckInstance, detail: bool = False):
     deck = instance.deck
-    deck_cards = db.query(DeckCard).filter(DeckCard.deck_id == deck.id).all()
+    # A DeckCard's card_id is nulled (ON DELETE SET NULL) if its Card is ever
+    # deleted (only realistic path: a custom card). Exclude those rather than
+    # count them — an entry with no card left can never be completed, so
+    # counting it would silently cap a deck's progress below 100% forever.
+    deck_cards = db.query(DeckCard).filter(
+        DeckCard.deck_id == deck.id,
+        DeckCard.card_id.isnot(None),
+    ).all()
     scanned_by_card = {
         sc.card_id: sc
         for sc in db.query(ScannedCard).filter(ScannedCard.deck_instance_id == instance.id).all()
@@ -60,46 +67,6 @@ def _instance_response(db: Session, instance: DeckInstance, detail: bool = False
     return DeckInstanceResponse(**payload)
 
 
-def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str, quantity: int = 1) -> None:
-    """Count a confirmed collection add toward one deck instance's scan progress.
-
-    Silently no-ops if the instance isn't this user's, or the card isn't part of
-    that deck's template — a scanned card that doesn't match the active deck
-    still lands in the general collection (see api/collection.py), it just
-    doesn't move deck progress.
-    """
-    instance = db.query(DeckInstance).filter(
-        DeckInstance.id == deck_instance_id,
-        DeckInstance.user_id == user_id,
-    ).first()
-    if not instance:
-        return
-
-    deck_card = db.query(DeckCard).filter(
-        DeckCard.deck_id == instance.deck_id,
-        DeckCard.card_id == card_id,
-    ).first()
-    if not deck_card:
-        return
-
-    now = datetime.datetime.utcnow()
-    scanned = db.query(ScannedCard).filter(
-        ScannedCard.deck_instance_id == instance.id,
-        ScannedCard.card_id == card_id,
-    ).first()
-    if scanned:
-        scanned.scanned_quantity = min(scanned.scanned_quantity + quantity, deck_card.expected_quantity)
-        scanned.last_scanned_at = now
-    else:
-        db.add(ScannedCard(
-            deck_instance_id=instance.id,
-            card_id=card_id,
-            scanned_quantity=min(quantity, deck_card.expected_quantity),
-            last_scanned_at=now,
-        ))
-    db.commit()
-
-
 @router.get("/search", response_model=List[DeckSearchResult])
 def search_decks(
     q: str = Query(..., min_length=2),
@@ -120,8 +87,12 @@ def parse_deck(
 ):
     """Fetch a confirmed Bulbapedia page and best-effort parse it into draft deck(s) for review.
 
-    Nothing is saved here — the frontend shows this for the user to review/fix
-    before calling POST /api/decks/ with the confirmed card list.
+    No Deck/DeckInstance is created here — the frontend shows this for the user
+    to review/fix before calling POST /api/decks/ with the confirmed card list.
+    Note: resolving an ambiguous entry against TCGdex (services.bulbapedia.
+    resolve_entry) can still upsert a Card catalogue row as a side effect,
+    same as browsing or searching cards elsewhere in the app already does —
+    that's shared reference data, not user-facing deck state.
     """
     try:
         wikitext = bulbapedia.fetch_wikitext(request.title)
@@ -168,6 +139,30 @@ def parse_deck(
     )
 
 
+def _sync_deck_cards(db: Session, deck: Deck, cards_in: list) -> None:
+    """Make a deck template's DeckCard rows match a submitted card list exactly.
+
+    Used both when a deck is first created and when an existing template
+    (matched by source_url) is saved again — e.g. the user re-parsed a page
+    and corrected an entry that failed to auto-resolve the first time. Without
+    this, re-saving under the same source_url would silently keep the old,
+    wrong card list forever.
+    """
+    existing = {dc.card_id: dc for dc in db.query(DeckCard).filter(DeckCard.deck_id == deck.id).all()}
+    submitted_card_ids = set()
+    for entry in cards_in:
+        ensure_card_exists(db, entry.card_id)
+        submitted_card_ids.add(entry.card_id)
+        current = existing.get(entry.card_id)
+        if current:
+            current.expected_quantity = entry.expected_quantity
+        else:
+            db.add(DeckCard(deck_id=deck.id, card_id=entry.card_id, expected_quantity=entry.expected_quantity))
+    for card_id, deck_card in existing.items():
+        if card_id not in submitted_card_ids:
+            db.delete(deck_card)
+
+
 @router.post("/", response_model=DeckInstanceDetailResponse)
 def create_deck(
     deck_in: DeckCreate,
@@ -177,8 +172,10 @@ def create_deck(
     """Save a confirmed deck template and start tracking it for the current user.
 
     Reuses an existing template by source_url if one was already saved (by any
-    user, since deck templates are shared catalogue data like Set/Card), and
-    reopens the current user's existing instance rather than duplicating it.
+    user, since deck templates are shared catalogue data like Set/Card) —
+    reopening the current user's existing instance rather than duplicating it —
+    but always syncs the template's card list to what was just submitted, so
+    correcting and re-saving a previously-imperfect deck actually takes effect.
     """
     deck = None
     if deck_in.source_url:
@@ -194,11 +191,10 @@ def create_deck(
         )
         db.add(deck)
         db.flush()
-        for entry in deck_in.cards:
-            ensure_card_exists(db, entry.card_id)
-            db.add(DeckCard(deck_id=deck.id, card_id=entry.card_id, expected_quantity=entry.expected_quantity))
-        db.commit()
-        db.refresh(deck)
+
+    _sync_deck_cards(db, deck, deck_in.cards)
+    db.commit()
+    db.refresh(deck)
 
     instance = db.query(DeckInstance).filter(
         DeckInstance.deck_id == deck.id,
