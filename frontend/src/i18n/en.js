@@ -398,6 +398,7 @@ const en = {
     subtitle: 'Track pre-built decks you own and scan cards to find what’s missing.',
     addDeck: 'Add a deck',
     empty: 'No decks tracked yet. Add a pre-built deck to start scanning.',
+    loadFailed: 'Failed to load your tracked decks.',
     complete: 'Complete',
     cardsFound: 'cards found',
     add: {

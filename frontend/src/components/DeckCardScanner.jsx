@@ -26,7 +26,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [confirmError, setConfirmError] = useState(null)
-  const [confirming, setConfirming] = useState(false)
+  const [confirmingKey, setConfirmingKey] = useState(null)
 
   const reset = () => {
     setResult(null)
@@ -58,8 +58,8 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   // unconditionally would leave the scanner looking ready for the next card
   // while the previous one silently never got counted, with only an
   // easy-to-miss toast as the only signal.
-  const confirmCard = async (candidate) => {
-    setConfirming(true)
+  const confirmCard = async (candidate, key) => {
+    setConfirmingKey(key)
     setConfirmError(null)
     try {
       await onConfirm(candidate)
@@ -67,7 +67,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
     } catch {
       setConfirmError(t('decks.scan.confirmFailed'))
     } finally {
-      setConfirming(false)
+      setConfirmingKey(null)
     }
   }
 
@@ -128,34 +128,40 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
                 <button onClick={reset} className="btn-ghost mx-auto text-sm">{t('decks.scan.tryAgain')}</button>
               </div>
             )}
-            {matches.map((candidate, i) => (
-              <button
-                key={candidate.id || i}
-                type="button"
-                disabled={confirming}
-                onClick={() => confirmCard(candidate)}
-                className="w-full flex items-center gap-3 rounded-xl border border-border bg-bg-card p-3 text-left hover:border-brand-red/40 hover:bg-brand-red/10 transition-colors disabled:opacity-50"
-              >
-                <img
-                  src={resolveCardImageUrl(candidate, 'small')}
-                  alt={candidate.name}
-                  className="h-16 w-auto rounded-md flex-shrink-0"
-                  loading="lazy"
-                />
-                <div className="min-w-0 flex-1">
-                  <p className="text-sm font-semibold text-text-primary truncate">{candidate.name}</p>
-                  <p className="text-xs text-text-muted truncate">
-                    {candidate.set?.name}{candidate.number ? ` · #${candidate.number}` : ''}
-                  </p>
-                  {i === 0 && result._identity_confident && (
-                    <span className="badge badge-green mt-1 inline-block">{t('decks.scan.bestMatch')}</span>
-                  )}
-                </div>
-                <Check size={18} className="flex-shrink-0 text-text-muted" />
-              </button>
-            ))}
+            {matches.map((candidate, i) => {
+              const key = candidate.id || i
+              const isConfirmingThis = confirmingKey === key
+              return (
+                <button
+                  key={key}
+                  type="button"
+                  disabled={confirmingKey != null}
+                  onClick={() => confirmCard(candidate, key)}
+                  className="w-full flex items-center gap-3 rounded-xl border border-border bg-bg-card p-3 text-left hover:border-brand-red/40 hover:bg-brand-red/10 transition-colors disabled:opacity-50"
+                >
+                  <img
+                    src={resolveCardImageUrl(candidate, 'small')}
+                    alt={candidate.name}
+                    className="h-16 w-auto rounded-md flex-shrink-0"
+                    loading="lazy"
+                  />
+                  <div className="min-w-0 flex-1">
+                    <p className="text-sm font-semibold text-text-primary truncate">{candidate.name}</p>
+                    <p className="text-xs text-text-muted truncate">
+                      {candidate.set?.name}{candidate.number ? ` · #${candidate.number}` : ''}
+                    </p>
+                    {i === 0 && result._identity_confident && (
+                      <span className="badge badge-green mt-1 inline-block">{t('decks.scan.bestMatch')}</span>
+                    )}
+                  </div>
+                  {isConfirmingThis
+                    ? <Loader2 size={18} className="flex-shrink-0 animate-spin text-brand-red" />
+                    : <Check size={18} className="flex-shrink-0 text-text-muted" />}
+                </button>
+              )
+            })}
             {matches.length > 0 && (
-              <button onClick={reset} disabled={confirming} className="btn-ghost w-full text-sm disabled:opacity-50">
+              <button onClick={reset} disabled={confirmingKey != null} className="btn-ghost w-full text-sm disabled:opacity-50">
                 {t('decks.scan.scanAnother')}
               </button>
             )}

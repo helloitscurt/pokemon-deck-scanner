@@ -144,7 +144,7 @@ export default function AddDeck() {
   }
 
   return (
-    <div className="space-y-4 pb-2 max-w-2xl mx-auto">
+    <div className="space-y-4 pb-2">
       <button onClick={() => navigate('/decks')} className="btn-ghost text-sm py-1.5">
         <ArrowLeft size={14} /> {t('decks.title')}
       </button>
@@ -235,7 +235,7 @@ export default function AddDeck() {
               {entries.length - unresolvedCount} / {entries.length} {t('decks.add.autoResolved')}
             </p>
             {unresolvedCount > 0 && (
-              <div className="flex items-center gap-2 mt-2 text-xs text-brand-yellow">
+              <div className="flex items-center gap-2 mt-2 text-xs text-yellow">
                 <AlertTriangle size={14} className="flex-shrink-0" />
                 {t('decks.add.needsReview').replace('{count}', unresolvedCount)}
               </div>
@@ -255,7 +255,7 @@ export default function AddDeck() {
                     />
                   ) : (
                     <div className="h-14 w-10 rounded bg-bg-elevated flex-shrink-0 flex items-center justify-center">
-                      <AlertTriangle size={16} className="text-brand-yellow" />
+                      <AlertTriangle size={16} className="text-yellow" />
                     </div>
                   )}
                   <div className="min-w-0 flex-1">
@@ -267,7 +267,7 @@ export default function AddDeck() {
                         {entry.card.set_ref?.name} · #{entry.card.number}
                       </p>
                     ) : (
-                      <p className="text-xs text-brand-yellow">{t('decks.add.notResolved')}</p>
+                      <p className="text-xs text-yellow">{t('decks.add.notResolved')}</p>
                     )}
                     <button
                       onClick={() => setEditingIndex(editingIndex === index ? null : index)}

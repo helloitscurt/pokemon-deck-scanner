@@ -8,7 +8,7 @@ export default function Decks() {
   const navigate = useNavigate()
   const { t } = useSettings()
 
-  const { data: instances = [], isLoading } = useQuery({
+  const { data: instances = [], isLoading, error, refetch } = useQuery({
     queryKey: ['deck-instances'],
     queryFn: getDeckInstances,
   })
@@ -28,6 +28,11 @@ export default function Decks() {
       {isLoading ? (
         <div className="space-y-3">
           {[...Array(3)].map((_, i) => <div key={i} className="skeleton h-24 rounded-2xl" />)}
+        </div>
+      ) : error ? (
+        <div className="card text-center py-12">
+          <p className="text-brand-red">{t('decks.loadFailed')}</p>
+          <button onClick={() => refetch()} className="btn-ghost mt-4 mx-auto">{t('common.retry')}</button>
         </div>
       ) : instances.length === 0 ? (
         <div className="card text-center py-12 space-y-3">

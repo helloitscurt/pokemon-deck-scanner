@@ -5,6 +5,7 @@ import { ArrowLeft, Camera, RotateCcw, Trash2 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
+import { useConfirmDialog } from '../contexts/ConfirmDialogContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
 import { CardRow } from '../components/card-system'
 import { CardModal } from '../components/CardItem'
@@ -16,11 +17,10 @@ export default function DeckDetail() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
   const { t } = useSettings()
+  const confirmDialog = useConfirmDialog()
   const [filter, setFilter] = useState('missing')
   const [scannerOpen, setScannerOpen] = useState(false)
   const [selectedCard, setSelectedCard] = useState(null)
-  const [confirmReset, setConfirmReset] = useState(false)
-  const [confirmDelete, setConfirmDelete] = useState(false)
 
   const { data, isLoading, error } = useQuery({
     queryKey: ['deck-instance', instanceId],
@@ -37,7 +37,6 @@ export default function DeckDetail() {
     onSuccess: () => {
       toast.success(t('decks.detail.resetDone'))
       invalidate()
-      setConfirmReset(false)
     },
     onError: () => toast.error(t('decks.detail.resetFailed')),
   })
@@ -51,6 +50,28 @@ export default function DeckDetail() {
     },
     onError: () => toast.error(t('decks.detail.deleteFailed')),
   })
+
+  const handleReset = async () => {
+    const confirmed = await confirmDialog({
+      title: t('decks.detail.reset'),
+      message: t('decks.detail.resetConfirm'),
+      confirmLabel: t('decks.detail.reset'),
+      destructive: false,
+    })
+    if (!confirmed) return
+    resetMutation.mutate()
+  }
+
+  const handleDelete = async () => {
+    const confirmed = await confirmDialog({
+      title: t('decks.detail.remove'),
+      message: t('decks.detail.removeConfirm'),
+      confirmLabel: t('decks.detail.remove'),
+      destructive: true,
+    })
+    if (!confirmed) return
+    deleteMutation.mutate()
+  }
 
   const scanMutation = useMutation({
     mutationFn: (candidate) => addToCollection({ card_id: candidate.id, quantity: 1, deck_instance_id: Number(instanceId) }),
@@ -124,10 +145,10 @@ export default function DeckDetail() {
           <button onClick={() => setScannerOpen(true)} className="btn-primary text-sm py-2 px-3 flex-1 min-w-[140px]">
             <Camera size={15} /> {t('decks.detail.scan')}
           </button>
-          <button onClick={() => setConfirmReset(true)} className="btn-ghost text-sm py-2 px-3">
+          <button onClick={handleReset} className="btn-ghost text-sm py-2 px-3">
             <RotateCcw size={14} /> {t('decks.detail.reset')}
           </button>
-          <button onClick={() => setConfirmDelete(true)} className="btn-ghost text-sm py-2 px-3 text-brand-red">
+          <button onClick={handleDelete} className="btn-ghost text-sm py-2 px-3 text-brand-red">
             <Trash2 size={14} /> {t('decks.detail.remove')}
           </button>
         </div>
@@ -171,7 +192,10 @@ export default function DeckDetail() {
                 name={deckCard.card?.name}
                 subtext={deckCard.card?.set_ref?.name}
                 setNumber={deckCard.card?.number ? `#${deckCard.card.number}` : null}
-                value={missing > 0 ? `${missing} ${t('decks.detail.missingCount')}` : t('decks.detail.foundLabel')}
+                badges={[{
+                  label: missing > 0 ? `${missing} ${t('decks.detail.missingCount')}` : t('decks.detail.foundLabel'),
+                  variant: missing > 0 ? 'red' : 'green',
+                }]}
                 onClick={() => setSelectedCard(deckCard.card)}
               />
             )
@@ -194,34 +218,6 @@ export default function DeckDetail() {
         onClose={() => setScannerOpen(false)}
         onConfirm={(candidate) => scanMutation.mutateAsync(candidate)}
       />
-
-      {confirmReset && (
-        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4" onClick={() => setConfirmReset(false)}>
-          <div className="card max-w-sm w-full" onClick={(e) => e.stopPropagation()}>
-            <p className="text-sm text-text-primary mb-4">{t('decks.detail.resetConfirm')}</p>
-            <div className="flex gap-2">
-              <button onClick={() => setConfirmReset(false)} className="btn-ghost flex-1">{t('common.cancel')}</button>
-              <button onClick={() => resetMutation.mutate()} disabled={resetMutation.isPending} className="btn-primary flex-1">
-                {t('decks.detail.reset')}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {confirmDelete && (
-        <div className="fixed inset-0 z-50 bg-black/75 flex items-center justify-center p-4" onClick={() => setConfirmDelete(false)}>
-          <div className="card max-w-sm w-full" onClick={(e) => e.stopPropagation()}>
-            <p className="text-sm text-text-primary mb-4">{t('decks.detail.removeConfirm')}</p>
-            <div className="flex gap-2">
-              <button onClick={() => setConfirmDelete(false)} className="btn-ghost flex-1">{t('common.cancel')}</button>
-              <button onClick={() => deleteMutation.mutate()} disabled={deleteMutation.isPending} className="btn-primary flex-1 bg-brand-red">
-                {t('decks.detail.remove')}
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
     </div>
   )
 }
