@@ -10,7 +10,7 @@ import { resolveCardImageUrl } from '../utils/imageUrl'
 import { CardModal } from '../components/CardItem'
 import { CompactCardArtwork } from '../components/UnifiedCard'
 import DeckCardScanner from '../components/DeckCardScanner'
-import { missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
+import { isDeckCardFound, isDeckCardMissing, missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
 
 export default function DeckDetail() {
   const { instanceId } = useParams()
@@ -111,11 +111,12 @@ export default function DeckDetail() {
   const cards = data.cards || []
   const visibleCards = selectVisibleDeckCards(cards, filter, sortBy)
   // Tab counts are card TYPES (rows), matching what's actually listed below —
-  // distinct from the physical-card totals in the header above (a card
-  // needing 4 copies with 1 scanned counts as 1 physical "found" up there,
-  // but stays under "Missing" here since that type isn't fully satisfied yet).
-  const missingTypeCount = cards.filter((c) => missingQuantity(c) > 0).length
-  const foundTypeCount = cards.length - missingTypeCount
+  // distinct from the physical-card totals in the header above. Missing and
+  // Found deliberately overlap rather than partition the deck: a card
+  // needing 4 copies with 1 scanned is both still Missing (3 more needed)
+  // and already Found (you have one) — see utils/deckChecklist.js.
+  const missingTypeCount = cards.filter(isDeckCardMissing).length
+  const foundTypeCount = cards.filter(isDeckCardFound).length
 
   return (
     <div className="space-y-4 pb-2">
@@ -194,7 +195,11 @@ export default function DeckDetail() {
       {visibleCards.length === 0 ? (
         <div className="card text-center py-10">
           <p className="text-text-secondary">
-            {filter === 'missing' ? t('decks.detail.nothingMissing') : t('decks.detail.noCards')}
+            {filter === 'missing'
+              ? t('decks.detail.nothingMissing')
+              : filter === 'found'
+                ? t('decks.detail.nothingFoundYet')
+                : t('decks.detail.noCards')}
           </p>
         </div>
       ) : (

@@ -435,6 +435,7 @@ const en = {
       found: 'Found',
       all: 'All',
       nothingMissing: 'Nothing missing — deck complete!',
+      nothingFoundYet: 'Nothing found yet — scan a card to get started.',
       noCards: 'No cards in this deck.',
       missingCount: 'missing',
       sortBy: 'Sort',

@@ -10,6 +10,15 @@ export function isDeckCardMissing(deckCard) {
   return deckCard.scanned_quantity < deckCard.expected_quantity
 }
 
+// "Found" means at least one copy has been scanned — not "every copy has
+// been scanned". A card needing 4 copies with 1 scanned is both still
+// Missing (3 more needed) and already Found (you have located one) — these
+// two tabs deliberately overlap rather than partition the deck, so a card
+// you've made partial progress on shows up in both instead of neither.
+export function isDeckCardFound(deckCard) {
+  return deckCard.scanned_quantity > 0
+}
+
 export function byCardName(a, b) {
   return String(a.card?.name || '').localeCompare(String(b.card?.name || ''), undefined, { sensitivity: 'base', numeric: true })
 }
@@ -46,7 +55,7 @@ export function selectVisibleDeckCards(cards, filter, sortBy = 'missing_desc') {
   const filtered = filter === 'missing'
     ? cards.filter(isDeckCardMissing)
     : filter === 'found'
-      ? cards.filter(card => !isDeckCardMissing(card))
+      ? cards.filter(isDeckCardFound)
       : cards
   const comparator = DECK_CHECKLIST_SORTS[sortBy] || byMissingDesc
   return filtered.slice().sort(comparator)
