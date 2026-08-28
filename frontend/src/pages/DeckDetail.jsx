@@ -9,6 +9,7 @@ import { resolveCardImageUrl } from '../utils/imageUrl'
 import { CardRow } from '../components/card-system'
 import { CardModal } from '../components/CardItem'
 import DeckCardScanner from '../components/DeckCardScanner'
+import { isDeckCardMissing, missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
 
 export default function DeckDetail() {
   const { instanceId } = useParams()
@@ -86,10 +87,8 @@ export default function DeckDetail() {
   const progress = Math.min(100, Math.max(0, Number(data.progress) || 0))
   const hpClass = progress >= 66 ? 'healthy' : progress >= 33 ? 'medium' : 'low'
   const cards = data.cards || []
-  const missingCards = cards.filter((c) => c.scanned_quantity < c.expected_quantity)
-  const visibleCards = filter === 'missing' ? missingCards : filter === 'found'
-    ? cards.filter((c) => c.scanned_quantity >= c.expected_quantity)
-    : cards
+  const missingCards = cards.filter(isDeckCardMissing)
+  const visibleCards = selectVisibleDeckCards(cards, filter)
 
   return (
     <div className="space-y-4 pb-2">
@@ -163,7 +162,7 @@ export default function DeckDetail() {
       ) : (
         <div className="space-y-2">
           {visibleCards.map((deckCard) => {
-            const missing = deckCard.expected_quantity - deckCard.scanned_quantity
+            const missing = missingQuantity(deckCard)
             return (
               <CardRow
                 key={deckCard.card_id}
@@ -186,13 +185,14 @@ export default function DeckDetail() {
           onClose={() => setSelectedCard(null)}
           defaultLang={selectedCard.lang || 'en'}
           initialTab="overview"
+          readOnly
         />
       )}
 
       <DeckCardScanner
         isOpen={scannerOpen}
         onClose={() => setScannerOpen(false)}
-        onConfirm={(candidate) => scanMutation.mutate(candidate)}
+        onConfirm={(candidate) => scanMutation.mutateAsync(candidate)}
       />
 
       {confirmReset && (

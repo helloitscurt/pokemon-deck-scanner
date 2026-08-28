@@ -6,6 +6,7 @@ import toast from 'react-hot-toast'
 import { searchDecks, parseDeckPage, saveDeck, searchCards } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
+import { countUnresolvedEntries, setEntryCard as setEntryCardPure, setEntryQuantity as setEntryQuantityPure } from '../utils/deckReview'
 
 const STEP = { SEARCH: 'search', BLOCK: 'block', REVIEW: 'review' }
 
@@ -73,7 +74,6 @@ export default function AddDeck() {
   const [step, setStep] = useState(STEP.SEARCH)
   const [query, setQuery] = useState('')
   const [results, setResults] = useState([])
-  const [selectedPage, setSelectedPage] = useState(null)
   const [parseResult, setParseResult] = useState(null)
   const [selectedBlockIndex, setSelectedBlockIndex] = useState(0)
   const [entries, setEntries] = useState([])
@@ -87,8 +87,7 @@ export default function AddDeck() {
 
   const parseMutation = useMutation({
     mutationFn: (page) => parseDeckPage(page.title),
-    onSuccess: (data, page) => {
-      setSelectedPage(page)
+    onSuccess: (data) => {
       setParseResult(data)
       if (data.blocks.length > 1) {
         setStep(STEP.BLOCK)
@@ -124,27 +123,21 @@ export default function AddDeck() {
   }
 
   const setEntryCard = (index, card) => {
-    setEntries((current) => current.map((entry, i) => (
-      i === index ? { ...entry, card_id: card.id, card, confident: true } : entry
-    )))
+    setEntries((current) => setEntryCardPure(current, index, card))
     setEditingIndex(null)
   }
 
   const setEntryQuantity = (index, quantity) => {
-    const safeQuantity = Math.min(99, Math.max(1, Number(quantity) || 1))
-    setEntries((current) => current.map((entry, i) => (
-      i === index ? { ...entry, expected_quantity: safeQuantity } : entry
-    )))
+    setEntries((current) => setEntryQuantityPure(current, index, quantity))
   }
 
-  const unresolvedCount = entries.filter((entry) => !entry.card_id).length
+  const unresolvedCount = countUnresolvedEntries(entries)
   const activeBlock = parseResult?.blocks?.[selectedBlockIndex]
 
   const handleSave = () => {
     if (unresolvedCount > 0 || entries.length === 0) return
     saveMutation.mutate({
       name: activeBlock?.name || parseResult?.title,
-      product_type: parseResult?.product_type,
       source_url: activeBlock?.source_url,
       cards: entries.map((entry) => ({ card_id: entry.card_id, expected_quantity: entry.expected_quantity })),
     })

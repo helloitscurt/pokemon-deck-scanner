@@ -545,7 +545,7 @@ function OwnedVersionRow({ item, onQuantityChange, onRemove, isUpdating, isRemov
   )
 }
 
-export function CardModal({ card, onClose, onEdit, defaultLang = 'en', ownedItems = null, initialTab = 'overview', isForeignTemplate = false, onCopyTemplate, copyTemplatePending = false, image = null, imageOverlay = null, imageAccessory = null }) {
+export function CardModal({ card, onClose, onEdit, defaultLang = 'en', ownedItems = null, initialTab = 'overview', isForeignTemplate = false, readOnly = false, onCopyTemplate, copyTemplatePending = false, image = null, imageOverlay = null, imageAccessory = null }) {
   if (!card || !card.id) return null
 
   const [activeTab, setActiveTab] = useState(initialTab)
@@ -749,7 +749,7 @@ export function CardModal({ card, onClose, onEdit, defaultLang = 'en', ownedItem
     { id: 'overview', label: t('cardTabs.overview') },
     { id: 'prices', label: t('cardTabs.prices') },
     ...(ownedQuantity > 0 ? [{ id: 'owned', label: t('cardTabs.owned') }] : []),
-    ...(!isForeignTemplate ? [
+    ...(!isForeignTemplate && !readOnly ? [
       { id: 'add', label: t('cardTabs.add') },
       { id: 'wishlist', label: t('cardTabs.wishlist') },
     ] : []),

@@ -456,6 +456,7 @@ const en = {
       scanAnother: 'Scan another',
       scanned: 'Scanned',
       addFailed: 'Failed to add this card.',
+      confirmFailed: 'Couldn’t save this card — check your connection and try again.',
     },
   },
 

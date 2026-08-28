@@ -25,10 +25,13 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   const [scanning, setScanning] = useState(false)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+  const [confirmError, setConfirmError] = useState(null)
+  const [confirming, setConfirming] = useState(false)
 
   const reset = () => {
     setResult(null)
     setError(null)
+    setConfirmError(null)
   }
 
   const handleFile = async (file) => {
@@ -50,9 +53,22 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
     onClose?.()
   }
 
-  const confirmCard = (candidate) => {
-    onConfirm(candidate)
-    reset()
+  // Await the caller's confirm action (adding the card to the deck) before
+  // moving on. A failure here must stay visible on screen — resetting
+  // unconditionally would leave the scanner looking ready for the next card
+  // while the previous one silently never got counted, with only an
+  // easy-to-miss toast as the only signal.
+  const confirmCard = async (candidate) => {
+    setConfirming(true)
+    setConfirmError(null)
+    try {
+      await onConfirm(candidate)
+      reset()
+    } catch {
+      setConfirmError(t('decks.scan.confirmFailed'))
+    } finally {
+      setConfirming(false)
+    }
   }
 
   const matches = (result?.matches || []).slice(0, 6)
@@ -101,6 +117,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
 
         {result && !scanning && (
           <div className="space-y-3">
+            {confirmError && (
+              <div className="rounded-lg border border-brand-red/30 bg-brand-red/5 px-3 py-2 text-center">
+                <p className="text-sm text-brand-red">{confirmError}</p>
+              </div>
+            )}
             {matches.length === 0 && (
               <div className="text-center py-6 space-y-3">
                 <p className="text-sm text-text-secondary">{t('decks.scan.noMatch')}</p>
@@ -111,8 +132,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
               <button
                 key={candidate.id || i}
                 type="button"
+                disabled={confirming}
                 onClick={() => confirmCard(candidate)}
-                className="w-full flex items-center gap-3 rounded-xl border border-border bg-bg-card p-3 text-left hover:border-brand-red/40 hover:bg-brand-red/10 transition-colors"
+                className="w-full flex items-center gap-3 rounded-xl border border-border bg-bg-card p-3 text-left hover:border-brand-red/40 hover:bg-brand-red/10 transition-colors disabled:opacity-50"
               >
                 <img
                   src={resolveCardImageUrl(candidate, 'small')}
@@ -133,7 +155,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
               </button>
             ))}
             {matches.length > 0 && (
-              <button onClick={reset} className="btn-ghost w-full text-sm">{t('decks.scan.scanAnother')}</button>
+              <button onClick={reset} disabled={confirming} className="btn-ghost w-full text-sm disabled:opacity-50">
+                {t('decks.scan.scanAnother')}
+              </button>
             )}
           </div>
         )}
