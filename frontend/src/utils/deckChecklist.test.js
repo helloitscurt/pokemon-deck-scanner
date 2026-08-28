@@ -1,10 +1,17 @@
 import { describe, expect, it } from 'vitest'
-import { byCardName, isDeckCardMissing, missingQuantity, selectVisibleDeckCards } from './deckChecklist'
+import {
+  byCardName,
+  byCardNumberAsc,
+  byMissingDesc,
+  isDeckCardMissing,
+  missingQuantity,
+  selectVisibleDeckCards,
+} from './deckChecklist'
 
 const deckCards = [
-  { card_id: 'sv1-2_en', card: { name: 'Floragato' }, expected_quantity: 2, scanned_quantity: 2 },
-  { card_id: 'sv1-1_en', card: { name: 'Sprigatito' }, expected_quantity: 1, scanned_quantity: 0 },
-  { card_id: 'sv1-3_en', card: { name: 'Meowscarada' }, expected_quantity: 3, scanned_quantity: 1 },
+  { card_id: 'sv1-2_en', card: { name: 'Floragato', number: '2' }, expected_quantity: 2, scanned_quantity: 2 },
+  { card_id: 'sv1-1_en', card: { name: 'Sprigatito', number: '1' }, expected_quantity: 1, scanned_quantity: 0 },
+  { card_id: 'sv1-3_en', card: { name: 'Meowscarada', number: '10' }, expected_quantity: 3, scanned_quantity: 1 },
 ]
 
 describe('missingQuantity', () => {
@@ -31,20 +38,61 @@ describe('byCardName', () => {
   })
 })
 
+describe('byMissingDesc', () => {
+  it('sorts by highest missing quantity first', () => {
+    const sorted = [...deckCards].sort(byMissingDesc)
+    // Meowscarada missing 2, Sprigatito missing 1, Floragato missing 0
+    expect(sorted.map(c => c.card.name)).toEqual(['Meowscarada', 'Sprigatito', 'Floragato'])
+  })
+
+  it('breaks ties alphabetically', () => {
+    const tied = [
+      { card: { name: 'Zubat' }, expected_quantity: 2, scanned_quantity: 0 },
+      { card: { name: 'Abra' }, expected_quantity: 2, scanned_quantity: 0 },
+    ]
+    const sorted = [...tied].sort(byMissingDesc)
+    expect(sorted.map(c => c.card.name)).toEqual(['Abra', 'Zubat'])
+  })
+})
+
+describe('byCardNumberAsc', () => {
+  it('sorts numerically, not as strings (so "10" comes after "2")', () => {
+    const sorted = [...deckCards].sort(byCardNumberAsc)
+    expect(sorted.map(c => c.card.number)).toEqual(['1', '2', '10'])
+  })
+
+  it('handles a non-numeric prefix without crashing', () => {
+    const withPrefix = [
+      { card: { name: 'A', number: 'TG04' } },
+      { card: { name: 'B', number: 'TG01' } },
+    ]
+    const sorted = [...withPrefix].sort(byCardNumberAsc)
+    expect(sorted.map(c => c.card.number)).toEqual(['TG01', 'TG04'])
+  })
+})
+
 describe('selectVisibleDeckCards', () => {
-  it('filters to only missing cards, sorted by name', () => {
+  it('defaults to missing-quantity-descending order', () => {
+    const result = selectVisibleDeckCards(deckCards, 'all')
+    expect(result.map(c => c.card.name)).toEqual(['Meowscarada', 'Sprigatito', 'Floragato'])
+  })
+
+  it('filters to only missing cards', () => {
     const result = selectVisibleDeckCards(deckCards, 'missing')
     expect(result.map(c => c.card.name)).toEqual(['Meowscarada', 'Sprigatito'])
   })
 
-  it('filters to only found cards, sorted by name', () => {
+  it('filters to only found cards', () => {
     const result = selectVisibleDeckCards(deckCards, 'found')
     expect(result.map(c => c.card.name)).toEqual(['Floragato'])
   })
 
-  it('returns every card, sorted by name, for "all"', () => {
-    const result = selectVisibleDeckCards(deckCards, 'all')
-    expect(result.map(c => c.card.name)).toEqual(['Floragato', 'Meowscarada', 'Sprigatito'])
+  it('accepts an explicit sort mode, applied the same way regardless of which tab is active', () => {
+    const alphabetical = selectVisibleDeckCards(deckCards, 'all', 'alphabetical')
+    expect(alphabetical.map(c => c.card.name)).toEqual(['Floragato', 'Meowscarada', 'Sprigatito'])
+
+    const byNumber = selectVisibleDeckCards(deckCards, 'all', 'number_asc')
+    expect(byNumber.map(c => c.card.number)).toEqual(['1', '2', '10'])
   })
 
   it('does not mutate the input array', () => {

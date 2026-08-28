@@ -19,6 +19,7 @@ export default function DeckDetail() {
   const { t } = useSettings()
   const confirmDialog = useConfirmDialog()
   const [filter, setFilter] = useState('missing')
+  const [sortBy, setSortBy] = useState('missing_desc')
   const [scannerOpen, setScannerOpen] = useState(false)
   const [selectedCard, setSelectedCard] = useState(null)
 
@@ -108,7 +109,13 @@ export default function DeckDetail() {
   const progress = Math.min(100, Math.max(0, Number(data.progress) || 0))
   const hpClass = progress >= 66 ? 'healthy' : progress >= 33 ? 'medium' : 'low'
   const cards = data.cards || []
-  const visibleCards = selectVisibleDeckCards(cards, filter)
+  const visibleCards = selectVisibleDeckCards(cards, filter, sortBy)
+  // Tab counts are card TYPES (rows), matching what's actually listed below —
+  // distinct from the physical-card totals in the header above (a card
+  // needing 4 copies with 1 scanned counts as 1 physical "found" up there,
+  // but stays under "Missing" here since that type isn't fully satisfied yet).
+  const missingTypeCount = cards.filter((c) => missingQuantity(c) > 0).length
+  const foundTypeCount = cards.length - missingTypeCount
 
   return (
     <div className="space-y-4 pb-2">
@@ -153,24 +160,35 @@ export default function DeckDetail() {
         </div>
       </div>
 
-      <div className="flex w-full min-w-0 gap-2 overflow-x-auto pb-1">
-        {[
-          { key: 'missing', label: `${t('decks.detail.missing')} (${data.total_count - data.scanned_count})` },
-          { key: 'found', label: `${t('decks.detail.found')} (${data.scanned_count})` },
-          { key: 'all', label: `${t('decks.detail.all')} (${data.total_count})` },
-        ].map(({ key, label }) => (
-          <button
-            key={key}
-            onClick={() => setFilter(key)}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
-              filter === key
-                ? 'bg-brand-red/20 text-brand-red border border-brand-red/30'
-                : 'text-text-secondary hover:text-text-primary hover:bg-bg-elevated'
-            }`}
-          >
-            {label}
-          </button>
-        ))}
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <div className="flex w-full min-w-0 gap-2 overflow-x-auto pb-1 sm:w-auto">
+          {[
+            { key: 'missing', label: `${t('decks.detail.missing')} (${missingTypeCount})` },
+            { key: 'found', label: `${t('decks.detail.found')} (${foundTypeCount})` },
+            { key: 'all', label: `${t('decks.detail.all')} (${cards.length})` },
+          ].map(({ key, label }) => (
+            <button
+              key={key}
+              onClick={() => setFilter(key)}
+              className={`px-4 py-2 rounded-lg text-sm font-medium transition-all whitespace-nowrap ${
+                filter === key
+                  ? 'bg-brand-red/20 text-brand-red border border-brand-red/30'
+                  : 'text-text-secondary hover:text-text-primary hover:bg-bg-elevated'
+              }`}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+
+        <label className="flex flex-shrink-0 items-center gap-2 text-xs text-text-muted">
+          {t('decks.detail.sortBy')}
+          <select value={sortBy} onChange={(event) => setSortBy(event.target.value)} className="select text-sm py-1.5">
+            <option value="missing_desc">{t('decks.detail.sortMissingDesc')}</option>
+            <option value="alphabetical">{t('decks.detail.sortAlphabetical')}</option>
+            <option value="number_asc">{t('decks.detail.sortNumberAsc')}</option>
+          </select>
+        </label>
       </div>
 
       {visibleCards.length === 0 ? (
@@ -193,11 +211,13 @@ export default function DeckDetail() {
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-semibold text-text-primary">{deckCard.card?.name}</p>
                   {deckCard.card?.number && (
-                    <p className="font-mono text-[10px] text-text-muted">#{deckCard.card.number}</p>
+                    <p className="font-mono text-xs text-text-muted">#{deckCard.card.number}</p>
                   )}
                 </div>
                 <p className={`flex-shrink-0 text-lg font-bold ${missing > 0 ? 'text-brand-red' : 'text-green'}`}>
-                  {missing > 0 ? `${missing} ${t('decks.detail.missingCount')}` : t('decks.detail.foundLabel')}
+                  {missing > 0
+                    ? `${missing}/${deckCard.expected_quantity} ${t('decks.detail.missingCount')}`
+                    : t('decks.detail.foundLabel')}
                 </p>
               </button>
             )

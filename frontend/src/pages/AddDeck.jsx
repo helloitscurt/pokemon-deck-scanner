@@ -7,6 +7,7 @@ import { searchDecks, parseDeckPage, saveDeck, searchCards } from '../api/client
 import { useSettings } from '../contexts/SettingsContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
 import { countUnresolvedEntries, setEntryCard as setEntryCardPure, setEntryQuantity as setEntryQuantityPure } from '../utils/deckReview'
+import ImageZoomOverlay from '../components/ImageZoomOverlay'
 
 const STEP = { SEARCH: 'search', BLOCK: 'block', REVIEW: 'review' }
 
@@ -78,6 +79,7 @@ export default function AddDeck() {
   const [selectedBlockIndex, setSelectedBlockIndex] = useState(0)
   const [entries, setEntries] = useState([])
   const [editingIndex, setEditingIndex] = useState(null)
+  const [zoomImage, setZoomImage] = useState(null)
 
   const searchMutation = useMutation({
     mutationFn: searchDecks,
@@ -247,12 +249,19 @@ export default function AddDeck() {
               <div key={index} className="card p-3">
                 <div className="flex items-center gap-3">
                   {entry.card ? (
-                    <img
-                      src={resolveCardImageUrl(entry.card, 'small')}
-                      alt={entry.card.name}
-                      className="h-14 w-auto rounded flex-shrink-0"
-                      loading="lazy"
-                    />
+                    <button
+                      type="button"
+                      onClick={() => setZoomImage({ src: resolveCardImageUrl(entry.card, 'large'), alt: entry.card.name })}
+                      className="flex-shrink-0 cursor-zoom-in"
+                      aria-label={`${t('card.zoomImage')} — ${entry.card.name}`}
+                    >
+                      <img
+                        src={resolveCardImageUrl(entry.card, 'small')}
+                        alt={entry.card.name}
+                        className="h-14 w-auto rounded"
+                        loading="lazy"
+                      />
+                    </button>
                   ) : (
                     <div className="h-14 w-10 rounded bg-bg-elevated flex-shrink-0 flex items-center justify-center">
                       <AlertTriangle size={16} className="text-yellow" />
@@ -314,6 +323,10 @@ export default function AddDeck() {
             </button>
           </div>
         </div>
+      )}
+
+      {zoomImage && (
+        <ImageZoomOverlay src={zoomImage.src} alt={zoomImage.alt} onClose={() => setZoomImage(null)} />
       )}
     </div>
   )
