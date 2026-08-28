@@ -63,7 +63,7 @@ class DeckTrackingApiTests(unittest.TestCase):
 
     def test_create_deck_progress_starts_at_zero(self):
         instance = self._create_deck()
-        self.assertEqual(instance.total_count, 2)
+        self.assertEqual(instance.total_count, 3)  # physical cards: card_a x1 + card_b x2
         self.assertEqual(instance.scanned_count, 0)
         self.assertEqual(instance.progress, 0.0)
         self.assertFalse(instance.is_complete)
@@ -74,7 +74,9 @@ class DeckTrackingApiTests(unittest.TestCase):
         register_scan(self.db, self.user.id, instance.id, self.card_a.id, 1)
         register_scan(self.db, self.user.id, instance.id, self.card_b.id, 1)
         mid = get_deck_instance(instance.id, current_user=self.user, db=self.db)
-        self.assertEqual(mid.progress, 50.0)  # card_a done (1/1), card_b not yet (1/2)
+        # Progress is physical cards found (2 of 3: card_a done 1/1, card_b 1/2),
+        # not "card types satisfied" (which would read 1/2 = 50%).
+        self.assertEqual(mid.progress, round(2 / 3 * 100, 1))
         self.assertFalse(mid.is_complete)
 
         register_scan(self.db, self.user.id, instance.id, self.card_b.id, 1)
@@ -140,13 +142,13 @@ class DeckTrackingApiTests(unittest.TestCase):
         ])
         self.assertEqual(second.id, first.id)  # still the same instance
         self.assertEqual(second.deck_id, first.deck_id)  # still the same template
-        self.assertEqual(second.total_count, 2)
+        self.assertEqual(second.total_count, 4)  # physical cards: card_a x1 + card_b x3
         card_b_row = next(c for c in second.cards if c.card_id == self.card_b.id)
         self.assertEqual(card_b_row.expected_quantity, 3)
 
         # Dropping card_a from a re-save should remove its DeckCard row entirely.
         third = self._create_deck(cards=[DeckCardEntry(card_id=self.card_b.id, expected_quantity=3)])
-        self.assertEqual(third.total_count, 1)
+        self.assertEqual(third.total_count, 3)  # physical cards: card_b x3 only
         self.assertEqual(self.db.query(DeckCard).filter(DeckCard.deck_id == first.deck_id).count(), 1)
 
     def test_deck_card_with_null_card_id_excluded_from_progress(self):
@@ -161,7 +163,7 @@ class DeckTrackingApiTests(unittest.TestCase):
         register_scan(self.db, self.user.id, instance.id, self.card_a.id, 1)
         register_scan(self.db, self.user.id, instance.id, self.card_b.id, 2)
         result = get_deck_instance(instance.id, current_user=self.user, db=self.db)
-        self.assertEqual(result.total_count, 2)  # not 3 — the orphaned row is excluded
+        self.assertEqual(result.total_count, 3)  # not 4 — the orphaned row's quantity is excluded
         self.assertTrue(result.is_complete)
 
     def test_instance_scoped_endpoints_reject_other_users(self):

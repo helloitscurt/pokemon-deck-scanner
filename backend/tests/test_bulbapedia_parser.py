@@ -54,6 +54,36 @@ class BulbapediaParserTests(unittest.TestCase):
             "card_name": "Houndour",
             "number": "33",
             "confident": True,
+            "use_number_fallback": True,
+        })
+
+    def test_parse_name_field_plain_tcg_template_has_no_set_or_number(self):
+        """Regression test: Battle Academy 2024's Pikachu Deck uses the plain
+        {{TCG|Name}} form for its basic energy line (verified against the
+        real page) rather than {{TCG ID|Set|Name|Number}} like every other
+        entry on that same page. Before this was handled, the unmatched
+        template fell through to the generic brace-strip fallback and
+        produced the literal string "TCG|Basic Lightning Energy" as the card
+        name — this is what a user would have to manually fix instead of it
+        auto-resolving like every other basic energy entry does.
+
+        use_number_fallback=False matters too, not just the name: this shape
+        opts out of parse_decklists' generic number-field fallback (see
+        test_parse_decklists_plain_tcg_template_does_not_use_number_fallback)
+        because that fallback number belongs to whatever set the entry's
+        image link happens to point at, not necessarily the set the eventual
+        name-only search actually matches — verified live against this exact
+        page: the energy line links "SVE Basic Energies (TCG) #004", but the
+        card TCGdex's name search actually resolves is sv01-257, a different
+        set and number. Passing "004" through as a search filter silently
+        excluded the real match."""
+        parsed = bulbapedia._parse_name_field("{{TCG|Basic Lightning Energy}}")
+        self.assertEqual(parsed, {
+            "set_name": None,
+            "card_name": "Basic Lightning Energy",
+            "number": None,
+            "confident": False,
+            "use_number_fallback": False,
         })
 
     def test_parse_name_field_promo_wikilink_is_unconfident(self):
@@ -89,6 +119,25 @@ class BulbapediaParserTests(unittest.TestCase):
         self.assertEqual(len(blocks[1]["entries"]), 1)
         self.assertEqual(blocks[1]["entries"][0]["raw_name"], "Houndoom")
 
+    def test_parse_decklists_plain_tcg_template_does_not_use_number_fallback(self):
+        """Regression test for the real Battle Academy 2024 Pikachu Deck bug:
+        {{TCG|Basic Lightning Energy}} entry's leading image-link number
+        ("SVE Basic Energies (TCG) #004") must NOT end up as this entry's
+        number — that number belongs to a different, unstated set than
+        whatever card a name-only search actually matches, and passing it
+        through silently made the entry unresolvable via live search."""
+        wikitext = (
+            "{{halfdecklist/header|title=Pikachu Deck|type=Lightning|symbol=no}}\n"
+            "{{halfdecklist/entry|[[Image:SVE.png|24px|link=SVE Basic Energies (TCG)]] 004|G|"
+            "{{TCG|Basic Lightning Energy}}|Energy|Lightning|18}}\n"
+            "{{halfdecklist/footer}}"
+        )
+        blocks = bulbapedia.parse_decklists(wikitext)
+        entry = blocks[0]["entries"][0]
+        self.assertEqual(entry["raw_name"], "Basic Lightning Energy")
+        self.assertEqual(entry["expected_quantity"], 18)
+        self.assertIsNone(entry["number"])
+
 
 @unittest.skipUnless(API_TEST_DEPS_AVAILABLE, "FastAPI/SQLAlchemy are not installed in this lightweight test environment")
 class BulbapediaResolveEntryTests(unittest.TestCase):
@@ -114,6 +163,22 @@ class BulbapediaResolveEntryTests(unittest.TestCase):
         resolved = bulbapedia.resolve_entry(self.db, entry)
         self.assertTrue(resolved["confident"])
         self.assertEqual(resolved["card_id"], self.card.id)
+
+    def test_resolve_entry_plain_tcg_template_resolves_via_live_search(self):
+        """The {{TCG|Name}} form (no set/number) still auto-resolves end to
+        end when the live search finds exactly one match — this is the real
+        Battle Academy 2024 "Basic Lightning Energy" case, which returns
+        exactly one hit from TCGdex in practice (verified live)."""
+        entry = {"raw_name": "Basic Lightning Energy", "set_name": None, "number": None, "expected_quantity": 18, "confident": False}
+        live_result = {"data": [{"id": "sv1-257", "name": "Basic Lightning Energy", "image": "https://example/energy"}], "totalCount": 1}
+        with patch("services.bulbapedia.pokemon_api.search_cards", return_value=live_result), \
+             patch("services.bulbapedia.pokemon_api.parse_card_for_db", return_value={
+                 "id": "sv1-257_en", "tcg_card_id": "sv1-257", "name": "Basic Lightning Energy",
+                 "set_id": "sv1", "number": "257", "lang": "en",
+             }):
+            resolved = bulbapedia.resolve_entry(self.db, entry)
+        self.assertTrue(resolved["confident"])
+        self.assertEqual(resolved["card_id"], "sv1-257_en")
 
     def test_resolve_entry_matches_via_known_set_name_alias(self):
         entry = {"raw_name": "Basic Fire Energy", "set_name": "SVE Energy", "number": "2", "expected_quantity": 18, "confident": True}

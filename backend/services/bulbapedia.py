@@ -139,16 +139,20 @@ def _split_top_level(text: str) -> List[str]:
 
 
 _TCG_ID_RE = re.compile(r"^\{\{TCG ID\|(.+)\}\}$", re.DOTALL)
+_TCG_RE = re.compile(r"^\{\{TCG\|(.+)\}\}$", re.DOTALL)
 _WIKILINK_RE = re.compile(r"^\[\[([^\]|]+)(?:\|([^\]]+))?\]\](.*)$", re.DOTALL)
 
 
 def _parse_name_field(name_field: str) -> dict:
     """Best-effort parse of one entry's card-name field.
 
-    Two shapes seen on real pages: a {{TCG ID|Set|Name|Number}} template
-    (high confidence — exact set + name + number), or a raw [[wikilink]],
-    typically for promo cards not covered by the TCG ID template (lower
-    confidence — name only, no set/number).
+    Three shapes seen on real pages: a {{TCG ID|Set|Name|Number}} template
+    (high confidence — exact set + name + number), a plain {{TCG|Name}}
+    template (name only, no set/number — verified on real pages for basic
+    energy lines, e.g. Battle Academy 2024's Pikachu Deck uses
+    {{TCG|Basic Lightning Energy}} while its other entries all use the
+    {{TCG ID|...}} form), or a raw [[wikilink]], typically for promo cards
+    not covered by either TCG template (lower confidence — name only).
     """
     stripped = name_field.strip()
     match = _TCG_ID_RE.match(stripped)
@@ -160,7 +164,27 @@ def _parse_name_field(name_field: str) -> dict:
                 "card_name": fields[1].strip(),
                 "number": fields[2].strip(),
                 "confident": True,
+                "use_number_fallback": True,
             }
+    tcg_match = _TCG_RE.match(stripped)
+    if tcg_match:
+        # The plain {{TCG|Name}} form (verified on real pages: basic-energy
+        # lines like {{TCG|Basic Lightning Energy}}) never carries its own
+        # set/number, and the entry's leading image-link number (if any)
+        # belongs to whatever set that image happens to link to — not
+        # necessarily the set TCGdex's name search will actually match.
+        # Passing it through as a search filter can incorrectly exclude the
+        # real match (verified: Battle Academy 2024's Pikachu Deck energy
+        # line links "SVE Basic Energies (TCG) #004", but the card that
+        # actually matches by name is sv01-257, a different set/number
+        # entirely) — so this shape explicitly opts out of that fallback.
+        return {
+            "set_name": None,
+            "card_name": tcg_match.group(1).strip(),
+            "number": None,
+            "confident": False,
+            "use_number_fallback": False,
+        }
     link_match = _WIKILINK_RE.match(stripped)
     if link_match:
         display = (link_match.group(2) or link_match.group(1)).strip()
@@ -170,8 +194,15 @@ def _parse_name_field(name_field: str) -> dict:
             "card_name": (display + (" " + suffix if suffix else "")).strip(),
             "number": None,
             "confident": False,
+            "use_number_fallback": True,
         }
-    return {"set_name": None, "card_name": re.sub(r"\{\{|\}\}", "", stripped), "number": None, "confident": False}
+    return {
+        "set_name": None,
+        "card_name": re.sub(r"\{\{|\}\}", "", stripped),
+        "number": None,
+        "confident": False,
+        "use_number_fallback": True,
+    }
 
 
 def _parse_number_field(number_field: str) -> Optional[str]:
@@ -211,10 +242,13 @@ def parse_decklists(wikitext: str) -> List[dict]:
                         quantity = 0
                     parsed_name = _parse_name_field(name_field)
                     if quantity > 0:
+                        number = parsed_name["number"]
+                        if not number and parsed_name["use_number_fallback"]:
+                            number = _parse_number_field(number_field)
                         current["entries"].append({
                             "raw_name": parsed_name["card_name"],
                             "set_name": parsed_name["set_name"],
-                            "number": parsed_name["number"] or _parse_number_field(number_field),
+                            "number": number,
                             "expected_quantity": quantity,
                             "confident": parsed_name["confident"],
                         })

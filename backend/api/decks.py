@@ -33,14 +33,18 @@ def _instance_response(db: Session, instance: DeckInstance, detail: bool = False
         for sc in db.query(ScannedCard).filter(ScannedCard.deck_instance_id == instance.id).all()
     }
 
-    total_count = len(deck_cards)
+    # Counted in physical cards (sum of expected_quantity), not unique card
+    # rows — a 60-card deck should read "0/60", not "0/22", even though only
+    # 22 of those are distinct card types (the rest are extra energy/trainer
+    # copies). is_complete still requires every row individually satisfied.
+    total_count = 0
     scanned_count = 0
     card_rows = []
     for dc in deck_cards:
         sc = scanned_by_card.get(dc.card_id)
         scanned_qty = min(sc.scanned_quantity if sc else 0, dc.expected_quantity)
-        if scanned_qty >= dc.expected_quantity:
-            scanned_count += 1
+        total_count += dc.expected_quantity
+        scanned_count += scanned_qty
         if detail:
             card_rows.append(DeckCardResponse(
                 card_id=dc.card_id,
