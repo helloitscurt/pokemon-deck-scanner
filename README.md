@@ -76,6 +76,7 @@ Be kind. Be clear. Assume good intent. Keep feedback constructive.
 - Virtual binders for collection and checklist views
 - Exact-copy quantities in collection binders, with cross-binder allocation limits and total/unique counts
 - Wishlist with Telegram price alerts
+- Preconstructed-deck completion tracking: search Bulbapedia to add a Battle Deck/Battle Academy product, auto-resolve its card list against the catalogue with manual correction for anything ambiguous, then scan cards against it to see what's still missing — track several decks at once, each independently
 
 ### 📈 Prices, Portfolio & Analytics
 - Cardmarket EUR pricing and TCGPlayer USD pricing via TCGdex
