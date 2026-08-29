@@ -36,17 +36,26 @@ function scaleQuad(quad, scaleX, scaleY) {
   }
 }
 
+// This app supports multiple color themes (data-theme="fire"|"water"|...,
+// see index.css), each overriding --color-brand-red — read live rather
+// than hardcoding the default hex, so the detection outline matches
+// whichever theme is actually active instead of always showing default red.
+function currentBrandRed() {
+  const value = getComputedStyle(document.documentElement).getPropertyValue('--color-brand-red').trim()
+  return value || '#e3000b'
+}
+
 // Clears the overlay and, when a quad was found, strokes its outline.
 // Color signals progress toward a capture: dim while a card is only just
-// detected, brand-red while it's being held steady and the stability
-// streak is building toward the capture threshold.
+// detected, the active theme's brand-red while it's being held steady and
+// the stability streak is building toward the capture threshold.
 function drawOverlay(canvas, quad, stableFraction) {
   const ctx = canvas.getContext('2d')
   ctx.clearRect(0, 0, canvas.width, canvas.height)
   if (!quad) return
 
   const { topLeftCorner, topRightCorner, bottomRightCorner, bottomLeftCorner } = quad
-  ctx.strokeStyle = stableFraction > 0.2 ? '#e3000b' : 'rgba(255,255,255,0.6)'
+  ctx.strokeStyle = stableFraction > 0.2 ? currentBrandRed() : 'rgba(255,255,255,0.6)'
   ctx.lineWidth = Math.max(2, canvas.width * 0.006)
   ctx.beginPath()
   ctx.moveTo(topLeftCorner.x, topLeftCorner.y)

@@ -104,10 +104,10 @@ export default function DeckDetail() {
       let undoRequested = false
       toast((toastInstance) => (
         <span className="flex items-center gap-3">
-          <span>{t('decks.scan.scanned')}: {candidate.name}</span>
+          <span className="min-w-0 flex-1 truncate">{t('decks.scan.scanned')}: {candidate.name}</span>
           <button
             type="button"
-            className="font-semibold text-brand-red underline underline-offset-2"
+            className="flex-shrink-0 font-semibold text-brand-red-light underline underline-offset-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red"
             onClick={async () => {
               if (undoRequested) return
               undoRequested = true
