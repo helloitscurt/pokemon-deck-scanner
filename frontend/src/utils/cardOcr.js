@@ -1,5 +1,5 @@
 // Lazy-loads the vendored Tesseract.js worker (frontend/public/tesseract/,
-// see VENDORED.md) on first use and turns its raw OCR text into the
+// see VENDORED.md) on first use and turns its raw OCR output into the
 // structured fields backend/api/recognize.py's POST /cards/match-text
 // expects — see "The verified backend seam" in
 // docs/plans/live-card-scanner.md's Phase 2. English only for now (see the
@@ -59,27 +59,18 @@ function cleanNumberToken(token) {
 }
 
 // Exported for its own direct test coverage (see cardOcr.test.js) — pure
-// text-in, fields-out, no worker/canvas involved, per the plan's own
-// testing note: "real logic with real bug potential, separate from whether
-// the backend correctly matches once it has clean fields."
+// text-in, fields-out. Name is NOT extracted here (see pickCardName below)
+// — a real-device card (a "Potion" Trainer card) proved a flat-text,
+// first-plausible-line heuristic picks up mid-card noise ("- eee ollie")
+// instead of the actual name, which only position + confidence data (not
+// available from a flat string) can reliably tell apart.
 export function parseCardOcrText(rawText) {
   const text = String(rawText || '')
-  const lines = text.split('\n').map((line) => line.trim()).filter(Boolean)
-
   const numberMatch = text.match(NUMBER_PATTERN)
   const hpMatch = text.match(HP_PATTERN)
 
-  // No reliable pattern for a card's decorative, stylized name — best
-  // effort: the first line with enough letters to plausibly be a name, not
-  // a stray symbol/number line OCR sometimes emits first. Deliberately
-  // conservative elsewhere (set_code, artist, regulation_mark, card_type
-  // are left for a future pass, not guessed at here) — a wrong-but-present
-  // value actively contradicts the correct candidate in the backend's
-  // matcher, which is worse than leaving a field null (neutral).
-  const name = lines.find((line) => /[A-Za-z]{3,}/.test(line) && !/^HP\b/i.test(line)) || null
-
   return {
-    name,
+    name: null,
     name_en: null,
     number_local: numberMatch ? cleanNumberToken(numberMatch[1]) : null,
     number_total: numberMatch ? cleanNumberToken(numberMatch[2]) : null,
@@ -89,11 +80,61 @@ export function parseCardOcrText(rawText) {
   }
 }
 
-// cardCanvas: the same cropped-card canvas cardDetection.js's extractCard()
-// produces. Returns the parsed fields — never throws on a garbled/empty
-// result, since "OCR found nothing usable" is an expected, common outcome
-// this tier is explicitly built to fall back from (see the plan's Phase 2
-// flow diagram), not an error.
+// Structural card-frame labels that sit in the same top band as the real
+// name but are never it (checked against the actual layout of Pokemon,
+// Trainer/Item, Supporter, Stadium, and Energy cards). Compared
+// case-insensitively against a candidate line's full trimmed text, not a
+// substring — "Potion" doesn't contain "item" as a whole word, but a line
+// that IS just "Item" does.
+const NAME_BAND_DENYLIST = new Set([
+  'trainer', 'item', 'supporter', 'stadium', 'energy', 'basic',
+  'pokemon', 'pokémon', 'ex', 'gx', 'v', 'vmax', 'vstar',
+])
+
+// The name is always printed in a banner near the top of a card — position
+// is a much stronger signal than "first line with letters" (see
+// parseCardOcrText's comment for why that failed). Fraction of the card's
+// height to search, and the minimum Tesseract confidence (0-100) to trust
+// — both are reasoned starting points, not empirically calibrated against
+// real cards yet; expect to retune after more real-device data.
+const NAME_BAND_FRACTION = 0.22
+const MIN_NAME_CONFIDENCE = 40
+
+// Flattens Tesseract's blocks -> paragraphs -> lines into one list. Each
+// line carries text/confidence/bbox — see index.d.ts in the vendored
+// tesseract.js package for the shape. Requires output: {blocks: true} on
+// the recognize() call (off by default — text-only is Tesseract.js's own
+// default output, for performance).
+function flattenLines(blocks) {
+  const lines = []
+  for (const block of blocks || []) {
+    for (const paragraph of block.paragraphs || []) {
+      for (const line of paragraph.lines || []) {
+        lines.push(line)
+      }
+    }
+  }
+  return lines
+}
+
+// Exported for its own direct test coverage (see cardOcr.test.js) —
+// pure data-in, name-out. cardHeight is the OCR crop's pixel height (same
+// coordinate space as each line's bbox); passing 0/undefined disables the
+// position filter (used defensively, not expected in real use).
+export function pickCardName(blocks, cardHeight) {
+  const candidates = flattenLines(blocks).filter((line) => {
+    const text = (line.text || '').trim()
+    if (!/[A-Za-z]{2,}/.test(text)) return false
+    if ((line.confidence ?? 0) < MIN_NAME_CONFIDENCE) return false
+    if (NAME_BAND_DENYLIST.has(text.toLowerCase())) return false
+    if (cardHeight && line.bbox) return line.bbox.y0 < cardHeight * NAME_BAND_FRACTION
+    return true
+  })
+  if (candidates.length === 0) return null
+  candidates.sort((a, b) => b.confidence - a.confidence)
+  return candidates[0].text.trim()
+}
+
 // Mutable, not React state — mirrors cardDetection.js's detectionStatus.
 // DeckCardScanner reads this into its on-screen debug readout right after
 // calling recognizeCardText, so "Tesseract found nothing at all" can be
@@ -101,10 +142,21 @@ export function parseCardOcrText(rawText) {
 // into a name/number" without server logs or devtools access on a phone.
 export const lastOcrRawText = { value: '' }
 
+// cardCanvas: the same cropped-card canvas cardDetection.js's extractCard()
+// produces. Returns the parsed fields — never throws on a garbled/empty
+// result, since "OCR found nothing usable" is an expected, common outcome
+// this tier is explicitly built to fall back from (see the plan's Phase 2
+// flow diagram), not an error.
 export async function recognizeCardText(cardCanvas) {
   const worker = await ensureWorker()
-  const { data } = await worker.recognize(cardCanvas)
+  // blocks: true is required for pickCardName's position/confidence data —
+  // text: true keeps the flat string parseCardOcrText's number/HP regexes
+  // already rely on.
+  const { data } = await worker.recognize(cardCanvas, {}, { text: true, blocks: true })
   const rawText = data?.text || ''
   lastOcrRawText.value = rawText
-  return parseCardOcrText(rawText)
+  return {
+    ...parseCardOcrText(rawText),
+    name: pickCardName(data?.blocks, cardCanvas?.height),
+  }
 }
