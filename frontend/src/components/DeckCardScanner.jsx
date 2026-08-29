@@ -97,6 +97,13 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   const tickInFlightRef = useRef(false)
   const cameraFallbackLockedRef = useRef(false)
   const timersRef = useRef([])
+  // Set right after a successful auto-save; cleared the first time a
+  // detection tick sees no card at all. Without this, a still-sitting card
+  // the user hasn't physically moved away yet gets auto-detected as stable
+  // again within a few hundred ms of returning to 'hunting' — a real,
+  // observed redundant re-scan of an already-saved card (see build step 8/11
+  // real-device notes), not a hypothetical.
+  const awaitingCardRemovalRef = useRef(false)
 
   // hunting | processing | ambiguous | success | error | cameraDenied
   const [phase, setPhase] = useState('hunting')
@@ -135,6 +142,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   useEffect(() => {
     if (!isOpen) return
     cameraFallbackLockedRef.current = false
+    awaitingCardRemovalRef.current = false
     setResult(null)
     setError(null)
     setConfirmError(null)
@@ -165,6 +173,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
     setError(null)
     setPhase('success')
     setShowCheckmark(true)
+    awaitingCardRemovalRef.current = true
     timersRef.current.push(setTimeout(() => setShowCheckmark(false), CHECKMARK_DURATION_MS))
     timersRef.current.push(setTimeout(() => {
       stabilityTrackerRef.current.reset()
@@ -316,6 +325,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
         detectionCanvas.getContext('2d').drawImage(video, 0, 0, detectionWidth, detectionHeight)
 
         const quad = await detectCardQuad(detectionCanvas)
+        if (!quad) awaitingCardRemovalRef.current = false
         const { consecutiveStableFrames, readyToCapture } = stabilityTrackerRef.current.observe(
           quad, detectionWidth, detectionHeight,
         )
@@ -328,7 +338,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
           consecutiveStableFrames / REQUIRED_STABLE_FRAMES,
         )
 
-        if (readyToCapture && quad) {
+        if (readyToCapture && quad && !awaitingCardRemovalRef.current) {
           const captureCanvas = captureCanvasRef.current
           captureCanvas.width = video.videoWidth
           captureCanvas.height = video.videoHeight

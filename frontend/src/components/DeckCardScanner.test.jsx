@@ -178,10 +178,38 @@ describe('DeckCardScanner', () => {
     expect(screen.queryByLabelText('decks.scan.captured')).not.toBeInTheDocument()
     expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
 
-    // And the loop actually re-arms: a fresh stable hold captures again.
+    // The loop re-arms once the card is actually removed from frame — not
+    // merely once cooldown elapses (see the next test: a still-sitting card
+    // must NOT re-trigger a capture on its own).
     recognizeCard.mockClear()
+    detectCardQuad.mockResolvedValueOnce(null)
+    await advanceTicks(1)
+    detectCardQuad.mockResolvedValue(STABLE_QUAD)
     await advanceTicks(REQUIRED_STABLE_FRAMES)
     expect(recognizeCard).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not immediately re-capture the same still-visible card right after a successful auto-save', async () => {
+    // Real-device finding: a card the user hasn't physically moved away yet
+    // was getting auto-detected as stable again within ~3s of a successful
+    // save, firing a second, unintended (and costly) recognize call.
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-abc123',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+    recognizeCard.mockClear()
+    // Checkmark + cooldown elapse, but detectCardQuad keeps returning the
+    // same STABLE_QUAD throughout — the card was never actually removed.
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(recognizeCard).not.toHaveBeenCalled()
   })
 
   it('falls back to the tap-to-confirm picker on an ambiguous match, and pauses further auto-capture while it is shown', async () => {
