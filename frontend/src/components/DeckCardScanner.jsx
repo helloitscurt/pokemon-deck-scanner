@@ -435,7 +435,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
                   type="button"
                   disabled={confirmingKey != null}
                   onClick={() => confirmCard(candidate, key)}
-                  className="w-full flex items-center gap-3 rounded-xl border border-border bg-bg-card p-3 text-left hover:border-brand-red/40 hover:bg-brand-red/10 transition-colors disabled:opacity-50"
+                  className="w-full flex items-center gap-3 rounded-xl border border-border bg-bg-card p-3 text-left hover:border-brand-red/40 hover:bg-brand-red/10 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red/70 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <img
                     src={resolveCardImageUrl(candidate, 'small')}
@@ -459,7 +459,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
               )
             })}
             {matches.length > 0 && (
-              <button onClick={resetForNextCard} disabled={confirmingKey != null} className="btn-ghost w-full text-sm disabled:opacity-50">
+              <button onClick={resetForNextCard} disabled={confirmingKey != null} className="btn-ghost w-full text-sm disabled:cursor-not-allowed disabled:opacity-50">
                 {t('decks.scan.scanAnother')}
               </button>
             )}
