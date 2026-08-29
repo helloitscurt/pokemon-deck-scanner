@@ -26,7 +26,10 @@ function loadScript(src) {
 
 // Resolves to a jscanify instance once window.cv is fully initialized.
 // Cached as a singleton promise so repeated calls (every detection tick,
-// or an explicit preload) only ever load/init once per page load.
+// or an explicit preload) only ever load/init once per page load — but
+// only the successful case is cached. A transient failure (e.g. a network
+// blip while the scanner opens) must not permanently wedge every future
+// call for the rest of the page's lifetime with the same stale rejection.
 function ensureReady() {
   if (!readyPromise) {
     readyPromise = loadScript('/opencv/opencv.js')
@@ -35,6 +38,10 @@ function ensureReady() {
       }))
       .then(() => loadScript('/opencv/jscanify.js'))
       .then(() => new window.jscanify())
+      .catch((err) => {
+        readyPromise = null
+        throw err
+      })
   }
   return readyPromise
 }

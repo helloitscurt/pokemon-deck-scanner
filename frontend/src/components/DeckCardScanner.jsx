@@ -176,10 +176,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
     setConfirmError(null)
     try {
       await onConfirm(candidate, { isAutoSave })
+      // The fallback path skips the checkmark theater — just clear back to
+      // the ready-to-scan-next state (resetForNextCard already routes to
+      // 'cameraDenied' vs 'hunting' correctly based on the same lock).
       if (cameraFallbackLockedRef.current) {
-        setResult(null)
-        setError(null)
-        setPhase('cameraDenied')
+        resetForNextCard()
       } else {
         enterSuccessCooldown()
       }

@@ -10,7 +10,7 @@ from api.collection import ensure_card_exists, find_matching_collection_item
 from database import get_db
 from models import Card, Deck, DeckCard, DeckInstance, ScannedCard, User
 from schemas import (
-    DeckCreate, DeckInstanceDetailResponse, DeckInstanceResponse, DeckCardResponse,
+    CollectionItemCreate, DeckCreate, DeckInstanceDetailResponse, DeckInstanceResponse, DeckCardResponse,
     DeckSearchResult, DeckParseRequest, DeckParseResponse, DeckParseBlock, DeckParseEntry,
 )
 from services import bulbapedia
@@ -287,13 +287,19 @@ def undo_scan(
     if not instance:
         raise HTTPException(status_code=404, detail="Deck instance not found")
 
-    # The scanner always adds with these exact defaults (see
-    # schemas.CollectionItemCreate and api.collection.add_to_collection) —
-    # deterministic, so undo re-derives the same row add_to_collection
-    # would have found without the frontend needing to remember its id.
+    # The scanner always adds with CollectionItemCreate's own defaults (it
+    # never sends variant/condition/lang/purchase_price at all) — read
+    # from the schema itself rather than duplicating the literals here, so
+    # this can't silently drift from add_to_collection's matching rule if
+    # a default value is ever changed in only one place.
+    default_fields = CollectionItemCreate.model_fields
     matching_item = find_matching_collection_item(
         db, current_user.id,
-        card_id=card_id, variant="Normal", lang="en", condition="NM", purchase_price=None,
+        card_id=card_id,
+        variant=default_fields["variant"].default,
+        lang=default_fields["lang"].default,
+        condition=default_fields["condition"].default,
+        purchase_price=default_fields["purchase_price"].default,
     )
     if not matching_item:
         raise HTTPException(status_code=404, detail="No matching scan found to undo")

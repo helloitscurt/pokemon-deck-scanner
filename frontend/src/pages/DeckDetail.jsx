@@ -95,6 +95,13 @@ export default function DeckDetail() {
       // matching row from exactly this value, deterministically, so this
       // is the only thing that needs remembering per scan.
       const cardId = response.data.card_id
+      // Guards against a double-tap firing two undo calls — lives in this
+      // closure (one per toast() call), not inside the render function
+      // below, since react-hot-toast keeps re-invoking that function
+      // during the exit animation toast.dismiss() starts: the button stays
+      // in the DOM (fading out) for that duration, not removed
+      // synchronously, so dismissing alone doesn't stop a fast second tap.
+      let undoRequested = false
       toast((toastInstance) => (
         <span className="flex items-center gap-3">
           <span>{t('decks.scan.scanned')}: {candidate.name}</span>
@@ -102,10 +109,8 @@ export default function DeckDetail() {
             type="button"
             className="font-semibold text-brand-red underline underline-offset-2"
             onClick={async () => {
-              // Dismiss immediately, before the request resolves — the
-              // toast disappearing on tap is what prevents a second tap
-              // on the same toast from firing a second undo, rather than
-              // a separate in-flight-disable flag.
+              if (undoRequested) return
+              undoRequested = true
               toast.dismiss(toastInstance.id)
               try {
                 await undoLastScan(instanceId, cardId)
