@@ -466,6 +466,9 @@ const en = {
       liveHint: 'Hold one card steady on a plain, contrasting surface.',
       cameraUnavailable: 'Camera unavailable — take a photo instead.',
       captured: 'Captured',
+      undo: 'Undo',
+      undone: 'Scan undone.',
+      undoFailed: 'Couldn’t undo — check your connection and try again.',
     },
   },
 

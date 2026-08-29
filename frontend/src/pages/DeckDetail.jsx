@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { ArrowLeft, Camera, RotateCcw, Trash2 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection } from '../api/client'
+import { getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection, undoLastScan } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { useConfirmDialog } from '../contexts/ConfirmDialogContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
@@ -74,11 +74,52 @@ export default function DeckDetail() {
     deleteMutation.mutate()
   }
 
+  // { candidate, isAutoSave } — bundled into one object because
+  // useMutation only forwards a single argument through to onSuccess.
+  // isAutoSave decides which toast shows: a plain success toast for a
+  // manual tap (unchanged), or the Undo-capable one below in its place
+  // (not in addition to it) for an auto-save. Without this, every
+  // auto-save would stack two toasts for one action — DeckCardScanner's
+  // auto-save path and this onSuccess both fire on the exact same confirm.
   const scanMutation = useMutation({
-    mutationFn: (candidate) => addToCollection({ card_id: candidate.id, quantity: 1, deck_instance_id: Number(instanceId) }),
-    onSuccess: (_response, candidate) => {
-      toast.success(`${t('decks.scan.scanned')}: ${candidate.name}`)
+    mutationFn: ({ candidate }) => addToCollection({ card_id: candidate.id, quantity: 1, deck_instance_id: Number(instanceId) }),
+    onSuccess: (response, { candidate, isAutoSave }) => {
       invalidate()
+      if (!isAutoSave) {
+        toast.success(`${t('decks.scan.scanned')}: ${candidate.name}`)
+        return
+      }
+      // response.data.card_id is add_to_collection's own resolved id for
+      // this card — not candidate.id — since add_to_collection can
+      // rewrite it (see api/collection.py). The undo route re-derives its
+      // matching row from exactly this value, deterministically, so this
+      // is the only thing that needs remembering per scan.
+      const cardId = response.data.card_id
+      toast((toastInstance) => (
+        <span className="flex items-center gap-3">
+          <span>{t('decks.scan.scanned')}: {candidate.name}</span>
+          <button
+            type="button"
+            className="font-semibold text-brand-red underline underline-offset-2"
+            onClick={async () => {
+              // Dismiss immediately, before the request resolves — the
+              // toast disappearing on tap is what prevents a second tap
+              // on the same toast from firing a second undo, rather than
+              // a separate in-flight-disable flag.
+              toast.dismiss(toastInstance.id)
+              try {
+                await undoLastScan(instanceId, cardId)
+                invalidate()
+                toast.success(t('decks.scan.undone'))
+              } catch {
+                toast.error(t('decks.scan.undoFailed'))
+              }
+            }}
+          >
+            {t('decks.scan.undo')}
+          </button>
+        </span>
+      ), { duration: 5000 })
     },
     onError: () => toast.error(t('decks.scan.addFailed')),
   })
@@ -245,7 +286,7 @@ export default function DeckDetail() {
       <DeckCardScanner
         isOpen={scannerOpen}
         onClose={() => setScannerOpen(false)}
-        onConfirm={(candidate) => scanMutation.mutateAsync(candidate)}
+        onConfirm={(candidate, meta) => scanMutation.mutateAsync({ candidate, ...meta })}
       />
     </div>
   )

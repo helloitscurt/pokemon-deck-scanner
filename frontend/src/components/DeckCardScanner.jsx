@@ -168,11 +168,14 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   // failure stays visible via confirmError rather than silently resetting.
   // Returns whether the save succeeded, so callers with no picker of their
   // own (the auto-save path) know whether to fall back to showing one.
-  const confirmCard = async (candidate, key) => {
+  // isAutoSave is threaded through to onConfirm so DeckDetail.jsx's own
+  // success handler can show an Undo-capable toast for auto-saves instead
+  // of stacking it on top of the existing plain one (see DeckDetail.jsx).
+  const confirmCard = async (candidate, key, isAutoSave = false) => {
     setConfirmingKey(key)
     setConfirmError(null)
     try {
-      await onConfirm(candidate)
+      await onConfirm(candidate, { isAutoSave })
       if (cameraFallbackLockedRef.current) {
         setResult(null)
         setError(null)
@@ -201,7 +204,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
       const topCandidate = data?.matches?.[0]
 
       if (data?._identity_confident && topCandidate) {
-        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto')
+        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true)
         if (!saved) {
           setResult(data)
           setPhase('ambiguous')

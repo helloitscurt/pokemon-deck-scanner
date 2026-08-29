@@ -408,6 +408,8 @@ export const getDeckInstances = () => api.get('/decks/instances').then(r => r.da
 export const getDeckInstance = (id) => api.get(`/decks/instances/${id}`).then(r => r.data)
 export const resetDeckInstance = (id) => api.post(`/decks/instances/${id}/reset`).then(r => r.data)
 export const deleteDeckInstance = (id) => api.delete(`/decks/instances/${id}`).then(r => r.data)
+export const undoLastScan = (instanceId, cardId) =>
+  api.post(`/decks/instances/${instanceId}/scans/${encodeURIComponent(cardId)}/undo`).then(r => r.data)
 
 // Social
 export const getLeaderboard = (params = {}) => api.get('/social/leaderboard', { params })
