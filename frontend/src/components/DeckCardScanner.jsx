@@ -180,11 +180,14 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   // isAutoSave is threaded through to onConfirm so DeckDetail.jsx's own
   // success handler can show an Undo-capable toast for auto-saves instead
   // of stacking it on top of the existing plain one (see DeckDetail.jsx).
-  const confirmCard = async (candidate, key, isAutoSave = false) => {
+  // traceId (from recognizeCard()'s response, only present when the user
+  // has scan diagnostics enabled) rides along the same way, so an eventual
+  // undo can be correlated back to the scan trace it's reversing.
+  const confirmCard = async (candidate, key, isAutoSave = false, traceId = null) => {
     setConfirmingKey(key)
     setConfirmError(null)
     try {
-      await onConfirm(candidate, { isAutoSave })
+      await onConfirm(candidate, { isAutoSave, traceId })
       // The fallback path skips the checkmark theater — just clear back to
       // the ready-to-scan-next state (resetForNextCard already routes to
       // 'cameraDenied' vs 'hunting' correctly based on the same lock).
@@ -210,11 +213,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
       const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
       if (!blob) throw new Error('capture-failed')
 
-      const data = await recognizeCard(blob)
+      const data = await recognizeCard(blob, 'live_auto_scan')
       const topCandidate = data?.matches?.[0]
 
       if (data?._identity_confident && topCandidate) {
-        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true)
+        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true, data.trace_id)
         if (!saved) {
           setResult(data)
           setPhase('ambiguous')
@@ -308,7 +311,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
     setConfirmError(null)
     setPhase('processing')
     try {
-      const data = await recognizeCard(file)
+      const data = await recognizeCard(file, 'manual')
       setResult(data)
       setPhase('ambiguous')
     } catch (err) {
@@ -434,7 +437,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
                   key={key}
                   type="button"
                   disabled={confirmingKey != null}
-                  onClick={() => confirmCard(candidate, key)}
+                  onClick={() => confirmCard(candidate, key, false, result.trace_id)}
                   className="w-full flex items-center gap-3 rounded-xl border border-border bg-bg-card p-3 text-left hover:border-brand-red/40 hover:bg-brand-red/10 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red/70 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <img

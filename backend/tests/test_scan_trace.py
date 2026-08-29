@@ -18,6 +18,7 @@ try:
         create_scan_trace,
         delete_user_traces,
         record_ground_truth,
+        record_scan_reversed,
         revoke_user_traces,
         trace_available,
         trace_deletion_available,
@@ -227,6 +228,80 @@ class ScanTraceTests(unittest.TestCase):
         self.assertTrue(
             all(stat.S_IMODE(path.stat().st_mode) == 0o600 for path in payload_paths)
         )
+
+    def test_source_label_is_recorded_and_defaults_to_none(self):
+        self._enable(self.user)
+        labeled = create_scan_trace(self.db, self.user.id, mode="single", source="live_auto_scan")
+        unlabeled = create_scan_trace(self.db, self.user.id, mode="single")
+
+        labeled_payload = json.loads(labeled.save().read_text(encoding="utf-8"))
+        unlabeled_payload = json.loads(unlabeled.save().read_text(encoding="utf-8"))
+
+        self.assertEqual(labeled_payload["source"], "live_auto_scan")
+        self.assertIsNone(unlabeled_payload["source"])
+
+    def test_undone_at_starts_none_and_record_scan_reversed_sets_it(self):
+        self._enable(self.user)
+        trace = create_scan_trace(self.db, self.user.id, mode="single")
+        trace.record_decision("number_metadata", "base1-58")
+        path = trace.save()
+        self.assertIsNone(json.loads(path.read_text(encoding="utf-8"))["undone_at"])
+
+        self.assertTrue(record_scan_reversed(self.user.id, trace.trace_id))
+
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIsNotNone(payload["undone_at"])
+        # Everything else the trace already recorded survives untouched.
+        self.assertEqual(payload["decision"]["selected"], "base1-58")
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_record_scan_reversed_no_ops_for_a_scan_that_was_never_saved(self):
+        # Diagnostics disabled (never enabled in this test) -> trace.save()
+        # writes nothing. Undo must not fail or raise just because there
+        # was nothing to mark.
+        trace = create_scan_trace(self.db, self.user.id, mode="single")
+        trace.save()
+
+        self.assertFalse(record_scan_reversed(self.user.id, trace.trace_id))
+
+    def test_record_scan_reversed_no_ops_for_an_unknown_or_empty_trace_id(self):
+        self._enable(self.user)
+        self.assertFalse(record_scan_reversed(self.user.id, "not-a-real-trace-id"))
+        self.assertFalse(record_scan_reversed(self.user.id, None))
+        self.assertFalse(record_scan_reversed(self.user.id, ""))
+
+    def test_record_scan_reversed_ignores_glob_wildcards_in_a_crafted_trace_id(self):
+        """trace_id is client-supplied (round-tripped through the undo call)
+        and lands directly in a glob pattern. Verified empirically that
+        pathlib.Path.glob() does not give '..' any parent-directory meaning
+        in a pattern (it just fails to match), so cross-directory traversal
+        was never reachable here regardless of _safe(). What IS reachable
+        without it: a trace_id of "*" turns into the pattern "*.json",
+        matching every trace this user has ever saved — a single crafted
+        undo call could mark all of them undone at once. _safe() strips
+        glob metacharacters (*, ?, [, ]) before they ever reach a pattern."""
+        self._enable(self.user)
+        kept = create_scan_trace(self.db, self.user.id, mode="single")
+        kept.record_decision("number_metadata", "base1-58")
+        kept_path = kept.save()
+        other = create_scan_trace(self.db, self.user.id, mode="single")
+        other_path = other.save()
+
+        self.assertFalse(record_scan_reversed(self.user.id, "*"))
+
+        # Neither this user's real trace nor an unrelated one of theirs was
+        # swept up by the wildcard.
+        self.assertIsNone(json.loads(kept_path.read_text(encoding="utf-8"))["undone_at"])
+        self.assertIsNone(json.loads(other_path.read_text(encoding="utf-8"))["undone_at"])
+
+    def test_record_scan_reversed_only_touches_the_requesting_users_trace(self):
+        self._enable(self.user)
+        self._enable(self.other_user)
+        trace = create_scan_trace(self.db, self.user.id, mode="single")
+        path = trace.save()
+
+        self.assertFalse(record_scan_reversed(self.other_user.id, trace.trace_id))
+        self.assertIsNone(json.loads(path.read_text(encoding="utf-8"))["undone_at"])
 
     def test_delete_removes_only_the_requesting_users_trace_tree(self):
         self._enable(self.user)

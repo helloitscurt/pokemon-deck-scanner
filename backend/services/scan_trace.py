@@ -208,6 +208,7 @@ class ScanTrace:
         filename: str | None = None,
         provider: str | None = None,
         model: str | None = None,
+        source: str | None = None,
     ):
         self.enabled = bool(enabled)
         self.user_id = int(user_id)
@@ -223,12 +224,23 @@ class ScanTrace:
             "filename": filename,
             "provider": provider,
             "model": model,
+            # Which UI flow produced this scan — e.g. "live_auto_scan" vs
+            # "manual" for the deck-tracking scanner (see
+            # docs/plans/live-card-scanner.md). Lets analysis separate
+            # confident recognitions that were auto-saved with no human
+            # glance from ones that still went through a manual tap, since
+            # both hit this same endpoint otherwise indistinguishably.
+            "source": source,
             "extraction": {},
             "search": {"tcgdex": [], "prefilter": None},
             "candidates": [],
             "decision": {"mechanism": None, "selected": None},
             "ground_truth": None,
             "correct": None,
+            # Set later, out-of-band, if this specific scan is reversed —
+            # see record_scan_reversed. None means "not (yet) undone", not
+            # "known to have been kept".
+            "undone_at": None,
         }
         self._image: bytes | None = None
         self._secrets: list[str] = []
@@ -423,6 +435,7 @@ def create_scan_trace(
     filename: str | None = None,
     provider: str | None = None,
     model: str | None = None,
+    source: str | None = None,
 ) -> ScanTrace:
     return ScanTrace(
         enabled=user_trace_enabled(db, user_id),
@@ -433,6 +446,7 @@ def create_scan_trace(
         filename=filename,
         provider=provider,
         model=model,
+        source=source,
     )
 
 
@@ -480,6 +494,59 @@ def record_ground_truth(
             if temp:
                 temp.unlink(missing_ok=True)
             logger.exception("Failed to label scan diagnostics at %s", path)
+    return updated
+
+
+def record_scan_reversed(user_id: int, trace_id: str | None) -> bool:
+    """Mark a saved trace as later undone, for auto-save-accuracy analysis —
+    the only way to ever measure "how often does auto-save get it wrong" is
+    to know which confident, auto-saved recognitions a user later reversed.
+
+    trace_id is client-supplied (round-tripped from an earlier /cards/recognize
+    response through the undo call) and lands directly in a glob pattern.
+    Checked empirically: pathlib.Path.glob() gives '..' no parent-directory
+    meaning in a pattern (it just fails to match), so cross-directory
+    traversal was never reachable here regardless. What IS reachable
+    without sanitizing first: a trace_id of "*" becomes the pattern
+    "*.json", matching every trace this user has ever saved — one crafted
+    call could mark all of them undone at once. _safe() strips glob
+    metacharacters (*, ?, [, ]) before they ever reach the pattern, the
+    same protection record_ground_truth's job/item ids already rely on.
+
+    No-ops (returns False, does not raise) if trace_id is empty, tracing was
+    disabled for that scan (no file was ever saved), or nothing matches —
+    undo must never fail, or even log loudly, just because diagnostics
+    weren't recording. mode="single" traces have no job_id/item_id, so the
+    filename is just "{trace_id}.json" — unlike record_ground_truth's
+    wildcard job/item pattern, this is an exact match; a fresh uuid4 hex
+    trace_id doesn't need one.
+    """
+    if not trace_id:
+        return False
+    pattern = f"{_safe(trace_id)}.json"
+    paths: set[Path] = set()
+    for root in _cleanup_roots():
+        user_dir = _user_dir(user_id, root)
+        if user_dir is not None and user_dir.is_dir():
+            paths.update(user_dir.glob(f"*/{pattern}"))
+
+    updated = False
+    for path in sorted(paths):
+        temp: Path | None = None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            data["undone_at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            temp = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
+            _write_private(
+                temp,
+                json.dumps(data, indent=2, ensure_ascii=False, default=str),
+            )
+            temp.replace(path)
+            updated = True
+        except Exception:
+            if temp:
+                temp.unlink(missing_ok=True)
+            logger.exception("Failed to mark scan trace %s as undone", trace_id)
     return updated
 
 

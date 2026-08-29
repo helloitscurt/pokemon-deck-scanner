@@ -1,4 +1,5 @@
 import datetime
+import logging
 from typing import List
 
 import httpx
@@ -15,6 +16,9 @@ from schemas import (
 )
 from services import bulbapedia
 from services.deck_progress import unregister_scan
+from services.scan_trace import record_scan_reversed
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -261,6 +265,20 @@ def reset_deck_instance(
 def undo_scan(
     instance_id: int,
     card_id: str,
+    # Round-tripped from the /cards/recognize response that produced this
+    # scan (only present at all when that user has scan diagnostics
+    # enabled — see services/scan_trace.py) so the reversal can be marked
+    # on the original trace for auto-save-accuracy analysis. Optional and
+    # separate from everything else this route does: a missing, stale, or
+    # invalid trace_id must never block the actual undo.
+    # Plain default, not Query(default=None): FastAPI infers a simple typed
+    # param as a query param automatically without needing the wrapper, and
+    # this route is called directly (bypassing FastAPI's own request
+    # handling, which resolves Query(...) markers into real values) by
+    # every test in this file — Query(default=None) stays a truthy
+    # sentinel object rather than None when the function is called that
+    # way directly, which a plain default doesn't have.
+    trace_id: str | None = None,
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -317,6 +335,16 @@ def undo_scan(
         matching_item.quantity -= 1
 
     db.commit()
+
+    # Best-effort, file-based, and independent of the transaction just
+    # committed above — matches _apply_deck_scan's own rule that a
+    # diagnostics side-effect must never make an already-committed action
+    # look like it failed.
+    try:
+        record_scan_reversed(current_user.id, trace_id)
+    except Exception:
+        logger.exception("Failed to mark scan trace %s as undone", trace_id)
+
     return _instance_response(db, instance, detail=True)
 
 

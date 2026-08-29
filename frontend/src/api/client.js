@@ -109,10 +109,13 @@ export const deleteCustomCard = (cardId) => api.delete(`/cards/custom/${cardId}`
 export const getCustomCards = () => api.get('/cards/custom')
 export const cloneCustomCard = (cardId) => api.post(`/cards/custom/${cardId}/clone`).then(r => r.data)
 
-// Card recognition via Gemini Vision
-export const recognizeCard = (imageFile) => {
+// Card recognition via Gemini Vision. source is an optional diagnostics
+// label (e.g. "live_auto_scan" vs "manual" from the deck-tracking scanner)
+// — never affects matching, only which UI flow a saved trace records.
+export const recognizeCard = (imageFile, source) => {
   const formData = new FormData()
   formData.append('file', imageFile)
+  if (source) formData.append('source', source)
   return api.post('/cards/recognize', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   }).then(r => r.data)
@@ -408,8 +411,13 @@ export const getDeckInstances = () => api.get('/decks/instances').then(r => r.da
 export const getDeckInstance = (id) => api.get(`/decks/instances/${id}`).then(r => r.data)
 export const resetDeckInstance = (id) => api.post(`/decks/instances/${id}/reset`).then(r => r.data)
 export const deleteDeckInstance = (id) => api.delete(`/decks/instances/${id}`).then(r => r.data)
-export const undoLastScan = (instanceId, cardId) =>
-  api.post(`/decks/instances/${instanceId}/scans/${encodeURIComponent(cardId)}/undo`).then(r => r.data)
+// traceId is optional — round-tripped from the recognizeCard() response
+// that produced this scan (only present when that user has scan
+// diagnostics enabled) so the reversal can be correlated back to it.
+export const undoLastScan = (instanceId, cardId, traceId) =>
+  api.post(`/decks/instances/${instanceId}/scans/${encodeURIComponent(cardId)}/undo`, null, {
+    params: traceId ? { trace_id: traceId } : undefined,
+  }).then(r => r.data)
 
 // Social
 export const getLeaderboard = (params = {}) => api.get('/social/leaderboard', { params })

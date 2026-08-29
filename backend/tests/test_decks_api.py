@@ -437,6 +437,42 @@ class UndoScanTests(unittest.TestCase):
             ScannedCard.deck_instance_id == instance.id, ScannedCard.card_id == self.card_b.id,
         ).first())
 
+    def test_passes_trace_id_through_to_scan_trace_when_given(self):
+        instance = self._create_deck()
+        self._confirm_scan(instance, self.card_a)
+
+        with patch("api.decks.record_scan_reversed") as mock_record:
+            undo_scan(instance.id, self.card_a.id, trace_id="abc123def456", current_user=self.user, db=self.db)
+
+        mock_record.assert_called_once_with(self.user.id, "abc123def456")
+
+    def test_omitting_trace_id_calls_scan_trace_with_none_not_a_sentinel(self):
+        """Regression test: trace_id used to default via Query(default=None),
+        which resolves to a truthy Query(None) marker object (not None) when
+        this route is called directly rather than through a real FastAPI
+        request — exactly how every test in this file calls it. A plain
+        default fixes that; this pins the actual value passed through."""
+        instance = self._create_deck()
+        self._confirm_scan(instance, self.card_a)
+
+        with patch("api.decks.record_scan_reversed") as mock_record:
+            undo_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+
+        mock_record.assert_called_once_with(self.user.id, None)
+
+    def test_undo_succeeds_even_if_recording_the_trace_reversal_fails(self):
+        """Regression test for the same isolation _apply_deck_scan already
+        gets right: a diagnostics-only failure must never make an
+        already-committed undo look like it failed."""
+        instance = self._create_deck()
+        self._confirm_scan(instance, self.card_a)
+
+        with patch("api.decks.record_scan_reversed", side_effect=RuntimeError("boom")):
+            result = undo_scan(instance.id, self.card_a.id, trace_id="abc123", current_user=self.user, db=self.db)
+
+        self.assertEqual(result.scanned_count, 0)
+        self.assertIsNone(self._collection_item(self.card_a))
+
 
 if __name__ == "__main__":
     unittest.main()

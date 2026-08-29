@@ -74,16 +74,18 @@ export default function DeckDetail() {
     deleteMutation.mutate()
   }
 
-  // { candidate, isAutoSave } — bundled into one object because
+  // { candidate, isAutoSave, traceId } — bundled into one object because
   // useMutation only forwards a single argument through to onSuccess.
   // isAutoSave decides which toast shows: a plain success toast for a
   // manual tap (unchanged), or the Undo-capable one below in its place
   // (not in addition to it) for an auto-save. Without this, every
   // auto-save would stack two toasts for one action — DeckCardScanner's
   // auto-save path and this onSuccess both fire on the exact same confirm.
+  // traceId (only present when the user has scan diagnostics enabled) is
+  // just carried through to the undo call below, for correlation.
   const scanMutation = useMutation({
     mutationFn: ({ candidate }) => addToCollection({ card_id: candidate.id, quantity: 1, deck_instance_id: Number(instanceId) }),
-    onSuccess: (response, { candidate, isAutoSave }) => {
+    onSuccess: (response, { candidate, isAutoSave, traceId }) => {
       invalidate()
       if (!isAutoSave) {
         toast.success(`${t('decks.scan.scanned')}: ${candidate.name}`)
@@ -113,7 +115,7 @@ export default function DeckDetail() {
               undoRequested = true
               toast.dismiss(toastInstance.id)
               try {
-                await undoLastScan(instanceId, cardId)
+                await undoLastScan(instanceId, cardId, traceId)
                 invalidate()
                 toast.success(t('decks.scan.undone'))
               } catch {

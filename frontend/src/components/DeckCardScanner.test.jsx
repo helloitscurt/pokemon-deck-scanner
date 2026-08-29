@@ -120,11 +120,15 @@ describe('DeckCardScanner', () => {
     recognizeCard.mockResolvedValue({
       _identity_confident: true,
       matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-abc123',
     })
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
+    // Labeled so a saved trace can later be told apart from a manual scan
+    // — see services/scan_trace.py's "source" field.
+    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
     // The quad passed here is scaled up from the downscaled detection
     // canvas to native (640x480) resolution — not STABLE_QUAD's raw
     // coordinates — so this checks shape/dimensions, not exact numbers.
@@ -139,10 +143,11 @@ describe('DeckCardScanner', () => {
     )
     expect(recognizeCard).toHaveBeenCalledTimes(1)
     // Not a new/parallel save path — routes through the same onConfirm the
-    // manual candidate picker uses, with isAutoSave threaded through.
+    // manual candidate picker uses, with isAutoSave and the recognize
+    // response's trace_id (for later undo correlation) threaded through.
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true },
+      { isAutoSave: true, traceId: 'trace-abc123' },
     )
     expect(screen.getByLabelText('decks.scan.captured')).toBeInTheDocument()
 
@@ -164,6 +169,7 @@ describe('DeckCardScanner', () => {
     recognizeCard.mockResolvedValue({
       _identity_confident: false,
       matches: [{ id: 'a', name: 'Card A' }, { id: 'b', name: 'Card B' }],
+      trace_id: 'trace-ambiguous1',
     })
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
 
@@ -182,9 +188,11 @@ describe('DeckCardScanner', () => {
     fireEvent.click(screen.getByText('Card A'))
     await act(async () => { await Promise.resolve() })
 
+    // A manual tap still carries the recognize response's trace_id through
+    // (for undo correlation), just with isAutoSave: false.
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'a' }),
-      { isAutoSave: false },
+      { isAutoSave: false, traceId: 'trace-ambiguous1' },
     )
     expect(screen.getByLabelText('decks.scan.captured')).toBeInTheDocument()
   })
@@ -196,6 +204,35 @@ describe('DeckCardScanner', () => {
     expect(screen.getByText('decks.scan.cameraUnavailable')).toBeInTheDocument()
     expect(screen.getByText('decks.scan.takePhoto')).toBeInTheDocument()
     expect(screen.queryByText('decks.scan.liveHint')).not.toBeInTheDocument()
+  })
+
+  it('labels a manual-fallback scan "manual", not "live_auto_scan"', async () => {
+    mockCameraStatus = 'denied'
+    recognizeCard.mockResolvedValue({
+      _identity_confident: false,
+      matches: [{ id: 'a', name: 'Card A' }],
+      trace_id: 'trace-manual1',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    // Rendered via createPortal(..., document.body) — outside RTL's own
+    // container div, so this has to search the whole document.
+    const fileInput = document.querySelector('input[type="file"]')
+    const file = new File(['fake'], 'card.jpg', { type: 'image/jpeg' })
+    await act(async () => {
+      fireEvent.change(fileInput, { target: { files: [file] } })
+    })
+
+    expect(recognizeCard).toHaveBeenCalledWith(file, 'manual')
+    expect(screen.getByText('Card A')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('Card A'))
+    await act(async () => { await Promise.resolve() })
+
+    expect(onConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'a' }),
+      { isAutoSave: false, traceId: 'trace-manual1' },
+    )
   })
 
   it('surfaces a retry banner if recognizeCard itself fails, and returns to hunting on retry', async () => {

@@ -32,7 +32,7 @@ from services.scan_providers import (
     text_part,
 )
 import logging
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from sqlalchemy.orm import Session
 from api.auth import get_current_user
 from database import get_db
@@ -1157,6 +1157,10 @@ async def recognize_sanitized_card(
 @router.post("/recognize")
 async def recognize_card(
     file: UploadFile = File(...),
+    # Which UI flow is calling — e.g. "live_auto_scan" vs "manual" from the
+    # deck-tracking scanner (see docs/plans/live-card-scanner.md). Purely a
+    # diagnostics label recorded on the trace; never affects matching.
+    source: str | None = Form(default=None),
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
@@ -1176,16 +1180,25 @@ async def recognize_card(
         # attribute an OpenAI scan to the Gemini model.
         provider=provider.name,
         model=provider.model(),
+        source=source,
     )
     trace.set_image(sanitized.data)
     try:
-        return await recognize_sanitized_card(
+        result = await recognize_sanitized_card(
             db,
             current_user.id,
             sanitized.data,
             sanitized.content_type,
             trace=trace,
         )
+        # Only worth returning when a trace was actually saved — otherwise
+        # it's an id for a file that will never exist, and a later undo
+        # call would harmlessly no-op trying to look it up anyway. Kept
+        # conditional so callers that don't care (the manual scanner,
+        # composite scans) don't have to think about it.
+        if trace.enabled:
+            result["trace_id"] = trace.trace_id
+        return result
     finally:
         trace.save()
 

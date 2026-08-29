@@ -514,15 +514,22 @@ here — both are pulled together as build-order steps 5-6.
 - **Auto-saves should be distinguishable from manual confirms in the
   existing scan-trace/diagnostics system, and undo events need to connect
   back to them — one without the other doesn't meet the actual goal.**
-  The backend already has `ScanTrace`/`trace.record_decision(...)`
-  infrastructure (used throughout `recognize.py`) for recording how a scan
-  was resolved — the natural, already-existing place to make a pattern of
-  bad auto-saves discoverable over time. But a bad auto-save is really only
-  *known* bad once a human undoes it — so tagging the auto-save alone isn't
-  enough; the undo endpoint needs to record that this specific scan was
-  reversed too (correlatable back to the original trace entry), or "how
-  many auto-saves get undone" — the actual signal this exists to surface —
-  can't be answered from the data at all.
+  Resolved: `create_scan_trace()` now takes an optional `source` label
+  (`"live_auto_scan"` vs `"manual"`, threaded from `DeckCardScanner.jsx`'s
+  two recognize call sites through `POST /cards/recognize`), and
+  `/cards/recognize` returns `trace_id` when diagnostics are enabled for
+  that user. The frontend carries `trace_id` through `confirmCard` →
+  `onConfirm` → `DeckDetail.jsx`'s undo toast, which passes it to
+  `undo_scan` as an optional query param; `record_scan_reversed()` marks
+  the original trace file's `undone_at` field. Both additions are
+  best-effort and independent of the actual save/undo transactions —
+  matches `_apply_deck_scan`'s own rule that a diagnostics side-effect must
+  never make an already-committed action look like it failed. A crafted
+  `trace_id` can't reach outside a user's own trace directory or affect
+  another user's traces; verified (not just intended) that `pathlib.glob()`
+  gives `..` no parent-directory meaning in a pattern, so the real risk
+  `_safe()` closes off is glob-wildcard injection (a trace_id of `"*"`)
+  rather than the path traversal an earlier draft of this note assumed.
 
 ---
 
