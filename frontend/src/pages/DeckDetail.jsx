@@ -212,7 +212,7 @@ export default function DeckDetail() {
               <button
                 key={deckCard.card_id}
                 onClick={() => setSelectedCard(deckCard.card)}
-                className="flex w-full items-center gap-3 rounded-xl border border-[rgba(255,255,255,0.05)] bg-[rgba(20,20,40,0.6)] p-3 text-left backdrop-blur-xl transition-all duration-200 hover:border-brand-red/30 hover:bg-bg-elevated hover:shadow-glow focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red/70"
+                className="flex w-full items-center gap-3 rounded-xl border border-[rgba(255,255,255,0.05)] bg-[rgba(20,20,40,0.6)] p-3 text-left backdrop-blur-xl transition-all duration-200 hover:border-brand-red/30 hover:bg-bg-elevated hover:shadow-glow active:bg-bg-elevated focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red/70"
               >
                 <CompactCardArtwork card={deckCard.card} image={resolveCardImageUrl(deckCard.card, 'small')} alt={deckCard.card?.name} />
                 <div className="min-w-0 flex-1">

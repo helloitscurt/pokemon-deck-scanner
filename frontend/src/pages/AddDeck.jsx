@@ -252,7 +252,7 @@ export default function AddDeck() {
                     <button
                       type="button"
                       onClick={() => setZoomImage({ src: resolveCardImageUrl(entry.card, 'large'), alt: entry.card.name })}
-                      className="flex-shrink-0 cursor-zoom-in"
+                      className="flex-shrink-0 cursor-zoom-in rounded focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red"
                       aria-label={`${t('card.zoomImage')} — ${entry.card.name}`}
                     >
                       <img

@@ -330,7 +330,10 @@ export function UnifiedCardDialog({
               <div className="relative w-24 flex-shrink-0 sm:w-full">
                 <button
                   type="button"
-                  className={clsx('block w-full rounded-xl text-left', image && 'cursor-zoom-in')}
+                  className={clsx(
+                    'block w-full rounded-xl text-left focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red',
+                    image && 'cursor-zoom-in',
+                  )}
                   onClick={() => image && setImageZoomOpen(true)}
                   disabled={!image}
                   aria-label={image ? `${t('card.zoomImage')} — ${card.name}` : undefined}
