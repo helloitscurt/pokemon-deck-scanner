@@ -2,15 +2,11 @@ import base64
 import asyncio
 import datetime
 import httpx
-import io
 import math
 import os
 import json
 import re
-import warnings
 from email.utils import parsedate_to_datetime
-from functools import lru_cache
-from urllib.parse import urlparse
 from services.tcgdex_languages import is_supported_tcgdex_language, normalize_tcgdex_language
 from services.gemini_rate_limit import (
     GeminiKeyBlockedError,
@@ -18,7 +14,17 @@ from services.gemini_rate_limit import (
     penalize_gemini_key,
     record_gemini_success,
 )
-from services.image_cache import get_cached_image, store_cached_image
+from services.phash import (
+    MAX_REFERENCE_IMAGE_BYTES,
+    MAX_REFERENCE_IMAGE_PIXELS,
+    PHASH_CANDIDATE_LIMIT,
+    PHASH_MAX_DISTANCE,
+    PHASH_MIN_MARGIN,
+    TRUSTED_REFERENCE_IMAGE_HOSTS,
+    download_candidate_images as _download_candidate_images,
+    perceptual_hash as _perceptual_hash,
+    phash_best_match as _phash_best_match,
+)
 from services.scan_storage import MAX_FILE_BYTES, ScanUploadError, read_limited_upload, sanitize_image_bytes
 from services.scan_trace import ScanTrace, create_scan_trace
 from services.scan_providers import (
@@ -46,12 +52,6 @@ GEMINI_TRANSIENT_STATUS_CODES = {408, 425, 500, 502, 503, 504}
 DEFAULT_GEMINI_MODEL = "gemini-flash-latest"
 GEMINI_MODELS_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/models"
 MAX_GEMINI_RETRY_SECONDS = 14 * 24 * 60 * 60
-PHASH_MAX_DISTANCE = 20
-PHASH_MIN_MARGIN = 5
-PHASH_CANDIDATE_LIMIT = 8
-MAX_REFERENCE_IMAGE_BYTES = 5 * 1024 * 1024
-MAX_REFERENCE_IMAGE_PIXELS = 50_000_000
-TRUSTED_REFERENCE_IMAGE_HOSTS = {"assets.tcgdex.net"}
 
 
 class GeminiRateLimitHTTPException(HTTPException):
@@ -567,175 +567,6 @@ def _metadata_decision(card_info: dict, candidates: list[dict]) -> tuple[bool, s
     return False, None
 
 
-async def _download_candidate_images(
-    client: httpx.AsyncClient,
-    candidates: list[dict],
-    existing: dict[str, bytes] | None = None,
-    db: Session | None = None,
-) -> dict[str, bytes]:
-    """Download each candidate image at most once for pHash/Gemini reuse.
-
-    When db is given, checks/populates the shared image cache
-    (services/image_cache.py) before hitting TCGdex — the same cache
-    api/images.py's card/set image serving uses, so a candidate whose
-    thumbnail was already viewed elsewhere in the app isn't re-downloaded
-    here. db is optional (defaults to no caching) so existing callers that
-    don't have a session handy are unaffected.
-    """
-    downloaded = dict(existing or {})
-
-    async def fetch(candidate: dict) -> tuple[str, bytes] | None:
-        candidate_id = str(candidate.get("id") or "")
-        image_url = candidate.get("image")
-        if not candidate_id or not image_url or candidate_id in downloaded:
-            return None
-        parsed_url = urlparse(str(image_url))
-        if (
-            parsed_url.scheme != "https"
-            or parsed_url.hostname not in TRUSTED_REFERENCE_IMAGE_HOSTS
-        ):
-            return None
-
-        if db is not None:
-            cached = get_cached_image(db, str(image_url))
-            if cached is not None:
-                return candidate_id, cached[0]
-
-        try:
-            async with client.stream("GET", image_url, timeout=5) as response:
-                if response.status_code != 200:
-                    return None
-                content_length = response.headers.get("content-length")
-                if content_length:
-                    try:
-                        if int(content_length) > MAX_REFERENCE_IMAGE_BYTES:
-                            return None
-                    except ValueError:
-                        return None
-
-                content_type = response.headers.get("content-type", "image/webp")
-                content = bytearray()
-                async for chunk in response.aiter_bytes():
-                    if len(content) + len(chunk) > MAX_REFERENCE_IMAGE_BYTES:
-                        return None
-                    content.extend(chunk)
-                if content:
-                    data = bytes(content)
-                    if db is not None:
-                        store_cached_image(db, str(image_url), data, content_type)
-                    return candidate_id, data
-        except Exception:
-            return None
-        return None
-
-    results = await asyncio.gather(*(fetch(candidate) for candidate in candidates))
-    downloaded.update(result for result in results if result is not None)
-    return downloaded
-
-
-@lru_cache(maxsize=1)
-def _phash_dct_matrix():
-    """Build the unnormalised DCT-II matrix used by imagehash.phash."""
-    import numpy as np
-
-    size = 32
-    positions = np.arange(size)
-    frequencies = np.arange(size)[:, None]
-    return 2 * np.cos(
-        np.pi * frequencies * (2 * positions + 1) / (2 * size)
-    )
-
-
-def _perceptual_hash(image_bytes: bytes | None) -> tuple[bool, ...] | None:
-    """Return the same 64-bit pHash as imagehash without its SciPy dependency."""
-    if not image_bytes:
-        return None
-    try:
-        import numpy as np
-        from PIL import Image
-
-        with warnings.catch_warnings():
-            warnings.simplefilter("error", Image.DecompressionBombWarning)
-            with Image.open(io.BytesIO(image_bytes)) as image:
-                width, height = image.size
-                if (
-                    width <= 0
-                    or height <= 0
-                    or width * height > MAX_REFERENCE_IMAGE_PIXELS
-                ):
-                    return None
-                pixels = np.asarray(
-                    image.convert("L").resize(
-                        (32, 32),
-                        Image.Resampling.LANCZOS,
-                    ),
-                    dtype=float,
-                )
-        transform = _phash_dct_matrix()
-        low_frequencies = (transform @ pixels @ transform.T)[:8, :8]
-        median = np.median(low_frequencies)
-        return tuple(bool(value) for value in (low_frequencies > median).flat)
-    except Exception:
-        return None
-
-
-def _phash_best_match(
-    candidates: list[dict],
-    photo_bytes: bytes | None,
-    candidate_images: dict[str, bytes],
-    trace: ScanTrace | None = None,
-) -> dict | None:
-    """Return a clearly separated perceptual match, otherwise abstain."""
-    photo_hash = _perceptual_hash(photo_bytes)
-    if photo_hash is None:
-        return None
-
-    scored: list[tuple[int, dict]] = []
-    for candidate in candidates[:PHASH_CANDIDATE_LIMIT]:
-        image_bytes = candidate_images.get(str(candidate.get("id") or ""))
-        if not image_bytes:
-            continue
-        candidate_hash = _perceptual_hash(image_bytes)
-        if candidate_hash is None:
-            continue
-        distance = sum(left != right for left, right in zip(photo_hash, candidate_hash))
-        scored.append((distance, candidate))
-
-    if len(scored) < 2:
-        if trace:
-            trace.record_phash(
-                [
-                    (distance, str(candidate.get("tcg_card_id") or ""))
-                    for distance, candidate in scored
-                ],
-                accepted=None,
-                reason="insufficient_images",
-            )
-        return None
-    scored.sort(key=lambda pair: pair[0])
-    best_distance, best_candidate = scored[0]
-    runner_up_distance = scored[1][0]
-    too_far = best_distance > PHASH_MAX_DISTANCE
-    too_close = runner_up_distance - best_distance < PHASH_MIN_MARGIN
-    accepted = None if too_far or too_close else best_candidate
-    if trace:
-        trace.record_phash(
-            [
-                (distance, str(candidate.get("tcg_card_id") or ""))
-                for distance, candidate in scored
-            ],
-            accepted=(
-                str(accepted.get("tcg_card_id") or "") if accepted else None
-            ),
-            reason=(
-                "too_far" if too_far else "ambiguous_margin" if too_close else "accepted"
-            ),
-        )
-    if accepted is None:
-        return None
-    return accepted
-
-
 async def _fill_candidate_details(
     db: Session,
     candidates: list[dict],
@@ -1199,83 +1030,6 @@ async def recognize_card(
         if trace.enabled:
             result["trace_id"] = trace.trace_id
         return result
-    finally:
-        trace.save()
-
-
-@router.post("/match-text")
-async def match_card_text(
-    # Structured fields parsed client-side from OCR (see
-    # frontend/src/utils/cardOcr.js) — see docs/plans/live-card-scanner.md's
-    # Phase 2. name is the only one match_card_info requires (it raises 422
-    # without one); everything else narrows candidates but is optional,
-    # matching what OCR can and can't reliably read off a card.
-    name: str = Form(...),
-    name_en: str | None = Form(default=None),
-    number_local: str | None = Form(default=None),
-    number_total: str | None = Form(default=None),
-    set_code: str | None = Form(default=None),
-    regulation_mark: str | None = Form(default=None),
-    card_type: str | None = Form(default=None),
-    hp: str | None = Form(default=None),
-    language: str | None = Form(default=None),
-    artist: str | None = Form(default=None),
-    # The same cropped-card image OCR ran against — not sent to any vision
-    # API here (allow_visual_verification=False below), only used for pHash
-    # so this path can still resolve an OCR-ambiguous card for free. See
-    # "Free disambiguation already exists: pHash" in the plan.
-    file: UploadFile = File(...),
-    source: str | None = Form(default=None),
-    db: Session = Depends(get_db),
-    current_user: User = Depends(get_current_user),
-):
-    try:
-        raw_image = await read_limited_upload(file, remaining_job_bytes=MAX_FILE_BYTES)
-        sanitized = sanitize_image_bytes(raw_image)
-    except ScanUploadError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-
-    card_info = {
-        "name": name,
-        "name_en": name_en,
-        "number_local": number_local,
-        "number_total": number_total,
-        "set_code": set_code,
-        "regulation_mark": regulation_mark,
-        "card_type": card_type,
-        "hp": hp,
-        "language": language,
-        "artist": artist,
-    }
-
-    # provider="ocr" (not a real ScanProvider — this path never calls one)
-    # distinguishes these traces from vision-API scans in diagnostics, which
-    # is the only way to later measure the plan's open question: how often
-    # OCR alone resolves confidently vs. falls back to the paid call.
-    trace = create_scan_trace(
-        db,
-        current_user.id,
-        mode="single",
-        filename="ocr-match.jpg",
-        provider="ocr",
-        source=source,
-    )
-    trace.set_image(sanitized.data)
-    trace.record_extraction(parsed=card_info)
-    try:
-        result = await match_card_info(
-            db,
-            card_info,
-            allow_visual_verification=False,
-            photo_bytes=sanitized.data,
-            trace=trace,
-        )
-        if trace.enabled:
-            result["trace_id"] = trace.trace_id
-        return result
-    except HTTPException as exc:
-        trace.record_error(str(exc.detail))
-        raise
     finally:
         trace.save()
 

@@ -294,6 +294,7 @@ export default function DeckDetail() {
         isOpen={scannerOpen}
         onClose={() => setScannerOpen(false)}
         onConfirm={(candidate, meta) => scanMutation.mutateAsync({ candidate, ...meta })}
+        deckInstanceId={instanceId}
       />
     </div>
   )

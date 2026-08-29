@@ -10,13 +10,13 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DeckCardScanner from './DeckCardScanner'
-import { matchCardText, recognizeCard } from '../api/client'
+import { matchDeckImage, recognizeCard } from '../api/client'
 import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
 import { lastOcrRawText, lastOcrWords, recognizeCardText } from '../utils/cardOcr'
 
 vi.mock('../api/client', () => ({
   recognizeCard: vi.fn(),
-  matchCardText: vi.fn(),
+  matchDeckImage: vi.fn(),
 }))
 
 vi.mock('../utils/cardDetection', () => ({
@@ -102,11 +102,12 @@ describe('DeckCardScanner', () => {
     stubMediaAndCanvas()
     detectCardQuad.mockResolvedValue(STABLE_QUAD)
     extractCard.mockResolvedValue(fakeCropCanvas())
-    // Default: OCR finds nothing usable, so tryOcrMatch short-circuits and
-    // every existing test below exercises the paid recognizeCard() path
-    // unchanged. Tests that specifically cover the Phase 2 OCR path
-    // override this themselves.
-    recognizeCardText.mockResolvedValue({ name: null })
+    // Default: OCR finds nothing usable and the deck-scoped match isn't
+    // confident either, so every existing test below still falls through
+    // to the paid recognizeCard() path unchanged. Tests that specifically
+    // cover the free tiers override these themselves.
+    recognizeCardText.mockResolvedValue({ name: null, number_local: null })
+    matchDeckImage.mockResolvedValue({ _identity_confident: false, matches: [] })
     // Plain mutable objects, not vi.fn() mocks — clearAllMocks in afterEach
     // doesn't touch these, so reset explicitly to avoid one test's value
     // leaking into the next.
@@ -128,13 +129,13 @@ describe('DeckCardScanner', () => {
   })
 
   it('preloads detection as soon as it opens', () => {
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
     expect(preloadCardDetection).toHaveBeenCalled()
   })
 
   it('does not capture before the card has been held steady for the required streak', async () => {
     recognizeCard.mockResolvedValue({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }] })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES - 1)
 
@@ -148,7 +149,7 @@ describe('DeckCardScanner', () => {
       matches: [{ id: 'p1', name: 'Pikachu' }],
       trace_id: 'trace-abc123',
     })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
@@ -205,7 +206,7 @@ describe('DeckCardScanner', () => {
       matches: [{ id: 'p1', name: 'Pikachu' }],
       trace_id: 'trace-abc123',
     })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
     expect(recognizeCard).toHaveBeenCalledTimes(1)
@@ -225,7 +226,7 @@ describe('DeckCardScanner', () => {
       matches: [{ id: 'a', name: 'Card A' }, { id: 'b', name: 'Card B' }],
       trace_id: 'trace-ambiguous1',
     })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
@@ -253,7 +254,7 @@ describe('DeckCardScanner', () => {
 
   it('shows the manual take-photo fallback when the camera is denied, not the live view', () => {
     mockCameraStatus = 'denied'
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     expect(screen.getByText('decks.scan.cameraUnavailable')).toBeInTheDocument()
     expect(screen.getByText('decks.scan.takePhoto')).toBeInTheDocument()
@@ -267,7 +268,7 @@ describe('DeckCardScanner', () => {
       matches: [{ id: 'a', name: 'Card A' }],
       trace_id: 'trace-manual1',
     })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     // Rendered via createPortal(..., document.body) — outside RTL's own
     // container div, so this has to search the whole document.
@@ -291,7 +292,7 @@ describe('DeckCardScanner', () => {
 
   it('surfaces a retry banner if recognizeCard itself fails, and returns to hunting on retry', async () => {
     recognizeCard.mockRejectedValue(new Error('network down'))
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
@@ -301,31 +302,72 @@ describe('DeckCardScanner', () => {
     expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
   })
 
-  it('auto-saves via the free OCR match-text path without ever calling the paid recognizeCard', async () => {
+  it('auto-saves via the free deck-scoped match without ever calling the paid recognizeCard', async () => {
     recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
-    matchCardText.mockResolvedValue({
+    matchDeckImage.mockResolvedValue({
       _identity_confident: true,
       matches: [{ id: 'p1', name: 'Pikachu' }],
-      trace_id: 'trace-ocr1',
+      trace_id: 'trace-deck1',
     })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
-    expect(matchCardText).toHaveBeenCalledWith(
-      { name: 'Pikachu', number_local: '25' },
+    expect(matchDeckImage).toHaveBeenCalledWith(
+      '3',
       expect.anything(),
+      { numberLocal: '25', name: 'Pikachu' },
       'live_auto_scan',
     )
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true, traceId: 'trace-ocr1' },
+      { isAutoSave: true, traceId: 'trace-deck1' },
     )
   })
 
-  it('runs OCR against its own higher-resolution crop, separate from the smaller one uploaded to the paid API', async () => {
+  it('still tries the deck-scoped match with no OCR hints at all — pHash alone can resolve a card', async () => {
+    // Real design point: unlike the retired broad-catalog match-text tier
+    // (which required a name to search by), the deck-scoped match can
+    // resolve purely from the image against this deck's own small,
+    // known candidate list — a total OCR failure shouldn't skip it.
+    recognizeCardText.mockResolvedValue({ name: null, number_local: null })
+    matchDeckImage.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-deck2',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(matchDeckImage).toHaveBeenCalledWith(
+      '3', expect.anything(), { numberLocal: null, name: null }, 'live_auto_scan',
+    )
+    expect(recognizeCard).not.toHaveBeenCalled()
+    expect(onConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'p1' }),
+      { isAutoSave: true, traceId: 'trace-deck2' },
+    )
+  })
+
+  it('never attempts the deck-scoped match without a deckInstanceId, going straight to the paid call', async () => {
+    recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-paid4',
+    })
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(matchDeckImage).not.toHaveBeenCalled()
+    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
+  })
+
+  it('runs OCR against its own higher-resolution crop, separate from the smaller one uploaded to the paid API', async () => {
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
@@ -339,7 +381,7 @@ describe('DeckCardScanner', () => {
     )
   })
 
-  it('retries OCR at the smaller crop size if the larger one throws, and still resolves via match-text', async () => {
+  it('retries OCR at the smaller crop size if the larger one throws, and still resolves via the deck match', async () => {
     // Real-device finding: worker.recognize() rejected outright on the
     // larger OCR-only crop, with no usable error reason (a Tesseract
     // worker crash rejects with undefined, not an Error — see
@@ -348,20 +390,18 @@ describe('DeckCardScanner', () => {
     recognizeCardText
       .mockRejectedValueOnce(undefined)
       .mockResolvedValueOnce({ name: 'Pikachu', number_local: '25' })
-    matchCardText.mockResolvedValue({
+    matchDeckImage.mockResolvedValue({
       _identity_confident: true,
       matches: [{ id: 'p1', name: 'Pikachu' }],
       trace_id: 'trace-retry1',
     })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(recognizeCardText).toHaveBeenCalledTimes(2)
-    expect(matchCardText).toHaveBeenCalledWith(
-      { name: 'Pikachu', number_local: '25' },
-      expect.anything(),
-      'live_auto_scan',
+    expect(matchDeckImage).toHaveBeenCalledWith(
+      '3', expect.anything(), { numberLocal: '25', name: 'Pikachu' }, 'live_auto_scan',
     )
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
@@ -370,26 +410,27 @@ describe('DeckCardScanner', () => {
     )
   })
 
-  it('falls back to the paid call, with a readable error, when OCR fails at both crop sizes', async () => {
+  it('still tries the deck-scoped match, with a readable error logged, when OCR fails at both crop sizes', async () => {
     recognizeCardText.mockRejectedValue(undefined)
-    recognizeCard.mockResolvedValue({
+    matchDeckImage.mockResolvedValue({
       _identity_confident: true,
       matches: [{ id: 'p1', name: 'Pikachu' }],
-      trace_id: 'trace-paid3',
+      trace_id: 'trace-deck3',
     })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(recognizeCardText).toHaveBeenCalledTimes(2)
-    expect(matchCardText).not.toHaveBeenCalled()
-    // The bug this guards: err?.message || err rendered the literal string
-    // "undefined" for a reject(undefined) — unreadable, not diagnostic.
-    expect(document.body.textContent).not.toMatch(/ocr: undefined\b/)
-    expect(document.body.textContent).toContain('worker may have crashed')
+    // No OCR hints at all, but the deck-scoped match still runs — pure
+    // pHash against this deck's own missing cards.
+    expect(matchDeckImage).toHaveBeenCalledWith(
+      '3', expect.anything(), { numberLocal: undefined, name: undefined }, 'live_auto_scan',
+    )
+    expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true, traceId: 'trace-paid3' },
+      { isAutoSave: true, traceId: 'trace-deck3' },
     )
   })
 
@@ -402,9 +443,9 @@ describe('DeckCardScanner', () => {
     recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
     lastOcrRawText.value = 'Pikachu\nHP 60\n025/198'
     lastOcrWords.value = [{ text: 'Pikachu', confidence: 91, y0: 90 }]
-    matchCardText.mockResolvedValue({ _identity_confident: false, matches: [] })
+    matchDeckImage.mockResolvedValue({ _identity_confident: false, matches: [] })
     recognizeCard.mockRejectedValue(new Error('network down'))
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
@@ -430,7 +471,7 @@ describe('DeckCardScanner', () => {
       { text: 'garbled', confidence: 61, y0: 600 }, // confident but out of band
     ]
     recognizeCard.mockRejectedValue(new Error('network down'))
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
@@ -446,50 +487,33 @@ describe('DeckCardScanner', () => {
     recognizeCardText.mockResolvedValue({ name: null })
     lastOcrRawText.value = ''
     recognizeCard.mockRejectedValue(new Error('network down'))
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(document.body.textContent).toContain('ocr raw:(empty)')
   })
 
-  it('falls back to the paid recognizeCard when OCR found a name but match-text was not confident', async () => {
+  it('falls back to the paid recognizeCard when the deck-scoped match was not confident', async () => {
     recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
-    matchCardText.mockResolvedValue({
+    matchDeckImage.mockResolvedValue({
       _identity_confident: false,
-      matches: [{ id: 'guess', name: 'Pikachu' }],
+      matches: [],
     })
     recognizeCard.mockResolvedValue({
       _identity_confident: true,
       matches: [{ id: 'p1', name: 'Pikachu' }],
       trace_id: 'trace-paid1',
     })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
-    expect(matchCardText).toHaveBeenCalled()
+    expect(matchDeckImage).toHaveBeenCalled()
     expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
-    // The not-confident OCR guess is discarded, not shown — the paid
-    // call's own result is what gets auto-saved.
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
       { isAutoSave: true, traceId: 'trace-paid1' },
     )
-  })
-
-  it('skips match-text entirely when OCR found no usable name, going straight to the paid call', async () => {
-    recognizeCardText.mockResolvedValue({ name: null })
-    recognizeCard.mockResolvedValue({
-      _identity_confident: true,
-      matches: [{ id: 'p1', name: 'Pikachu' }],
-      trace_id: 'trace-paid2',
-    })
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
-
-    await advanceTicks(REQUIRED_STABLE_FRAMES)
-
-    expect(matchCardText).not.toHaveBeenCalled()
-    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
   })
 })

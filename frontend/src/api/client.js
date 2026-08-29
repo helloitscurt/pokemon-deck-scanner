@@ -128,21 +128,18 @@ export const recognizeCard = (imageFile, source) => {
   }).then(r => r.data)
 }
 
-// Phase 2 (docs/plans/live-card-scanner.md): the free, client-OCR-fed match
-// path — same upload shape as recognizeCard() but sends structured text
-// fields (from cardOcr.js) instead of letting a paid vision model read them
-// off the image. fields.name is required by the backend route; the caller
-// is expected to only call this once OCR found one (see DeckCardScanner.jsx).
-export const matchCardText = (fields, imageBlob, source) => {
+// The free, deck-scoped match tier (docs/plans/live-card-scanner.md): pHash
+// the captured crop against ONLY this deck instance's still-missing cards
+// — a small, already-known local list — instead of a broad TCGdex catalog
+// search. numberLocal/name (both optional, from cardOcr.js) only narrow
+// among that instance's own cards, never search anything broader.
+export const matchDeckImage = (instanceId, imageBlob, { numberLocal, name } = {}, source) => {
   const formData = new FormData()
-  Object.entries(fields).forEach(([key, value]) => {
-    if (value !== null && value !== undefined && value !== '') {
-      formData.append(key, value)
-    }
-  })
   formData.append('file', imageBlob)
+  if (numberLocal) formData.append('number_local', numberLocal)
+  if (name) formData.append('name', name)
   if (source) formData.append('source', source)
-  return api.post('/cards/match-text', formData, {
+  return api.post(`/decks/instances/${instanceId}/match-image`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   }).then(r => r.data)
 }

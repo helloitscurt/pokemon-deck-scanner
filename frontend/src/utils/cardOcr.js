@@ -1,9 +1,12 @@
 // Lazy-loads the vendored Tesseract.js worker (frontend/public/tesseract/,
-// see VENDORED.md) on first use and turns its raw OCR output into the
-// structured fields backend/api/recognize.py's POST /cards/match-text
-// expects — see "The verified backend seam" in
-// docs/plans/live-card-scanner.md's Phase 2. English only for now (see the
-// plan for why); language is hardcoded to match the one model loaded below.
+// see VENDORED.md) on first use and turns its raw OCR output into the two
+// fields the deck-scoped match tier actually uses: a card's printed local/
+// total collector number and its name — see matchDeckImage in
+// frontend/src/api/client.js and POST /decks/instances/{id}/match-image in
+// backend/api/decks.py. Deliberately narrow: those two fields are what
+// identifies a specific printing, and both are short/high-contrast enough
+// to be realistically OCR-able, unlike a card's other printed details.
+// English only for now (see docs/plans/live-card-scanner.md's Phase 2).
 
 import { createWorker } from 'tesseract.js'
 
@@ -45,7 +48,6 @@ export function preloadCardOcr() {
 // A Pokemon card's local/total collector number, e.g. "025/198" or, for
 // special subsets, a short alpha prefix like "TG04/TG30" or "GG01/GG70".
 const NUMBER_PATTERN = /\b([A-Za-z]{0,3}\d{1,4})\s*\/\s*([A-Za-z]{0,3}\d{1,4})\b/
-const HP_PATTERN = /\bHP\s*(\d{2,3})\b|\b(\d{2,3})\s*HP\b/i
 
 // Tesseract commonly confuses these with digits inside a printed number
 // (a genuine "052" misread as "O52") — checked empirically against
@@ -65,18 +67,10 @@ function cleanNumberToken(token) {
 // instead of the actual name, which only position + confidence data (not
 // available from a flat string) can reliably tell apart.
 export function parseCardOcrText(rawText) {
-  const text = String(rawText || '')
-  const numberMatch = text.match(NUMBER_PATTERN)
-  const hpMatch = text.match(HP_PATTERN)
-
+  const numberMatch = String(rawText || '').match(NUMBER_PATTERN)
   return {
-    name: null,
-    name_en: null,
     number_local: numberMatch ? cleanNumberToken(numberMatch[1]) : null,
     number_total: numberMatch ? cleanNumberToken(numberMatch[2]) : null,
-    set_code: null,
-    hp: hpMatch ? (hpMatch[1] || hpMatch[2]) : null,
-    language: 'en',
   }
 }
 
@@ -172,8 +166,8 @@ export const lastOcrWords = { value: [] }
 export async function recognizeCardText(cardCanvas) {
   const worker = await ensureWorker()
   // blocks: true is required for pickCardName's position/confidence data —
-  // text: true keeps the flat string parseCardOcrText's number/HP regexes
-  // already rely on.
+  // text: true keeps the flat string parseCardOcrText's number regex
+  // already relies on.
   const { data } = await worker.recognize(cardCanvas, {}, { text: true, blocks: true })
   const rawText = data?.text || ''
   lastOcrRawText.value = rawText

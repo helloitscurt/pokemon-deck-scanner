@@ -2,12 +2,10 @@ import { describe, expect, it } from 'vitest'
 import { parseCardOcrText, pickCardName } from './cardOcr'
 
 describe('parseCardOcrText', () => {
-  it('extracts number and HP from a clean recognition', () => {
+  it('extracts number from a clean recognition', () => {
     const result = parseCardOcrText('Pikachu\nHP 60\nThunder Shock\n025/198')
     expect(result.number_local).toBe('025')
     expect(result.number_total).toBe('198')
-    expect(result.hp).toBe('60')
-    expect(result.language).toBe('en')
   })
 
   it('never extracts a name — position/confidence data only pickCardName has', () => {
@@ -15,18 +13,13 @@ describe('parseCardOcrText', () => {
     // line heuristic picks up mid-card noise instead of the real name (see
     // pickCardName's tests for the actual fix). This function no longer
     // even tries.
-    expect(parseCardOcrText('Pikachu\nHP 60\n025/198').name).toBeNull()
+    expect(parseCardOcrText('Pikachu\nHP 60\n025/198').name).toBeUndefined()
   })
 
   it('tolerates stray whitespace and inconsistent spacing around the number', () => {
     const result = parseCardOcrText('Pikachu\n\n  025  /  198  \n')
     expect(result.number_local).toBe('025')
     expect(result.number_total).toBe('198')
-  })
-
-  it('reads HP in either printed order', () => {
-    expect(parseCardOcrText('Wattrel\n120 HP\n50/198').hp).toBe('120')
-    expect(parseCardOcrText('Wattrel\nHP120\n50/198').hp).toBe('120')
   })
 
   it('preserves a short alpha prefix on special-subset numbers', () => {
@@ -37,9 +30,10 @@ describe('parseCardOcrText', () => {
 
   it('corrects letter-O/digit-zero confusion within a number token', () => {
     // A real "052" misread as "O52" — see backend/api/recognize.py's
-    // _normalize_collector_number, which does NOT tolerate this itself
-    // (backend/tests/test_match_text.py documents that gap). Fixed here,
-    // at the OCR-specific source of the ambiguity.
+    // _normalize_collector_number, which does NOT tolerate this itself.
+    // Fixed here, at the OCR-specific source of the ambiguity, since
+    // normalize_scanner_card_number (used by the deck-scoped number match
+    // in backend/api/decks.py) shares the same underlying normalizer.
     const result = parseCardOcrText('Pikachu\nO52/l98')
     expect(result.number_local).toBe('052')
     expect(result.number_total).toBe('198')
@@ -49,20 +43,11 @@ describe('parseCardOcrText', () => {
     const result = parseCardOcrText('~~~ ][ .. \n1 2 3')
     expect(result.number_local).toBeNull()
     expect(result.number_total).toBeNull()
-    expect(result.hp).toBeNull()
-  })
-
-  it('never guesses set_code, artist, regulation_mark, or card_type', () => {
-    // Deliberately out of scope for this parser (see cardOcr.js) — a
-    // wrong-but-present value actively contradicts the correct candidate
-    // in the backend's matcher, worse than leaving it null.
-    const result = parseCardOcrText('Pikachu\nHP 60\n025/198\nSV1\nIllus. Someone')
-    expect(result.set_code).toBeNull()
   })
 
   it('handles empty or missing input without throwing', () => {
-    expect(parseCardOcrText('')).toMatchObject({ name: null, number_local: null })
-    expect(parseCardOcrText(null)).toMatchObject({ name: null, number_local: null })
+    expect(parseCardOcrText('')).toMatchObject({ number_local: null })
+    expect(parseCardOcrText(null)).toMatchObject({ number_local: null })
   })
 })
 

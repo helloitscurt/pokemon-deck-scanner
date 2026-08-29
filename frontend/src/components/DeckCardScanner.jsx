@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Camera, Check, Loader2, X } from 'lucide-react'
-import { matchCardText, recognizeCard } from '../api/client'
+import { matchDeckImage, recognizeCard } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
@@ -102,13 +102,18 @@ function drawOverlay(canvas, quad, stableFraction) {
  * used at all (denied, unavailable, non-secure context), falls back to the
  * original file-input "Take Photo" flow, also unchanged.
  *
- * Props: isOpen, onClose, onConfirm(candidateCard) — same external contract
- * as before; DeckDetail.jsx needs no changes. Renders as its own
+ * Props: isOpen, onClose, onConfirm(candidateCard), deckInstanceId — the
+ * pipeline tried per card is OCR (free) -> deck-scoped pHash/number/name
+ * match against ONLY deckInstanceId's own still-missing cards (free, see
+ * matchDeckImage in api/client.js) -> recognizeCard (paid, Gemini) as the
+ * last resort. deckInstanceId is required for the free tiers to run at
+ * all — without it (shouldn't happen; DeckDetail.jsx always has one) this
+ * falls straight through to the paid call every time. Renders as its own
  * full-viewport portal (matching CardScanner.jsx), not the Modal/Sheet
  * wrapper this component used before — a live camera feed doesn't fit a
  * container built for scrollable forms.
  */
-export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
+export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstanceId }) {
   const { t } = useSettings()
 
   const manualFileRef = useRef()
@@ -253,14 +258,16 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
     }
   }
 
-  // Phase 2 (docs/plans/live-card-scanner.md): the free OCR+metadata path,
-  // tried before the paid recognizeCard() call below. Never throws — any
-  // failure here (OCR itself, or the match-text call) just means "fall back
-  // to the paid path for this one card," not a hard error for the capture.
-  // A not-confident OCR result is deliberately discarded in favor of a
-  // fresh paid-call attempt rather than shown as-is (see the plan's Phase 2
-  // "Net effect": the paid call is the fallback for cards OCR can't
-  // confidently resolve, not a second-tier candidate list of its own).
+  // Free tiers, tried before the paid recognizeCard() call below: OCR
+  // (client-side, may find nothing — that's fine, see below), then a
+  // deck-scoped pHash/number/name match against ONLY deckInstanceId's own
+  // still-missing cards (matchDeckImage — never a broad TCGdex search).
+  // Never throws — any failure here just means "fall back to the paid
+  // path for this one card," not a hard error for the capture. A
+  // not-confident deck-match result is deliberately discarded in favor of
+  // a fresh paid-call attempt rather than shown as-is (the paid call is
+  // the fallback for cards the free tiers can't confidently resolve, not
+  // a second-tier candidate list of its own).
   const runOcr = async (nativeFrameSource, quad, width, height) => {
     const ocrCanvas = await extractCard(nativeFrameSource, width, height, quad)
     if (!ocrCanvas) return null
@@ -268,7 +275,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   }
 
   const tryOcrMatch = async (nativeFrameSource, quad, blob) => {
-    let ocrFields
+    let ocrFields = null
     try {
       ocrFields = await runOcr(nativeFrameSource, quad, OCR_CROP_WIDTH, OCR_CROP_HEIGHT)
     } catch (err) {
@@ -277,39 +284,50 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
       // unconfirmed whether the size itself is why (could as easily be the
       // tab backgrounding mid-recognition). Retry once at the smaller,
       // original crop size — a genuinely different, lighter-weight attempt,
-      // not a blind repeat — before giving up on OCR for this card.
+      // not a blind repeat — before falling through to a pure image match
+      // with no OCR hints at all (still worth trying: pHash alone can
+      // resolve a card with zero OCR input, see matchDeckImage below).
       setDebugInfo((d) => ({ ...d, tickError: `ocr(large): ${describeError(err)}` }))
       try {
         ocrFields = await runOcr(nativeFrameSource, quad, CARD_CROP_WIDTH, CARD_CROP_HEIGHT)
       } catch (err2) {
         setDebugInfo((d) => ({
-          ...d, ocrName: null, ocrNumber: null, ocrRawText: '',
+          ...d, ocrName: null, ocrNumber: null, ocrRawText: '', ocrWords: [],
           tickError: `ocr: ${describeError(err2)}`,
         }))
-        return null
       }
     }
-    if (!ocrFields) return null
-    // Visible, not just inferred from "the paid call ran anyway" — the
-    // only way to tell "OCR found nothing" apart from "OCR found
-    // something but match-text wasn't confident" without this was
-    // reading server logs by hand (see the real-device Wattrel case).
-    setDebugInfo((d) => ({
-      ...d,
-      ocrName: ocrFields.name,
-      ocrNumber: ocrFields.number_local,
-      ocrRawText: lastOcrRawText.value,
-      // Shows every recognized word's own confidence/position, including
-      // ones pickCardName rejected — the only way to tell "nothing scored
-      // high enough" apart from "the name band/confidence floor need
-      // retuning" (see cardOcr.js's NAME_BAND_FRACTION/MIN_NAME_CONFIDENCE).
-      ocrWords: lastOcrWords.value,
-    }))
-    if (!ocrFields.name) return null
+
+    if (ocrFields) {
+      // Visible, not just inferred from "the paid call ran anyway" — the
+      // only way to tell "OCR found nothing" apart from "OCR found
+      // something but the deck match wasn't confident" without this was
+      // reading server logs by hand (see the real-device Wattrel case).
+      setDebugInfo((d) => ({
+        ...d,
+        ocrName: ocrFields.name,
+        ocrNumber: ocrFields.number_local,
+        ocrRawText: lastOcrRawText.value,
+        // Shows every recognized word's own confidence/position, including
+        // ones pickCardName rejected — the only way to tell "nothing scored
+        // high enough" apart from "the name band/confidence floor need
+        // retuning" (see cardOcr.js's NAME_BAND_FRACTION/MIN_NAME_CONFIDENCE).
+        ocrWords: lastOcrWords.value,
+      }))
+    }
+
+    // deckInstanceId missing shouldn't happen (DeckDetail.jsx always
+    // passes one) — defensive, not a real expected path.
+    if (!deckInstanceId) return null
+
     try {
-      return await matchCardText(ocrFields, blob, 'live_auto_scan')
+      return await matchDeckImage(
+        deckInstanceId, blob,
+        { numberLocal: ocrFields?.number_local, name: ocrFields?.name },
+        'live_auto_scan',
+      )
     } catch (err) {
-      setDebugInfo((d) => ({ ...d, tickError: `match-text: ${describeError(err)}` }))
+      setDebugInfo((d) => ({ ...d, tickError: `deck-match: ${describeError(err)}` }))
       return null
     }
   }

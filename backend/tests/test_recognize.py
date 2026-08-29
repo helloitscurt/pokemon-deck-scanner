@@ -318,7 +318,7 @@ class PhashMatchingTests(unittest.IsolatedAsyncioTestCase):
             [b"1234", b"56"],
             headers={"content-length": "4"},
         )
-        with patch("api.recognize.MAX_REFERENCE_IMAGE_BYTES", 5):
+        with patch("services.phash.MAX_REFERENCE_IMAGE_BYTES", 5):
             downloaded = await _download_candidate_images(
                 client,
                 [{"id": "large", "image": "https://assets.tcgdex.net/large.webp"}],
@@ -376,7 +376,7 @@ class PhashMatchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(get_cached_image(self.db, url))
 
     def test_rejects_excessive_decoded_dimensions(self):
-        with patch("api.recognize.MAX_REFERENCE_IMAGE_PIXELS", 100):
+        with patch("services.phash.MAX_REFERENCE_IMAGE_PIXELS", 100):
             self.assertIsNone(_perceptual_hash(self._image(7)))
 
     async def test_clear_phash_finishes_an_uncertain_match(self):

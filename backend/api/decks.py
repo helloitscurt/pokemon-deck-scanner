@@ -3,11 +3,12 @@ import logging
 from typing import List
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, UploadFile
 from sqlalchemy.orm import Session, joinedload
 
 from api.auth import get_current_user
 from api.collection import ensure_card_exists, find_matching_collection_item
+from api.recognize import normalize_scanner_card_number
 from database import get_db
 from models import Card, Deck, DeckCard, DeckInstance, ScannedCard, User
 from schemas import (
@@ -16,7 +17,9 @@ from schemas import (
 )
 from services import bulbapedia
 from services.deck_progress import unregister_scan
-from services.scan_trace import record_scan_reversed
+from services.phash import download_candidate_images, phash_best_match
+from services.scan_storage import MAX_FILE_BYTES, ScanUploadError, read_limited_upload, sanitize_image_bytes
+from services.scan_trace import create_scan_trace, record_scan_reversed
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +77,56 @@ def _instance_response(db: Session, instance: DeckInstance, detail: bool = False
         payload["cards"] = card_rows
         return DeckInstanceDetailResponse(**payload)
     return DeckInstanceResponse(**payload)
+
+
+def _get_owned_instance(db: Session, instance_id: int, user_id: int) -> DeckInstance:
+    instance = db.query(DeckInstance).options(joinedload(DeckInstance.deck)).filter(
+        DeckInstance.id == instance_id,
+        DeckInstance.user_id == user_id,
+    ).first()
+    if not instance:
+        raise HTTPException(status_code=404, detail="Deck instance not found")
+    return instance
+
+
+def _missing_deck_cards(db: Session, instance: DeckInstance) -> list[Card]:
+    """This instance's still-missing cards (expected_quantity > scanned_quantity)
+    — the small, already-known candidate set the live scanner's deck-image-match
+    (see match_deck_image below) compares against instead of a broad TCGdex
+    catalog search. A card already fully collected is excluded: matching
+    against it can't change anything and only makes the comparison slower."""
+    deck_cards = db.query(DeckCard).filter(
+        DeckCard.deck_id == instance.deck_id,
+        DeckCard.card_id.isnot(None),
+    ).all()
+    scanned_by_card = {
+        sc.card_id: sc.scanned_quantity
+        for sc in db.query(ScannedCard).filter(ScannedCard.deck_instance_id == instance.id).all()
+    }
+    missing_ids = [
+        dc.card_id for dc in deck_cards
+        if scanned_by_card.get(dc.card_id, 0) < dc.expected_quantity
+    ]
+    if not missing_ids:
+        return []
+    return db.query(Card).filter(Card.id.in_(missing_ids)).all()
+
+
+def _deck_card_candidate(card: Card) -> dict:
+    """Shapes a Card row into the {id, image, ...} dict services/phash.py's
+    download_candidate_images/phash_best_match expect — the same shape
+    api/recognize.py builds from TCGdex search results, just sourced from
+    the local DB instead. id is the full local Card.id (e.g. "sv1-1_en"),
+    which resolveCardImageUrl on the frontend already knows how to turn into
+    an image URL without needing images_small threaded through separately."""
+    return {
+        "id": card.id,
+        "tcg_card_id": card.tcg_card_id,
+        "name": card.name,
+        "number": card.number,
+        "image": card.images_small,
+        "set": {"name": card.set_ref.name} if card.set_ref else None,
+    }
 
 
 @router.get("/search", response_model=List[DeckSearchResult])
@@ -242,6 +295,130 @@ def get_deck_instance(
     if not instance:
         raise HTTPException(status_code=404, detail="Deck instance not found")
     return _instance_response(db, instance, detail=True)
+
+
+@router.post("/instances/{instance_id}/match-image")
+async def match_deck_image(
+    instance_id: int,
+    # The same cropped-card photo the live scanner's OCR step already ran
+    # against (frontend/src/components/DeckCardScanner.jsx) — this route
+    # never touches OCR text fields itself, just the image.
+    file: UploadFile = File(...),
+    # From OCR (frontend/src/utils/cardOcr.js), both optional — used only to
+    # narrow among this deck's own missing cards (see below), never to
+    # search anything broader. None is a completely normal, expected value.
+    # Form(...), not a plain default — this route accepts multipart/
+    # form-data (it has a File(...) param above), where a plain default
+    # would be read as a query param instead of a form field over real
+    # HTTP, silently mismatching the frontend's FormData-based upload.
+    # Tests calling this function directly must pass every one of these
+    # explicitly (never omit one) — see api/recognize.py's routes for the
+    # same discipline: FastAPI's own Form(default=None) sentinel object is
+    # what a direct call sees if a param is left to its Python default,
+    # not the None it resolves to over a real request.
+    number_local: str | None = Form(default=None),
+    name: str | None = Form(default=None),
+    source: str | None = Form(default=None),
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Deck-scoped card match: pHash the captured photo against ONLY this
+    deck instance's still-missing cards — a small, already-known local list
+    — instead of a broad TCGdex catalog search. This is the second tier of
+    the live scanner's pipeline (docs/plans/live-card-scanner.md): OCR
+    (free) -> this (free, deck-scoped) -> POST /cards/recognize (paid,
+    Gemini) as the last resort. Structurally cannot call any paid API —
+    there is no code path here that reaches one.
+    """
+    instance = _get_owned_instance(db, instance_id, current_user.id)
+
+    try:
+        raw_image = await read_limited_upload(file, remaining_job_bytes=MAX_FILE_BYTES)
+        sanitized = sanitize_image_bytes(raw_image)
+    except ScanUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    # provider="deck_image" (not a real ScanProvider) distinguishes these
+    # traces from both the OCR-metadata tier and the paid-vision tier in
+    # diagnostics, the same reason match-text's traces are labeled "ocr".
+    trace = create_scan_trace(
+        db, current_user.id, mode="single", filename="deck-match.jpg",
+        provider="deck_image", source=source,
+    )
+    trace.set_image(sanitized.data)
+
+    try:
+        missing = _missing_deck_cards(db, instance)
+        candidates = [_deck_card_candidate(card) for card in missing if card.images_small]
+
+        winner = None
+        decision = None
+        # pHash needs at least 2 scored candidates to judge a confident
+        # margin (see services/phash.py) — with fewer than 2 image-bearing
+        # candidates it can never run, regardless of how many missing cards
+        # there are (e.g. a near-finished deck with exactly one card left).
+        if len(candidates) >= 2:
+            async with httpx.AsyncClient(timeout=20) as client:
+                candidate_images = await download_candidate_images(
+                    client, candidates, db=db,
+                )
+            # No PHASH_CANDIDATE_LIMIT cap here (unlike recognize.py's
+            # broad-search call site) — candidates is already a small,
+            # bounded, already-known list; capping it to 8 would silently
+            # ignore most of a freshly-started deck.
+            winner = phash_best_match(
+                candidates, sanitized.data, candidate_images,
+                trace=trace, candidate_limit=len(candidates),
+            )
+            if winner is not None:
+                decision = "deck_phash"
+
+        if winner is None and number_local:
+            target = normalize_scanner_card_number(number_local)
+            number_matches = [
+                c for c in candidates
+                if target is not None and target == normalize_scanner_card_number(c["number"])
+            ]
+            # Only trust this when it's unique — a deck can plausibly have
+            # two different missing cards OCR's number could plausibly
+            # collide on (e.g. digit-transposition noise), and an ambiguous
+            # match here is exactly what pHash above already declined to
+            # resolve confidently.
+            if len(number_matches) == 1:
+                winner = number_matches[0]
+                decision = "deck_number_unique"
+
+        if winner is None and name:
+            # Substring, not equality — OCR's name output can include
+            # adjacent noise words it couldn't confidently drop (see
+            # cardOcr.js's pickCardName), e.g. a real "Potion" card OCR'd
+            # as "bern PRALINE Fe Potion". A card's own short, clean name
+            # showing up anywhere inside that noisier string is still a
+            # real signal a flat equality check would have missed
+            # entirely.
+            target = name.casefold()
+            name_matches = [
+                c for c in candidates
+                if c["name"] and c["name"].casefold() in target
+            ]
+            # Same uniqueness requirement as the number tier — an
+            # ambiguous substring match (e.g. two candidates whose names
+            # are each contained in the noisy OCR text) isn't trustworthy
+            # on its own.
+            if len(name_matches) == 1:
+                winner = name_matches[0]
+                decision = "deck_name_unique"
+
+        result = {
+            "matches": [winner] if winner else [],
+            "_identity_confident": winner is not None,
+            "_identity_decision": decision,
+        }
+        if trace.enabled:
+            result["trace_id"] = trace.trace_id
+        return result
+    finally:
+        trace.save()
 
 
 @router.post("/instances/{instance_id}/reset", response_model=DeckInstanceDetailResponse)

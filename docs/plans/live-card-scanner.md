@@ -808,42 +808,90 @@ Two open questions from the review, both resolved with you:
    independently re-downloading the same TCGdex images. Full design under
    "Free disambiguation already exists: pHash" above.
 
-## Phase 2: implemented (build steps 9-10), step 11 pending real-device measurement
+## Phase 2, first design (superseded 2026-08-30): implemented, then replaced
 
-Build steps 9 and 10 are done: `POST /cards/match-text`
-(`backend/api/recognize.py`), `frontend/src/utils/cardOcr.js` (Tesseract.js),
-wired into `DeckCardScanner.jsx`'s capture flow ahead of the existing
-`recognizeCard()` call, which now only fires when OCR found no usable name
-or `match-text` wasn't confident — matching the "Net effect" framing above,
-not the flow diagram's looser "OR straight to the manual picker" phrasing.
+Build steps 9-10 were originally implemented as written above: `POST
+/cards/match-text` (a broad TCGdex catalog search seeded by OCR fields,
+narrowed by pHash), tested (`backend/tests/test_match_text.py`), and wired
+into `DeckCardScanner.jsx`. It worked exactly as designed. Real-device
+testing that night surfaced two things worth recording even though this
+design is gone:
 
-**Language scope, resolved with you**: English only for now (not the
-broader multi-language set this app otherwise syncs from TCGdex) — each
-additional language needs its own several-MB `tessdata_fast` trained-data
-file, vendored the same way as `eng.traineddata`
-(`frontend/public/tesseract/VENDORED.md`). A non-English card's OCR
-`name` still gets attempted (Tesseract will produce *some* text off a
-non-English card using the English model), but accuracy is unvalidated for
-that case and expected to be poor — it just falls through to the paid
-`recognizeCard()` fallback like any other unresolved OCR attempt, so this
-is a soft, non-blocking scope limit, not a hard gate. Extending to more
-languages later is additive: vendor the file, no architecture change.
+- OCR's `name` extraction (the field `match-text` needed to run a search at
+  all) proved unreliable on real cards — a naive flat-text heuristic picked
+  up mid-card noise instead of the actual name; fixed with a
+  position+confidence-aware word-level picker
+  (`cardOcr.js`'s `pickCardName`), documented below since it's still used.
+- `normalize_recognized_card_info()` does **not** tolerate letter-O/digit-
+  zero OCR confusion (a genuine "052" misread as "O52" doesn't match) —
+  fixed at the OCR-specific source (`cardOcr.js`'s `cleanNumberToken`), not
+  the shared matcher the trusted Gemini-vision path also relies on. This
+  finding still applies to the current design (see below).
 
-**Real backend seam confirmed empirically, not just by reading code**: the
-new `backend/tests/test_match_text.py` proves `/cards/match-text` resolves
-confidently through the existing deterministic matcher end-to-end (not
-mocked at `match_card_info`'s own level) with OCR-shaped input, and proves
-the route can never itself trigger a paid vision call regardless of
-confidence. It also documents a real, verified gap the plan flagged as
-unknown: `normalize_recognized_card_info()` does **not** tolerate
-letter-O/digit-zero OCR confusion (a genuine "052" misread as "O52" does
-not match) — fixed at the OCR-specific source instead
-(`cardOcr.js`'s `cleanNumberToken`), not in the shared backend matcher the
-trusted Gemini-vision path also relies on.
+**Why superseded**: the live scanner is *always* scoped to one tracked
+deck instance with a small, already-known card list — searching the whole
+TCGdex catalog by OCR'd name, the way `match-text` did, was solving a
+harder and less reliable problem than the one this feature actually has.
+Redesigned per direct user request: OCR -> match against ONLY this deck
+instance's own still-missing cards -> paid Gemini call as the last resort,
+never a broad catalog search. `POST /cards/match-text` and
+`test_match_text.py` were deleted, not just deprecated — replaced outright,
+not layered alongside.
 
-**Step 11 (measure against real cards) still needs a real device** — same
-as Phase 1's own step 8, this can't be verified any other way. Next
-real-device test should watch for: (a) whether `name` OCR is usable often
-enough for `match-text` to ever get attempted, (b) how often it resolves
-confidently vs. falls back, (c) combined Tesseract.js + OpenCV.js payload
-size/reliability over whatever HTTPS path is in use at the time.
+## Phase 2, current design: deck-scoped match
+
+`POST /decks/instances/{instance_id}/match-image`
+(`backend/api/decks.py`, tested in `backend/tests/test_deck_image_match.py`)
+replaces `match-text`. Given the captured photo and this deck instance's
+still-missing cards (`expected_quantity > scanned_quantity` — a card
+already fully collected is excluded, since matching against it can't
+change anything):
+
+1. **pHash** (`services/phash.py`, extracted from `api/recognize.py` so
+   both matchers share it) against ALL missing candidates with an image —
+   no `PHASH_CANDIDATE_LIMIT` cap, unlike the broad-search matcher: a
+   deck's own candidate list is already small and bounded, so capping to 8
+   would silently ignore most of a freshly-started deck. Needs 2+ scored
+   candidates to judge a confident margin; with fewer, this tier can't run
+   at all (e.g. exactly one card left missing).
+2. If pHash didn't resolve confidently: a **unique** number match among
+   missing candidates (OCR's `number_local`, via the same
+   `normalize_scanner_card_number` the Gemini path uses — the letter-O/
+   digit-zero finding above still applies and is still fixed in
+   `cardOcr.js`, not here).
+3. If still unresolved: a **unique** name match — substring, not equality
+   (`candidate.name.casefold() in ocrName.casefold()`), since OCR's word-
+   level name output can include adjacent noise it couldn't confidently
+   drop (a real "Potion" card read as "bern PRALINE Fe Potion" — the
+   substring check still finds it).
+4. Otherwise: not confident, falls through to `recognizeCard()` (paid).
+
+An ambiguous number or name match (more than one candidate) is never
+trusted on its own at either tier — exactly the case pHash already
+declined to resolve.
+
+**OCR scope narrowed to match**: `cardOcr.js` no longer extracts HP or
+anything else — only `number_local`/`number_total` (regex on the flat
+text) and `name` (`pickCardName`, word-level, position+confidence-based —
+see the first-design section above for why line-level grouping and a
+flat-text heuristic both failed on real cards). Neither figure is used to
+search anything broader than this one deck instance's own card list.
+
+**A total OCR failure no longer skips the free tier** — a real change from
+the first design, which required a `name` to run `match-text` at all. The
+deck-scoped match can resolve purely from pHash with zero OCR input, so
+`DeckCardScanner.jsx` always attempts it once `deckInstanceId` is known,
+regardless of what OCR did or didn't find.
+
+**`DeckCardScanner.jsx` now requires a `deckInstanceId` prop** (from
+`DeckDetail.jsx`'s own `useParams()`) — without it, this tier is skipped
+entirely and every card falls straight to the paid call, matching the
+component's own inline documentation.
+
+**Verified**: 767 backend / 317 frontend tests green, including 9 new
+backend tests directly exercising the deck-scoped matcher's confidence
+logic (pHash win, missing-card exclusion, unique/ambiguous number match,
+unique/ambiguous name match, empty-deck edge case, cross-user ownership
+rejection, trace labeling). Not yet verified: real-device accuracy of this
+specific design — same caveat as everything else in this document that
+hasn't had a real-device pass yet.
