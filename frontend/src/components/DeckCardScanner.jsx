@@ -7,7 +7,7 @@ import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
 import { useCameraStream } from '../hooks/useCameraStream'
 import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
+import { lastOcrRawText, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
 import { createStabilityTracker } from '../utils/quadStability'
 
 const DETECTION_INTERVAL_MS = 180
@@ -254,7 +254,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
       // only way to tell "OCR found nothing" apart from "OCR found
       // something but match-text wasn't confident" without this was
       // reading server logs by hand (see the real-device Wattrel case).
-      setDebugInfo((d) => ({ ...d, ocrName: ocrFields.name, ocrNumber: ocrFields.number_local }))
+      setDebugInfo((d) => ({
+        ...d,
+        ocrName: ocrFields.name,
+        ocrNumber: ocrFields.number_local,
+        ocrRawText: lastOcrRawText.value,
+      }))
       if (!ocrFields.name) return null
       return await matchCardText(ocrFields, blob, 'live_auto_scan')
     } catch (err) {
@@ -507,6 +512,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
               {debugInfo.libError && <><br />lib error: {debugInfo.libError}</>}
               {debugInfo.ocrName !== undefined && (
                 <><br />ocr name:{debugInfo.ocrName ?? '(none)'} number:{debugInfo.ocrNumber ?? '(none)'}</>
+              )}
+              {debugInfo.ocrRawText !== undefined && (
+                <><br />ocr raw:{debugInfo.ocrRawText.trim()
+                  ? JSON.stringify(debugInfo.ocrRawText.replace(/\s+/g, ' ').trim().slice(0, 150))
+                  : '(empty)'}</>
               )}
               {debugInfo.tickError && <><br />tick error: {debugInfo.tickError}</>}
             </div>

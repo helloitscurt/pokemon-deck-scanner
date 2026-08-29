@@ -94,8 +94,17 @@ export function parseCardOcrText(rawText) {
 // result, since "OCR found nothing usable" is an expected, common outcome
 // this tier is explicitly built to fall back from (see the plan's Phase 2
 // flow diagram), not an error.
+// Mutable, not React state — mirrors cardDetection.js's detectionStatus.
+// DeckCardScanner reads this into its on-screen debug readout right after
+// calling recognizeCardText, so "Tesseract found nothing at all" can be
+// told apart from "Tesseract found text the parser above couldn't turn
+// into a name/number" without server logs or devtools access on a phone.
+export const lastOcrRawText = { value: '' }
+
 export async function recognizeCardText(cardCanvas) {
   const worker = await ensureWorker()
   const { data } = await worker.recognize(cardCanvas)
-  return parseCardOcrText(data?.text || '')
+  const rawText = data?.text || ''
+  lastOcrRawText.value = rawText
+  return parseCardOcrText(rawText)
 }

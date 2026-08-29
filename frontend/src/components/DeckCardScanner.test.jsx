@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DeckCardScanner from './DeckCardScanner'
 import { matchCardText, recognizeCard } from '../api/client'
 import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { recognizeCardText } from '../utils/cardOcr'
+import { lastOcrRawText, recognizeCardText } from '../utils/cardOcr'
 
 vi.mock('../api/client', () => ({
   recognizeCard: vi.fn(),
@@ -29,6 +29,7 @@ vi.mock('../utils/cardDetection', () => ({
 vi.mock('../utils/cardOcr', () => ({
   recognizeCardText: vi.fn(),
   preloadCardOcr: vi.fn(),
+  lastOcrRawText: { value: '' },
 }))
 
 let mockCameraStatus = 'streaming'
@@ -339,6 +340,7 @@ describe('DeckCardScanner', () => {
     // against, while still proving debugInfo captured the OCR result from
     // the earlier, successful tryOcrMatch step.
     recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
+    lastOcrRawText.value = 'Pikachu\nHP 60\n025/198'
     matchCardText.mockResolvedValue({ _identity_confident: false, matches: [] })
     recognizeCard.mockRejectedValue(new Error('network down'))
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
@@ -347,6 +349,22 @@ describe('DeckCardScanner', () => {
 
     expect(document.body.textContent).toContain('ocr name:Pikachu')
     expect(document.body.textContent).toContain('number:25')
+    expect(document.body.textContent).toContain('ocr raw:')
+    expect(document.body.textContent).toContain('Pikachu HP 60 025/198')
+  })
+
+  it('shows "(empty)" for the raw OCR readout when Tesseract found nothing at all', async () => {
+    // The real-device finding this guards: a well-lit, legible card still
+    // produced name:(none) number:(none) — this line is what tells apart
+    // "Tesseract found nothing" from "found text the parser couldn't use."
+    recognizeCardText.mockResolvedValue({ name: null })
+    lastOcrRawText.value = ''
+    recognizeCard.mockRejectedValue(new Error('network down'))
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(document.body.textContent).toContain('ocr raw:(empty)')
   })
 
   it('falls back to the paid recognizeCard when OCR found a name but match-text was not confident', async () => {
