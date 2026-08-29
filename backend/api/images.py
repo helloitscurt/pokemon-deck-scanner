@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from database import get_db
 from models import Card, ImageCache, ProductPurchase, Set, Setting
 from services.card_visibility import get_configured_sync_languages, get_pinned_set_language_pairs
+from services.image_cache import get_cached_image, store_cached_image
 from services.image_url_security import validate_public_https_image_url
 from services.product_images import (
     prepare_product_image_cache,
@@ -84,10 +85,12 @@ def _is_globally_visible_set_image(db: Session, card_set: Set) -> bool:
     return (tcg_set_id, set_lang) in get_pinned_set_language_pairs(db)
 
 
-def _get_or_fetch(db: Session, key: str, url: str) -> tuple[bytes, str]:
-    cached = db.query(ImageCache).filter(ImageCache.image_key == key).first()
+def _get_or_fetch(db: Session, url: str) -> tuple[bytes, str]:
+    """Fetch a TCGdex-hosted image, caching by URL — shared with pHash's
+    candidate downloads in api/recognize.py (services/image_cache.py)."""
+    cached = get_cached_image(db, url)
     if cached:
-        return cached.data, cached.content_type
+        return cached
 
     try:
         resp = _client.get(url)
@@ -96,18 +99,7 @@ def _get_or_fetch(db: Session, key: str, url: str) -> tuple[bytes, str]:
         raise HTTPException(status_code=502, detail="Failed to fetch image from upstream") from exc
 
     content_type = resp.headers.get("content-type", "image/webp")
-    entry = ImageCache(image_key=key, data=resp.content, content_type=content_type)
-    db.add(entry)
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
-        cached = db.query(ImageCache).filter(ImageCache.image_key == key).first()
-        if cached:
-            return cached.data, cached.content_type
-        raise
-
-    return resp.content, content_type
+    return store_cached_image(db, url, resp.content, content_type)
 
 
 def _get_or_fetch_custom_image(
@@ -210,8 +202,7 @@ def get_card_image(
         elif card.custom_image_url and url == card.custom_image_url:
             data, content_type = _get_or_fetch_custom_image(db, f"card:{card_id}:{size}:custom", url)
         else:
-            url_hash = hashlib.sha1(url.encode("utf-8")).hexdigest()
-            data, content_type = _get_or_fetch(db, f"card:{card_id}:{size}:{url_hash}", url)
+            data, content_type = _get_or_fetch(db, url)
     except (HTTPException, ValueError):
         return _card_back_response()
     return Response(
@@ -233,7 +224,6 @@ def get_set_image(set_id: str, image_type: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="Set not found")
 
     url = card_set.images_logo if image_type == "logo" else card_set.images_symbol
-    cache_key = f"set:{set_id}:{image_type}"
 
     if not url and _setting_enabled(db, "cross_language_image_fallback", True):
         fallback_lang = _other_lang(card_set.lang)
@@ -245,13 +235,12 @@ def get_set_image(set_id: str, image_type: str, db: Session = Depends(get_db)):
             ).first()
             if sibling:
                 url = sibling.images_logo if image_type == "logo" else sibling.images_symbol
-                cache_key = f"set:{set_id}:{image_type}:fallback:{fallback_lang}"
 
     if not url:
         return _set_fallback_response()
 
     try:
-        data, content_type = _get_or_fetch(db, cache_key, url)
+        data, content_type = _get_or_fetch(db, url)
     except HTTPException as exc:
         if exc.status_code == 502:
             return _set_fallback_response()

@@ -4,7 +4,11 @@ from unittest.mock import AsyncMock, Mock, patch
 try:
     import httpx
     from fastapi import HTTPException
+    from sqlalchemy import create_engine
+    from sqlalchemy.orm import sessionmaker
 
+    from database import Base
+    from services.image_cache import get_cached_image, store_cached_image
     from api.recognize import (
         DEFAULT_GEMINI_MODEL,
         COMPOSITE_PROMPT,
@@ -233,6 +237,12 @@ class PhashMatchingTests(unittest.IsolatedAsyncioTestCase):
             for chunk in self._chunks:
                 yield chunk
 
+    def setUp(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        self.db = Session()
+
     @staticmethod
     def _image(seed: int) -> bytes:
         import io
@@ -323,6 +333,47 @@ class PhashMatchingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(downloaded, {})
         client.stream.assert_not_called()
+
+    async def test_candidate_download_caches_a_fetched_image_by_url(self):
+        client = Mock()
+        client.stream.return_value = self.StreamResponse(
+            [b"fresh-image"], headers={"content-type": "image/webp"}
+        )
+        url = "https://assets.tcgdex.net/en/base/base1/1/low.webp"
+
+        downloaded = await _download_candidate_images(
+            client,
+            [{"id": "one", "image": url}],
+            db=self.db,
+        )
+
+        self.assertEqual(downloaded["one"], b"fresh-image")
+        self.assertEqual(get_cached_image(self.db, url), (b"fresh-image", "image/webp"))
+
+    async def test_candidate_download_reuses_a_cached_image_without_refetching(self):
+        client = Mock()
+        client.stream.return_value = self.StreamResponse([b"should-not-be-used"])
+        url = "https://assets.tcgdex.net/en/base/base1/1/low.webp"
+        store_cached_image(self.db, url, b"already-cached", "image/webp")
+
+        downloaded = await _download_candidate_images(
+            client,
+            [{"id": "one", "image": url}],
+            db=self.db,
+        )
+
+        self.assertEqual(downloaded["one"], b"already-cached")
+        client.stream.assert_not_called()
+
+    async def test_candidate_download_without_db_does_not_touch_the_cache(self):
+        client = Mock()
+        client.stream.return_value = self.StreamResponse([b"fresh-image"])
+        url = "https://assets.tcgdex.net/en/base/base1/1/low.webp"
+
+        downloaded = await _download_candidate_images(client, [{"id": "one", "image": url}])
+
+        self.assertEqual(downloaded["one"], b"fresh-image")
+        self.assertIsNone(get_cached_image(self.db, url))
 
     def test_rejects_excessive_decoded_dimensions(self):
         with patch("api.recognize.MAX_REFERENCE_IMAGE_PIXELS", 100):

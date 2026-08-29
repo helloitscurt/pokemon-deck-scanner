@@ -18,6 +18,7 @@ from services.gemini_rate_limit import (
     penalize_gemini_key,
     record_gemini_success,
 )
+from services.image_cache import get_cached_image, store_cached_image
 from services.scan_storage import MAX_FILE_BYTES, ScanUploadError, read_limited_upload, sanitize_image_bytes
 from services.scan_trace import ScanTrace, create_scan_trace
 from services.scan_providers import (
@@ -570,8 +571,17 @@ async def _download_candidate_images(
     client: httpx.AsyncClient,
     candidates: list[dict],
     existing: dict[str, bytes] | None = None,
+    db: Session | None = None,
 ) -> dict[str, bytes]:
-    """Download each candidate image at most once for pHash/Gemini reuse."""
+    """Download each candidate image at most once for pHash/Gemini reuse.
+
+    When db is given, checks/populates the shared image cache
+    (services/image_cache.py) before hitting TCGdex — the same cache
+    api/images.py's card/set image serving uses, so a candidate whose
+    thumbnail was already viewed elsewhere in the app isn't re-downloaded
+    here. db is optional (defaults to no caching) so existing callers that
+    don't have a session handy are unaffected.
+    """
     downloaded = dict(existing or {})
 
     async def fetch(candidate: dict) -> tuple[str, bytes] | None:
@@ -585,6 +595,12 @@ async def _download_candidate_images(
             or parsed_url.hostname not in TRUSTED_REFERENCE_IMAGE_HOSTS
         ):
             return None
+
+        if db is not None:
+            cached = get_cached_image(db, str(image_url))
+            if cached is not None:
+                return candidate_id, cached[0]
+
         try:
             async with client.stream("GET", image_url, timeout=5) as response:
                 if response.status_code != 200:
@@ -597,13 +613,17 @@ async def _download_candidate_images(
                     except ValueError:
                         return None
 
+                content_type = response.headers.get("content-type", "image/webp")
                 content = bytearray()
                 async for chunk in response.aiter_bytes():
                     if len(content) + len(chunk) > MAX_REFERENCE_IMAGE_BYTES:
                         return None
                     content.extend(chunk)
                 if content:
-                    return candidate_id, bytes(content)
+                    data = bytes(content)
+                    if db is not None:
+                        store_cached_image(db, str(image_url), data, content_type)
+                    return candidate_id, data
         except Exception:
             return None
         return None
@@ -955,6 +975,7 @@ async def match_card_info(
                 candidate_images = await _download_candidate_images(
                     client,
                     top_candidates[:PHASH_CANDIDATE_LIMIT],
+                    db=db,
                 )
                 if should_try_phash:
                     try:
@@ -982,6 +1003,7 @@ async def match_card_info(
                         client,
                         top_candidates,
                         candidate_images,
+                        db=db,
                     )
                     parts = [
                         {"text": "Here is the original card photo:"},
