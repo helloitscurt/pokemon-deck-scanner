@@ -7,7 +7,7 @@ import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
 import { useCameraStream } from '../hooks/useCameraStream'
 import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrRawText, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
+import { lastOcrLines, lastOcrRawText, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
 import { createStabilityTracker } from '../utils/quadStability'
 
 const DETECTION_INTERVAL_MS = 180
@@ -299,6 +299,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
       ocrName: ocrFields.name,
       ocrNumber: ocrFields.number_local,
       ocrRawText: lastOcrRawText.value,
+      // Shows every recognized line's own confidence/position, including
+      // ones pickCardName rejected — the only way to tell "nothing scored
+      // high enough" apart from "the name band/confidence floor need
+      // retuning" (see cardOcr.js's NAME_BAND_FRACTION/MIN_NAME_CONFIDENCE).
+      ocrLines: lastOcrLines.value,
     }))
     if (!ocrFields.name) return null
     try {
@@ -558,6 +563,16 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
                 <><br />ocr raw:{debugInfo.ocrRawText.trim()
                   ? JSON.stringify(debugInfo.ocrRawText.replace(/\s+/g, ' ').trim().slice(0, 150))
                   : '(empty)'}</>
+              )}
+              {debugInfo.ocrLines !== undefined && (
+                <><br />ocr lines:{debugInfo.ocrLines.length === 0
+                  ? '(none)'
+                  : debugInfo.ocrLines
+                    // Highest-confidence first — the ones pickCardName
+                    // would have preferred if position let it through.
+                    .slice().sort((a, b) => b.confidence - a.confidence).slice(0, 6)
+                    .map((l) => `"${l.text.slice(0, 20)}"@y${l.y0}(${l.confidence})`)
+                    .join(' ')}</>
               )}
               {debugInfo.tickError && <><br />tick error: {debugInfo.tickError}</>}
             </div>

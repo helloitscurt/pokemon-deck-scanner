@@ -147,6 +147,15 @@ export const lastOcrRawText = { value: '' }
 // result, since "OCR found nothing usable" is an expected, common outcome
 // this tier is explicitly built to fall back from (see the plan's Phase 2
 // flow diagram), not an error.
+// Same rationale as lastOcrRawText — the raw flat text alone can't show
+// WHY pickCardName rejected everything: nothing recognized at all, or
+// recognized-but-below-threshold/out-of-band candidates it correctly
+// declined to guess from. DeckCardScanner surfaces this compactly (text,
+// rounded confidence, y-position) so that distinction is visible without
+// server logs — it directly decides whether NAME_BAND_FRACTION/
+// MIN_NAME_CONFIDENCE need retuning or the problem is upstream of them.
+export const lastOcrLines = { value: [] }
+
 export async function recognizeCardText(cardCanvas) {
   const worker = await ensureWorker()
   // blocks: true is required for pickCardName's position/confidence data —
@@ -155,6 +164,11 @@ export async function recognizeCardText(cardCanvas) {
   const { data } = await worker.recognize(cardCanvas, {}, { text: true, blocks: true })
   const rawText = data?.text || ''
   lastOcrRawText.value = rawText
+  lastOcrLines.value = flattenLines(data?.blocks).map((l) => ({
+    text: (l.text || '').trim(),
+    confidence: Math.round(l.confidence ?? 0),
+    y0: l.bbox?.y0 ?? null,
+  }))
   return {
     ...parseCardOcrText(rawText),
     name: pickCardName(data?.blocks, cardCanvas?.height),
