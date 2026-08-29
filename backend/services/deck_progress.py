@@ -50,3 +50,45 @@ def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str
             last_scanned_at=now,
         ))
     db.commit()
+
+
+def unregister_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str, quantity: int = 1) -> bool:
+    """Reverse one register_scan call — decrement-or-delete the matching
+    ScannedCard row. Returns whether a row was found to reverse.
+
+    Same ownership/deck-membership checks as register_scan, so this is safe
+    to call on its own. Deliberately does NOT commit (unlike register_scan)
+    — the caller (api/decks.py's scan-undo route) commits this together
+    with the collection-side decrement in one transaction, so undo can't
+    half-succeed. That's a stricter consistency model than register_scan's
+    own caller uses (_apply_deck_scan deliberately isolates its failure
+    from the collection add it follows) — a half-reversed undo is a more
+    confusing state than a half-applied add, so undo doesn't get the same
+    isolation.
+    """
+    instance = db.query(DeckInstance).filter(
+        DeckInstance.id == deck_instance_id,
+        DeckInstance.user_id == user_id,
+    ).first()
+    if not instance:
+        return False
+
+    deck_card = db.query(DeckCard).filter(
+        DeckCard.deck_id == instance.deck_id,
+        DeckCard.card_id == card_id,
+    ).first()
+    if not deck_card:
+        return False
+
+    scanned = db.query(ScannedCard).filter(
+        ScannedCard.deck_instance_id == instance.id,
+        ScannedCard.card_id == card_id,
+    ).first()
+    if not scanned or scanned.scanned_quantity <= 0:
+        return False
+
+    if scanned.scanned_quantity <= quantity:
+        db.delete(scanned)
+    else:
+        scanned.scanned_quantity -= quantity
+    return True

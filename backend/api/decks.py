@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session, joinedload
 
 from api.auth import get_current_user
-from api.collection import ensure_card_exists
+from api.collection import ensure_card_exists, find_matching_collection_item
 from database import get_db
 from models import Card, Deck, DeckCard, DeckInstance, ScannedCard, User
 from schemas import (
@@ -14,6 +14,7 @@ from schemas import (
     DeckSearchResult, DeckParseRequest, DeckParseResponse, DeckParseBlock, DeckParseEntry,
 )
 from services import bulbapedia
+from services.deck_progress import unregister_scan
 
 router = APIRouter()
 
@@ -252,6 +253,63 @@ def reset_deck_instance(
     if not instance:
         raise HTTPException(status_code=404, detail="Deck instance not found")
     db.query(ScannedCard).filter(ScannedCard.deck_instance_id == instance.id).delete()
+    db.commit()
+    return _instance_response(db, instance, detail=True)
+
+
+@router.post("/instances/{instance_id}/scans/{card_id}/undo", response_model=DeckInstanceDetailResponse)
+def undo_scan(
+    instance_id: int,
+    card_id: str,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reverse one scan: decrement-or-delete both the CollectionItem row
+    add_to_collection incremented and the ScannedCard row register_scan
+    incremented, in one transaction — unlike _apply_deck_scan (which
+    deliberately isolates the collection add from the deck-progress update
+    that follows it), this deliberately does NOT isolate the two sides'
+    failures from each other. A half-reversed undo (one side decremented,
+    the other not) is a more confusing state than a half-applied add.
+
+    Two checks, not the one instance-ownership check reset_deck_instance
+    uses: that check alone never validates card_id at all (it has none).
+    Without also requiring card_id to be part of THIS deck's template (the
+    same check register_scan already does), a card_id that isn't in this
+    deck — but that the same user owns elsewhere — would still pass the
+    instance-ownership check and could decrement an unrelated collection
+    item that happens to match the deterministic defaults below.
+    """
+    instance = db.query(DeckInstance).options(joinedload(DeckInstance.deck)).filter(
+        DeckInstance.id == instance_id,
+        DeckInstance.user_id == current_user.id,
+    ).first()
+    if not instance:
+        raise HTTPException(status_code=404, detail="Deck instance not found")
+
+    # The scanner always adds with these exact defaults (see
+    # schemas.CollectionItemCreate and api.collection.add_to_collection) —
+    # deterministic, so undo re-derives the same row add_to_collection
+    # would have found without the frontend needing to remember its id.
+    matching_item = find_matching_collection_item(
+        db, current_user.id,
+        card_id=card_id, variant="Normal", lang="en", condition="NM", purchase_price=None,
+    )
+    if not matching_item:
+        raise HTTPException(status_code=404, detail="No matching scan found to undo")
+
+    # Checks card_id is part of this deck's template internally — see its
+    # own docstring for why this route still checks instance ownership
+    # itself above rather than relying solely on this.
+    reversed_progress = unregister_scan(db, current_user.id, instance_id, card_id)
+    if not reversed_progress:
+        raise HTTPException(status_code=404, detail="No matching scan found to undo")
+
+    if matching_item.quantity <= 1:
+        db.delete(matching_item)
+    else:
+        matching_item.quantity -= 1
+
     db.commit()
     return _instance_response(db, instance, detail=True)
 

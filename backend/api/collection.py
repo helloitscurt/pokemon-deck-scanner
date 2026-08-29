@@ -80,6 +80,34 @@ def _chunks(values: list, size: int):
         yield values[start:start + size]
 
 
+def find_matching_collection_item(
+    db: Session,
+    user_id: int,
+    *,
+    card_id: str,
+    variant: str,
+    lang: str,
+    condition: str,
+    purchase_price,
+) -> Optional[CollectionItem]:
+    """The row add_to_collection groups into for these exact fields.
+
+    Shared so a caller reversing an add (api/decks.py's scan-undo route)
+    re-derives the same row add_to_collection would have found instead of
+    independently encoding this five-field predicate a second time, which
+    would risk silently drifting from add_to_collection's own matching rule
+    if one were ever changed without the other.
+    """
+    return db.query(CollectionItem).filter(
+        CollectionItem.card_id == card_id,
+        CollectionItem.variant == variant,
+        CollectionItem.lang == lang,
+        CollectionItem.condition == condition,
+        CollectionItem.purchase_price == purchase_price,
+        CollectionItem.user_id == user_id,
+    ).first()
+
+
 def _apply_deck_scan(db: Session, current_user: User, item: CollectionItemCreate, effective_card_id: str) -> None:
     """Update deck-instance progress for a confirmed collection add, if requested.
 
@@ -559,14 +587,11 @@ def add_to_collection(
         ensure_card_exists(db, effective_card_id, lang=item_lang)
 
     # Find existing entry for same card + variant + lang + condition + purchase_price combination
-    existing = db.query(CollectionItem).filter(
-        CollectionItem.card_id == effective_card_id,
-        CollectionItem.variant == item_variant,
-        CollectionItem.lang == item_lang,
-        CollectionItem.condition == item.condition,
-        CollectionItem.purchase_price == item.purchase_price,
-        CollectionItem.user_id == current_user.id,
-    ).first()
+    existing = find_matching_collection_item(
+        db, current_user.id,
+        card_id=effective_card_id, variant=item_variant, lang=item_lang,
+        condition=item.condition, purchase_price=item.purchase_price,
+    )
 
     if existing:
         existing.quantity += item.quantity or 1
