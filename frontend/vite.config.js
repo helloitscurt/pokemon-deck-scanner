@@ -28,4 +28,12 @@ export default defineConfig({
       },
     },
   },
+  test: {
+    // Individual environment default stays 'node' (vitest's own default,
+    // unchanged) — DOM-rendering tests opt in per-file via a leading
+    // `// @vitest-environment jsdom` comment instead of switching this
+    // globally, so the other ~35 existing logic-only test files keep
+    // running exactly as before.
+    setupFiles: ['./src/test-setup.js'],
+  },
 })
