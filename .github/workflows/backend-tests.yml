@@ -51,7 +51,12 @@ jobs:
           pip --version
 
       - name: Install dependencies
-        run: pip install --no-cache-dir -r requirements.txt
+        # No --no-cache-dir here: actions/setup-python's cache: "pip" above
+        # needs pip to actually populate ~/.cache/pip to have anything to
+        # save for the next run — --no-cache-dir defeated that entirely and
+        # made the cache-save post-step fail (nothing there to save), which
+        # marked the whole job red even though the tests themselves passed.
+        run: pip install -r requirements.txt
 
       - name: Run backend test suite
         run: python -m unittest discover -s tests -p "test_*.py"
