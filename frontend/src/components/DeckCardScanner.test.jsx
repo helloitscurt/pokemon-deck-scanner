@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DeckCardScanner from './DeckCardScanner'
 import { matchCardText, recognizeCard } from '../api/client'
 import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrLines, lastOcrRawText, recognizeCardText } from '../utils/cardOcr'
+import { lastOcrRawText, lastOcrWords, recognizeCardText } from '../utils/cardOcr'
 
 vi.mock('../api/client', () => ({
   recognizeCard: vi.fn(),
@@ -30,7 +30,7 @@ vi.mock('../utils/cardOcr', () => ({
   recognizeCardText: vi.fn(),
   preloadCardOcr: vi.fn(),
   lastOcrRawText: { value: '' },
-  lastOcrLines: { value: [] },
+  lastOcrWords: { value: [] },
 }))
 
 let mockCameraStatus = 'streaming'
@@ -111,7 +111,7 @@ describe('DeckCardScanner', () => {
     // doesn't touch these, so reset explicitly to avoid one test's value
     // leaking into the next.
     lastOcrRawText.value = ''
-    lastOcrLines.value = []
+    lastOcrWords.value = []
     onConfirm = vi.fn().mockResolvedValue(undefined)
   })
 
@@ -401,7 +401,7 @@ describe('DeckCardScanner', () => {
     // the earlier, successful tryOcrMatch step.
     recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
     lastOcrRawText.value = 'Pikachu\nHP 60\n025/198'
-    lastOcrLines.value = [{ text: 'Pikachu', confidence: 91, y0: 90 }]
+    lastOcrWords.value = [{ text: 'Pikachu', confidence: 91, y0: 90 }]
     matchCardText.mockResolvedValue({ _identity_confident: false, matches: [] })
     recognizeCard.mockRejectedValue(new Error('network down'))
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
@@ -412,22 +412,22 @@ describe('DeckCardScanner', () => {
     expect(document.body.textContent).toContain('number:25')
     expect(document.body.textContent).toContain('ocr raw:')
     expect(document.body.textContent).toContain('Pikachu HP 60 025/198')
-    // The line-level readout — proves pickCardName's actual input (not
+    // The word-level readout — proves pickCardName's actual input (not
     // just its output) is visible, so a rejected-but-real candidate can be
     // told apart from Tesseract finding nothing usable at all.
-    expect(document.body.textContent).toContain('ocr lines:')
+    expect(document.body.textContent).toContain('ocr words:')
     expect(document.body.textContent).toContain('"Pikachu"@y90(91)')
   })
 
-  it('shows rejected OCR line candidates in the debug readout even when no name was picked', async () => {
+  it('shows rejected OCR word candidates in the debug readout even when no name was picked', async () => {
     // The real-device gap this closes: "ocr name:(none)" alone can't say
     // whether nothing was recognized, or something was recognized but
     // scored below MIN_NAME_CONFIDENCE / outside NAME_BAND_FRACTION.
     recognizeCardText.mockResolvedValue({ name: null })
     lastOcrRawText.value = 'garbled nonsense'
-    lastOcrLines.value = [
-      { text: 'Potion', confidence: 22, y0: 90 }, // real text, too low-confidence
-      { text: 'garbled nonsense', confidence: 61, y0: 600 }, // confident but out of band
+    lastOcrWords.value = [
+      { text: 'Potion', confidence: 22, y0: 90 }, // real word, too low-confidence
+      { text: 'garbled', confidence: 61, y0: 600 }, // confident but out of band
     ]
     recognizeCard.mockRejectedValue(new Error('network down'))
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
@@ -435,7 +435,7 @@ describe('DeckCardScanner', () => {
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(document.body.textContent).toContain('ocr name:(none)')
-    expect(document.body.textContent).toContain('"garbled nonsense"@y600(61)')
+    expect(document.body.textContent).toContain('"garbled"@y600(61)')
     expect(document.body.textContent).toContain('"Potion"@y90(22)')
   })
 

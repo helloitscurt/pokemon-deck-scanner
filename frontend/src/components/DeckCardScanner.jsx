@@ -7,7 +7,7 @@ import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
 import { useCameraStream } from '../hooks/useCameraStream'
 import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrLines, lastOcrRawText, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
+import { lastOcrRawText, lastOcrWords, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
 import { createStabilityTracker } from '../utils/quadStability'
 
 const DETECTION_INTERVAL_MS = 180
@@ -299,11 +299,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
       ocrName: ocrFields.name,
       ocrNumber: ocrFields.number_local,
       ocrRawText: lastOcrRawText.value,
-      // Shows every recognized line's own confidence/position, including
+      // Shows every recognized word's own confidence/position, including
       // ones pickCardName rejected — the only way to tell "nothing scored
       // high enough" apart from "the name band/confidence floor need
       // retuning" (see cardOcr.js's NAME_BAND_FRACTION/MIN_NAME_CONFIDENCE).
-      ocrLines: lastOcrLines.value,
+      ocrWords: lastOcrWords.value,
     }))
     if (!ocrFields.name) return null
     try {
@@ -564,14 +564,17 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
                   ? JSON.stringify(debugInfo.ocrRawText.replace(/\s+/g, ' ').trim().slice(0, 150))
                   : '(empty)'}</>
               )}
-              {debugInfo.ocrLines !== undefined && (
-                <><br />ocr lines:{debugInfo.ocrLines.length === 0
+              {debugInfo.ocrWords !== undefined && (
+                <><br />ocr words:{debugInfo.ocrWords.length === 0
                   ? '(none)'
-                  : debugInfo.ocrLines
+                  : debugInfo.ocrWords
                     // Highest-confidence first — the ones pickCardName
                     // would have preferred if position let it through.
-                    .slice().sort((a, b) => b.confidence - a.confidence).slice(0, 6)
-                    .map((l) => `"${l.text.slice(0, 20)}"@y${l.y0}(${l.confidence})`)
+                    // A real card produced more than fit in the earlier
+                    // line-level view's smaller slice, hiding the very
+                    // word that mattered — 12 gives more headroom.
+                    .slice().sort((a, b) => b.confidence - a.confidence).slice(0, 12)
+                    .map((w) => `"${w.text.slice(0, 15)}"@y${w.y0}(${w.confidence})`)
                     .join(' ')}</>
               )}
               {debugInfo.tickError && <><br />tick error: {debugInfo.tickError}</>}

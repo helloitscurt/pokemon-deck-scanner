@@ -87,7 +87,7 @@ export function parseCardOcrText(rawText) {
 // substring — "Potion" doesn't contain "item" as a whole word, but a line
 // that IS just "Item" does.
 const NAME_BAND_DENYLIST = new Set([
-  'trainer', 'item', 'supporter', 'stadium', 'energy', 'basic',
+  'trainer', 'item', 'supporter', 'stadium', 'energy', 'basic', 'hp',
   'pokemon', 'pokémon', 'ex', 'gx', 'v', 'vmax', 'vstar',
 ])
 
@@ -100,39 +100,51 @@ const NAME_BAND_DENYLIST = new Set([
 const NAME_BAND_FRACTION = 0.22
 const MIN_NAME_CONFIDENCE = 40
 
-// Flattens Tesseract's blocks -> paragraphs -> lines into one list. Each
-// line carries text/confidence/bbox — see index.d.ts in the vendored
-// tesseract.js package for the shape. Requires output: {blocks: true} on
-// the recognize() call (off by default — text-only is Tesseract.js's own
-// default output, for performance).
-function flattenLines(blocks) {
-  const lines = []
+// Flattens Tesseract's blocks -> paragraphs -> lines -> words into one
+// list. Each word carries its own text/confidence/bbox — see index.d.ts in
+// the vendored tesseract.js package for the shape. Requires
+// output: {blocks: true} on the recognize() call (off by default —
+// text-only is Tesseract.js's own default output, for performance).
+//
+// Word-level, not line-level: a real-device card ("Potion") proved
+// line-level grouping dilutes a single clean, correctly-recognized word
+// sitting next to garbled OCR noise on the same line — the line's overall
+// confidence (and merged text) reflected its worst neighbor, not the good
+// word itself. Tesseract's own flat-text output contained "Potion"
+// correctly; the line-grouped view didn't surface it as a usable
+// candidate at all. Filtering per-word lets a good word survive bad
+// neighbors, and adjacent surviving words get joined back into a name in
+// their original reading order (top-to-bottom, then left-to-right).
+function flattenWords(blocks) {
+  const words = []
   for (const block of blocks || []) {
     for (const paragraph of block.paragraphs || []) {
       for (const line of paragraph.lines || []) {
-        lines.push(line)
+        for (const word of line.words || []) {
+          words.push(word)
+        }
       }
     }
   }
-  return lines
+  return words
 }
 
 // Exported for its own direct test coverage (see cardOcr.test.js) —
 // pure data-in, name-out. cardHeight is the OCR crop's pixel height (same
-// coordinate space as each line's bbox); passing 0/undefined disables the
+// coordinate space as each word's bbox); passing 0/undefined disables the
 // position filter (used defensively, not expected in real use).
 export function pickCardName(blocks, cardHeight) {
-  const candidates = flattenLines(blocks).filter((line) => {
-    const text = (line.text || '').trim()
-    if (!/[A-Za-z]{2,}/.test(text)) return false
-    if ((line.confidence ?? 0) < MIN_NAME_CONFIDENCE) return false
+  const candidates = flattenWords(blocks).filter((word) => {
+    const text = (word.text || '').trim()
+    if (!/[A-Za-z]/.test(text)) return false
+    if ((word.confidence ?? 0) < MIN_NAME_CONFIDENCE) return false
     if (NAME_BAND_DENYLIST.has(text.toLowerCase())) return false
-    if (cardHeight && line.bbox) return line.bbox.y0 < cardHeight * NAME_BAND_FRACTION
+    if (cardHeight && word.bbox) return word.bbox.y0 < cardHeight * NAME_BAND_FRACTION
     return true
   })
   if (candidates.length === 0) return null
-  candidates.sort((a, b) => b.confidence - a.confidence)
-  return candidates[0].text.trim()
+  candidates.sort((a, b) => (a.bbox?.y0 ?? 0) - (b.bbox?.y0 ?? 0) || (a.bbox?.x0 ?? 0) - (b.bbox?.x0 ?? 0))
+  return candidates.map((word) => word.text.trim()).join(' ')
 }
 
 // Mutable, not React state — mirrors cardDetection.js's detectionStatus.
@@ -154,7 +166,8 @@ export const lastOcrRawText = { value: '' }
 // rounded confidence, y-position) so that distinction is visible without
 // server logs — it directly decides whether NAME_BAND_FRACTION/
 // MIN_NAME_CONFIDENCE need retuning or the problem is upstream of them.
-export const lastOcrLines = { value: [] }
+// Word-level, matching what pickCardName itself now operates on.
+export const lastOcrWords = { value: [] }
 
 export async function recognizeCardText(cardCanvas) {
   const worker = await ensureWorker()
@@ -164,10 +177,10 @@ export async function recognizeCardText(cardCanvas) {
   const { data } = await worker.recognize(cardCanvas, {}, { text: true, blocks: true })
   const rawText = data?.text || ''
   lastOcrRawText.value = rawText
-  lastOcrLines.value = flattenLines(data?.blocks).map((l) => ({
-    text: (l.text || '').trim(),
-    confidence: Math.round(l.confidence ?? 0),
-    y0: l.bbox?.y0 ?? null,
+  lastOcrWords.value = flattenWords(data?.blocks).map((w) => ({
+    text: (w.text || '').trim(),
+    confidence: Math.round(w.confidence ?? 0),
+    y0: w.bbox?.y0 ?? null,
   }))
   return {
     ...parseCardOcrText(rawText),
