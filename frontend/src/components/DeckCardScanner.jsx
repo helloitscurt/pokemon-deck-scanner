@@ -1,121 +1,406 @@
-import { useRef, useState } from 'react'
-import { Camera, Check, Loader2 } from 'lucide-react'
-import Modal from './ui/Modal'
+import { useEffect, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { Camera, Check, Loader2, X } from 'lucide-react'
 import { recognizeCard } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
+import { useCameraStream } from '../hooks/useCameraStream'
+import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
+import { createStabilityTracker } from '../utils/quadStability'
+
+const DETECTION_INTERVAL_MS = 180
+const REQUIRED_STABLE_FRAMES = 5
+const CHECKMARK_DURATION_MS = 900
+const COOLDOWN_AFTER_CHECKMARK_MS = 600
+// Detection runs on a downscaled frame — full contour detection on a native
+// camera resolution every ~180ms is too slow for a phone browser. The crop
+// sent to recognizeCard is re-drawn at native resolution at capture time
+// instead (see captureAndRecognize), so downscaling here only costs
+// detection accuracy, not recognition quality.
+const DETECTION_MAX_WIDTH = 480
+// A Pokémon card is ~2.5in x 3.5in — same ratio used for the crop sent to
+// recognizeCard, independent of whatever aspect ratio the camera itself is.
+const CARD_CROP_WIDTH = 375
+const CARD_CROP_HEIGHT = 525
+
+const ERROR_BANNER_CLASS = 'card border-brand-red/30 bg-brand-red/5 text-center py-4'
+
+function scaleQuad(quad, scaleX, scaleY) {
+  const scalePoint = ({ x, y }) => ({ x: x * scaleX, y: y * scaleY })
+  return {
+    topLeftCorner: scalePoint(quad.topLeftCorner),
+    topRightCorner: scalePoint(quad.topRightCorner),
+    bottomLeftCorner: scalePoint(quad.bottomLeftCorner),
+    bottomRightCorner: scalePoint(quad.bottomRightCorner),
+  }
+}
+
+// Clears the overlay and, when a quad was found, strokes its outline.
+// Color signals progress toward a capture: dim while a card is only just
+// detected, brand-red while it's being held steady and the stability
+// streak is building toward the capture threshold.
+function drawOverlay(canvas, quad, stableFraction) {
+  const ctx = canvas.getContext('2d')
+  ctx.clearRect(0, 0, canvas.width, canvas.height)
+  if (!quad) return
+
+  const { topLeftCorner, topRightCorner, bottomRightCorner, bottomLeftCorner } = quad
+  ctx.strokeStyle = stableFraction > 0.2 ? '#e3000b' : 'rgba(255,255,255,0.6)'
+  ctx.lineWidth = Math.max(2, canvas.width * 0.006)
+  ctx.beginPath()
+  ctx.moveTo(topLeftCorner.x, topLeftCorner.y)
+  ctx.lineTo(topRightCorner.x, topRightCorner.y)
+  ctx.lineTo(bottomRightCorner.x, bottomRightCorner.y)
+  ctx.lineTo(bottomLeftCorner.x, bottomLeftCorner.y)
+  ctx.closePath()
+  ctx.stroke()
+}
 
 /**
- * DeckCardScanner — single-photo point-and-capture scan, for deck-completion
- * mode specifically. Deliberately not a reuse of UnifiedCardScanner: that
- * component is built around staging a multi-photo batch, enqueueing an async
- * job, and reviewing results later on a separate page (ScanQueue/ScanReview) —
- * a good fit for "scan a pile of cards and sort them out afterward", but not
- * for "scan this one card, get immediate feedback, scan the next" against a
- * specific deck's checklist. This uses the synchronous single-image
- * /api/cards/recognize endpoint directly instead.
+ * DeckCardScanner — live continuous-stream scanner for deck-tracking mode.
+ * Detects a card in the camera feed client-side (jscanify/OpenCV.js, see
+ * utils/cardDetection.js), and once it's been held steady for
+ * REQUIRED_STABLE_FRAMES ticks, captures it and sends exactly one image to
+ * the existing /api/cards/recognize endpoint — no polling, no repeated
+ * calls per card. A confident match auto-saves through the same
+ * confirmCard() path a manual tap already used before this feature existed
+ * (not a new/parallel save path); an ambiguous one falls back to the
+ * existing tap-to-confirm candidate list unchanged. If the camera can't be
+ * used at all (denied, unavailable, non-secure context), falls back to the
+ * original file-input "Take Photo" flow, also unchanged.
  *
- * Props: isOpen, onClose, onConfirm(candidateCard) — the caller decides what
- * "confirm" means (here: addToCollection with deck_instance_id set).
+ * Props: isOpen, onClose, onConfirm(candidateCard) — same external contract
+ * as before; DeckDetail.jsx needs no changes. Renders as its own
+ * full-viewport portal (matching CardScanner.jsx), not the Modal/Sheet
+ * wrapper this component used before — a live camera feed doesn't fit a
+ * container built for scrollable forms.
  */
 export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   const { t } = useSettings()
-  const cameraRef = useRef()
-  const [scanning, setScanning] = useState(false)
+
+  const manualFileRef = useRef()
+  const detectionCanvasRef = useRef(null)
+  const overlayCanvasRef = useRef(null)
+  const captureCanvasRef = useRef(null)
+  const stabilityTrackerRef = useRef(createStabilityTracker({ requiredConsecutiveFrames: REQUIRED_STABLE_FRAMES }))
+  const tickInFlightRef = useRef(false)
+  const cameraFallbackLockedRef = useRef(false)
+  const timersRef = useRef([])
+
+  // hunting | processing | ambiguous | success | error | cameraDenied
+  const [phase, setPhase] = useState('hunting')
+  const [videoAspect, setVideoAspect] = useState(3 / 4)
+  const [showCheckmark, setShowCheckmark] = useState(false)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [confirmError, setConfirmError] = useState(null)
   const [confirmingKey, setConfirmingKey] = useState(null)
 
-  const reset = () => {
+  const cameraActive = isOpen && phase !== 'cameraDenied'
+  const { videoRef, status: cameraStatus } = useCameraStream({ active: cameraActive })
+
+  const clearTimers = () => {
+    timersRef.current.forEach(clearTimeout)
+    timersRef.current = []
+  }
+
+  // Re-attempt camera access (and drop any stale result from a previous
+  // session) every time the scanner is freshly opened — a user who denied
+  // access once, or changed their browser's permission since, gets another
+  // chance rather than being stuck on the fallback for good.
+  useEffect(() => {
+    if (!isOpen) return
+    cameraFallbackLockedRef.current = false
     setResult(null)
     setError(null)
     setConfirmError(null)
+    stabilityTrackerRef.current.reset()
+    setPhase('hunting')
+  }, [isOpen])
+
+  // Preload OpenCV.js/jscanify as soon as the scanner opens, so the first
+  // stable hold doesn't stall on a ~10MB download.
+  useEffect(() => {
+    if (isOpen) preloadCardDetection()
+  }, [isOpen])
+
+  useEffect(() => {
+    if (cameraStatus === 'denied' || cameraStatus === 'unavailable') {
+      cameraFallbackLockedRef.current = true
+      setPhase('cameraDenied')
+    }
+  }, [cameraStatus])
+
+  useEffect(() => clearTimers, [])
+
+  const enterSuccessCooldown = () => {
+    setResult(null)
+    setError(null)
+    setPhase('success')
+    setShowCheckmark(true)
+    timersRef.current.push(setTimeout(() => setShowCheckmark(false), CHECKMARK_DURATION_MS))
+    timersRef.current.push(setTimeout(() => {
+      stabilityTrackerRef.current.reset()
+      setPhase('hunting')
+    }, CHECKMARK_DURATION_MS + COOLDOWN_AFTER_CHECKMARK_MS))
   }
 
-  const handleFile = async (file) => {
-    if (!file) return
-    reset()
-    setScanning(true)
-    try {
-      const data = await recognizeCard(file)
-      setResult(data)
-    } catch (err) {
-      setError(err?.response?.data?.detail || t('decks.scan.failed'))
-    } finally {
-      setScanning(false)
-    }
+  const resetForNextCard = () => {
+    clearTimers()
+    setResult(null)
+    setError(null)
+    setConfirmError(null)
+    setConfirmingKey(null)
+    stabilityTrackerRef.current.reset()
+    setPhase(cameraFallbackLockedRef.current ? 'cameraDenied' : 'hunting')
   }
 
   const handleClose = () => {
-    reset()
+    clearTimers()
     onClose?.()
   }
 
-  // Await the caller's confirm action (adding the card to the deck) before
-  // moving on. A failure here must stay visible on screen — resetting
-  // unconditionally would leave the scanner looking ready for the next card
-  // while the previous one silently never got counted, with only an
-  // easy-to-miss toast as the only signal.
+  // Shared by every confirm path — auto-save on a confident live detection,
+  // a manual tap in the ambiguous candidate list, and a tap from the
+  // camera-denied fallback's own candidate list. Awaits the caller's
+  // confirm action (adding the card to the deck) before moving on; a
+  // failure stays visible via confirmError rather than silently resetting.
+  // Returns whether the save succeeded, so callers with no picker of their
+  // own (the auto-save path) know whether to fall back to showing one.
   const confirmCard = async (candidate, key) => {
     setConfirmingKey(key)
     setConfirmError(null)
     try {
       await onConfirm(candidate)
-      reset()
+      if (cameraFallbackLockedRef.current) {
+        setResult(null)
+        setError(null)
+        setPhase('cameraDenied')
+      } else {
+        enterSuccessCooldown()
+      }
+      return true
     } catch {
       setConfirmError(t('decks.scan.confirmFailed'))
+      return false
     } finally {
       setConfirmingKey(null)
     }
   }
 
+  const captureAndRecognize = async (nativeFrameSource, quad) => {
+    setPhase('processing')
+    try {
+      const cropCanvas = await extractCard(nativeFrameSource, CARD_CROP_WIDTH, CARD_CROP_HEIGHT, quad)
+      if (!cropCanvas) throw new Error('extract-failed')
+      const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
+      if (!blob) throw new Error('capture-failed')
+
+      const data = await recognizeCard(blob)
+      const topCandidate = data?.matches?.[0]
+
+      if (data?._identity_confident && topCandidate) {
+        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto')
+        if (!saved) {
+          setResult(data)
+          setPhase('ambiguous')
+        }
+      } else {
+        setResult(data)
+        setPhase('ambiguous')
+      }
+    } catch {
+      setError(t('decks.scan.failed'))
+      setPhase('error')
+    }
+  }
+
+  // ---- live detection loop: only runs while actively hunting ----
+  useEffect(() => {
+    if (phase !== 'hunting' || cameraStatus !== 'streaming') return undefined
+
+    const intervalId = setInterval(async () => {
+      if (tickInFlightRef.current) return
+      const video = videoRef.current
+      const detectionCanvas = detectionCanvasRef.current
+      const overlayCanvas = overlayCanvasRef.current
+      if (!video || !detectionCanvas || !overlayCanvas || video.readyState < 2 || !video.videoWidth) return
+
+      tickInFlightRef.current = true
+      try {
+        const scale = Math.min(1, DETECTION_MAX_WIDTH / video.videoWidth)
+        const detectionWidth = Math.round(video.videoWidth * scale)
+        const detectionHeight = Math.round(video.videoHeight * scale)
+        if (detectionCanvas.width !== detectionWidth || detectionCanvas.height !== detectionHeight) {
+          detectionCanvas.width = detectionWidth
+          detectionCanvas.height = detectionHeight
+        }
+        if (overlayCanvas.width !== video.videoWidth || overlayCanvas.height !== video.videoHeight) {
+          overlayCanvas.width = video.videoWidth
+          overlayCanvas.height = video.videoHeight
+          setVideoAspect(video.videoWidth / video.videoHeight || 3 / 4)
+        }
+
+        detectionCanvas.getContext('2d').drawImage(video, 0, 0, detectionWidth, detectionHeight)
+
+        const quad = await detectCardQuad(detectionCanvas)
+        const { consecutiveStableFrames, readyToCapture } = stabilityTrackerRef.current.observe(
+          quad, detectionWidth, detectionHeight,
+        )
+
+        const overlayScaleX = overlayCanvas.width / detectionWidth
+        const overlayScaleY = overlayCanvas.height / detectionHeight
+        drawOverlay(
+          overlayCanvas,
+          quad && scaleQuad(quad, overlayScaleX, overlayScaleY),
+          consecutiveStableFrames / REQUIRED_STABLE_FRAMES,
+        )
+
+        if (readyToCapture && quad) {
+          const captureCanvas = captureCanvasRef.current
+          captureCanvas.width = video.videoWidth
+          captureCanvas.height = video.videoHeight
+          captureCanvas.getContext('2d').drawImage(video, 0, 0)
+          const nativeQuad = scaleQuad(quad, video.videoWidth / detectionWidth, video.videoHeight / detectionHeight)
+          await captureAndRecognize(captureCanvas, nativeQuad)
+        }
+      } finally {
+        tickInFlightRef.current = false
+      }
+    }, DETECTION_INTERVAL_MS)
+
+    return () => clearInterval(intervalId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, cameraStatus])
+
+  // Freeze the visible frame instead of letting it keep playing behind the
+  // spinner/candidate list/checkmark — matches the plan's "freeze + crop"
+  // flow rather than a live feed still moving under a result the user is
+  // looking at.
+  useEffect(() => {
+    const video = videoRef.current
+    if (!video) return
+    if (phase === 'hunting') {
+      video.play().catch(() => {})
+    } else {
+      video.pause()
+    }
+  }, [phase, videoRef])
+
+  const handleManualFile = async (file) => {
+    if (!file) return
+    setResult(null)
+    setError(null)
+    setConfirmError(null)
+    setPhase('processing')
+    try {
+      const data = await recognizeCard(file)
+      setResult(data)
+      setPhase('ambiguous')
+    } catch (err) {
+      setError(err?.response?.data?.detail || t('decks.scan.failed'))
+      setPhase('cameraDenied')
+    }
+  }
+
+  if (!isOpen) return null
+
   const matches = (result?.matches || []).slice(0, 6)
 
-  return (
-    <Modal isOpen={isOpen} onClose={handleClose} title={t('decks.scan.title')} size="lg">
-      <div className="space-y-4 p-4 sm:p-5">
-        <input
-          ref={cameraRef}
-          type="file"
-          accept={SCANNER_IMAGE_ACCEPT}
-          capture="environment"
-          className="hidden"
-          onChange={(event) => {
-            handleFile(event.target.files?.[0])
-            event.target.value = ''
-          }}
-        />
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[200] flex flex-col"
+      style={{ background: 'rgba(0,0,0,0.95)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)' }}
+    >
+      <div className="flex items-center justify-between px-4 pt-6 pb-4 flex-shrink-0">
+        <div>
+          <p className="text-[10px] text-text-muted uppercase tracking-[0.2em]">{t('decks.scan.title')}</p>
+          <h2 className="text-lg font-black text-white">{t('decks.scan.subtitle')}</h2>
+        </div>
+        <button
+          onClick={handleClose}
+          aria-label={t('common.close')}
+          className="w-9 h-9 rounded-full flex items-center justify-center"
+          style={{ background: 'rgba(255,255,255,0.08)' }}
+        >
+          <X size={18} className="text-text-muted" />
+        </button>
+      </div>
 
-        {!result && !scanning && !error && (
-          <>
-            <p className="text-sm text-text-secondary text-center">{t('decks.scan.subtitle')}</p>
+      <div className="flex-1 overflow-y-auto px-4 pb-8">
+        {phase === 'cameraDenied' && (
+          <div className="flex flex-col items-center gap-5 pt-4">
+            <p className="text-sm text-text-secondary text-center">{t('decks.scan.cameraUnavailable')}</p>
+            <input
+              ref={manualFileRef}
+              type="file"
+              accept={SCANNER_IMAGE_ACCEPT}
+              capture="environment"
+              className="hidden"
+              onChange={(event) => {
+                handleManualFile(event.target.files?.[0])
+                event.target.value = ''
+              }}
+            />
             <button
               type="button"
-              onClick={() => cameraRef.current?.click()}
-              className="btn-primary w-full flex items-center justify-center gap-2 py-4"
+              onClick={() => manualFileRef.current?.click()}
+              className="btn-primary w-full max-w-xs flex items-center justify-center gap-2 py-4"
             >
               <Camera size={18} /> {t('decks.scan.takePhoto')}
             </button>
-          </>
-        )}
-
-        {scanning && (
-          <div className="flex flex-col items-center justify-center gap-3 py-10">
-            <Loader2 size={28} className="animate-spin text-brand-red" />
-            <p className="text-sm text-text-secondary">{t('decks.scan.identifying')}</p>
+            {error && (
+              <div className={`${ERROR_BANNER_CLASS} w-full max-w-xs`}>
+                <p className="text-sm text-brand-red">{error}</p>
+              </div>
+            )}
           </div>
         )}
 
-        {error && !scanning && (
-          <div className="card border-brand-red/30 bg-brand-red/5 text-center py-4">
-            <p className="text-sm text-brand-red">{error}</p>
-            <button onClick={reset} className="btn-ghost mt-3 mx-auto text-sm">{t('decks.scan.tryAgain')}</button>
+        {(phase === 'hunting' || phase === 'processing' || phase === 'success' || phase === 'error') && (
+          <div className="flex flex-col items-center gap-4 pt-2">
+            <div className="relative w-full max-w-sm overflow-hidden rounded-2xl bg-black" style={{ aspectRatio: videoAspect }}>
+              <video ref={videoRef} autoPlay playsInline muted className="absolute inset-0 h-full w-full object-contain" />
+              <canvas ref={overlayCanvasRef} className="absolute inset-0 h-full w-full pointer-events-none" />
+              <canvas ref={detectionCanvasRef} className="hidden" aria-hidden="true" />
+              <canvas ref={captureCanvasRef} className="hidden" aria-hidden="true" />
+
+              {phase === 'processing' && (
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/60">
+                  <Loader2 size={28} className="animate-spin text-brand-red" />
+                  <p className="text-sm text-white">{t('decks.scan.identifying')}</p>
+                </div>
+              )}
+
+              {phase === 'success' && showCheckmark && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                  <span
+                    className="inline-flex items-center justify-center rounded-full border border-green/40 bg-green/90 p-4 text-white shadow-lg"
+                    aria-label={t('decks.scan.captured')}
+                  >
+                    <Check size={32} strokeWidth={3} aria-hidden />
+                  </span>
+                </div>
+              )}
+            </div>
+
+            {phase === 'hunting' && (
+              <p className="text-xs text-text-muted text-center max-w-xs">{t('decks.scan.liveHint')}</p>
+            )}
+
+            {phase === 'error' && (
+              <div className={`${ERROR_BANNER_CLASS} w-full max-w-sm`}>
+                <p className="text-sm text-brand-red">{error}</p>
+                <button onClick={resetForNextCard} className="btn-ghost mt-3 mx-auto text-sm">
+                  {t('decks.scan.tryAgain')}
+                </button>
+              </div>
+            )}
           </div>
         )}
 
-        {result && !scanning && (
+        {phase === 'ambiguous' && result && (
           <div className="space-y-3">
             {confirmError && (
               <div className="rounded-lg border border-brand-red/30 bg-brand-red/5 px-3 py-2 text-center">
@@ -125,7 +410,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
             {matches.length === 0 && (
               <div className="text-center py-6 space-y-3">
                 <p className="text-sm text-text-secondary">{t('decks.scan.noMatch')}</p>
-                <button onClick={reset} className="btn-ghost mx-auto text-sm">{t('decks.scan.tryAgain')}</button>
+                <button onClick={resetForNextCard} className="btn-ghost mx-auto text-sm">{t('decks.scan.tryAgain')}</button>
               </div>
             )}
             {matches.map((candidate, i) => {
@@ -161,13 +446,14 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
               )
             })}
             {matches.length > 0 && (
-              <button onClick={reset} disabled={confirmingKey != null} className="btn-ghost w-full text-sm disabled:opacity-50">
+              <button onClick={resetForNextCard} disabled={confirmingKey != null} className="btn-ghost w-full text-sm disabled:opacity-50">
                 {t('decks.scan.scanAnother')}
               </button>
             )}
           </div>
         )}
       </div>
-    </Modal>
+    </div>,
+    document.body,
   )
 }

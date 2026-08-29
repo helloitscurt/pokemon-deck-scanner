@@ -463,6 +463,9 @@ const en = {
       scanned: 'Scanned',
       addFailed: 'Failed to add this card.',
       confirmFailed: 'Couldn’t save this card — check your connection and try again.',
+      liveHint: 'Hold one card steady on a plain, contrasting surface.',
+      cameraUnavailable: 'Camera unavailable — take a photo instead.',
+      captured: 'Captured',
     },
   },
 
