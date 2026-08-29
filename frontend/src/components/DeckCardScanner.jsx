@@ -1,12 +1,13 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { Camera, Check, Loader2, X } from 'lucide-react'
-import { recognizeCard } from '../api/client'
+import { matchCardText, recognizeCard } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
 import { useCameraStream } from '../hooks/useCameraStream'
-import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
+import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } from '../utils/cardDetection'
+import { preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
 import { createStabilityTracker } from '../utils/quadStability'
 
 const DETECTION_INTERVAL_MS = 180
@@ -105,6 +106,19 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   const [error, setError] = useState(null)
   const [confirmError, setConfirmError] = useState(null)
   const [confirmingKey, setConfirmingKey] = useState(null)
+  // Visible diagnostic readout, not devtools-only — this app has no console
+  // access on a phone. Mirrors detectionStatus (opencv.js/jscanify load
+  // state) plus the last error from the detection loop itself, which
+  // previously ran unhandled: a rejected detectCardQuad() call (e.g. a CSP
+  // block on WASM compilation) just silently retried forever with the
+  // camera visibly live and nothing else ever happening.
+  const [debugInfo, setDebugInfo] = useState({ tickCount: 0, tickError: null })
+  // Recognition (Gemini identify + visual-match, see recognize.py) can take
+  // well over a minute under real API load with the backend's own retries —
+  // measured 89s in practice. A static "Identifying card..." spinner is
+  // indistinguishable from hung at that duration; a running clock isn't.
+  const [processingSeconds, setProcessingSeconds] = useState(0)
+  const processingTimerRef = useRef(null)
 
   const cameraActive = isOpen && phase !== 'cameraDenied'
   const { videoRef, status: cameraStatus } = useCameraStream({ active: cameraActive })
@@ -141,7 +155,10 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
     }
   }, [cameraStatus])
 
-  useEffect(() => clearTimers, [])
+  useEffect(() => () => {
+    clearTimers()
+    clearInterval(processingTimerRef.current)
+  }, [])
 
   const enterSuccessCooldown = () => {
     setResult(null)
@@ -205,15 +222,44 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
     }
   }
 
+  // Phase 2 (docs/plans/live-card-scanner.md): the free OCR+metadata path,
+  // tried before the paid recognizeCard() call below. Never throws — any
+  // failure here (OCR itself, or the match-text call) just means "fall back
+  // to the paid path for this one card," not a hard error for the capture.
+  // A not-confident OCR result is deliberately discarded in favor of a
+  // fresh paid-call attempt rather than shown as-is (see the plan's Phase 2
+  // "Net effect": the paid call is the fallback for cards OCR can't
+  // confidently resolve, not a second-tier candidate list of its own).
+  const tryOcrMatch = async (cropCanvas, blob) => {
+    try {
+      const ocrFields = await recognizeCardText(cropCanvas)
+      if (!ocrFields.name) return null
+      return await matchCardText(ocrFields, blob, 'live_auto_scan')
+    } catch {
+      return null
+    }
+  }
+
   const captureAndRecognize = async (nativeFrameSource, quad) => {
     setPhase('processing')
+    setProcessingSeconds(0)
+    processingTimerRef.current = setInterval(() => setProcessingSeconds((s) => s + 1), 1000)
+    // Deliberately not preloaded upfront alongside OpenCV.js (see
+    // cardOcr.js / frontend/public/tesseract/VENDORED.md) — only starts
+    // downloading once a card is actually being captured, so it doesn't
+    // double the initial scanner-open payload for a feature that only
+    // pays off after detection already succeeded.
+    preloadCardOcr()
     try {
       const cropCanvas = await extractCard(nativeFrameSource, CARD_CROP_WIDTH, CARD_CROP_HEIGHT, quad)
       if (!cropCanvas) throw new Error('extract-failed')
       const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
       if (!blob) throw new Error('capture-failed')
 
-      const data = await recognizeCard(blob, 'live_auto_scan')
+      let data = await tryOcrMatch(cropCanvas, blob)
+      if (!data?._identity_confident) {
+        data = await recognizeCard(blob, 'live_auto_scan')
+      }
       const topCandidate = data?.matches?.[0]
 
       if (data?._identity_confident && topCandidate) {
@@ -226,9 +272,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
         setResult(data)
         setPhase('ambiguous')
       }
-    } catch {
+    } catch (err) {
       setError(t('decks.scan.failed'))
+      setDebugInfo((d) => ({ ...d, tickError: `capture: ${err?.message || err}` }))
       setPhase('error')
+    } finally {
+      clearInterval(processingTimerRef.current)
     }
   }
 
@@ -245,6 +294,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
 
       tickInFlightRef.current = true
       try {
+        setDebugInfo((d) => ({
+          tickCount: d.tickCount + 1,
+          tickError: null,
+          libState: detectionStatus.state,
+          libError: detectionStatus.error,
+        }))
         const scale = Math.min(1, DETECTION_MAX_WIDTH / video.videoWidth)
         const detectionWidth = Math.round(video.videoWidth * scale)
         const detectionHeight = Math.round(video.videoHeight * scale)
@@ -281,6 +336,8 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
           const nativeQuad = scaleQuad(quad, video.videoWidth / detectionWidth, video.videoHeight / detectionHeight)
           await captureAndRecognize(captureCanvas, nativeQuad)
         }
+      } catch (err) {
+        setDebugInfo((d) => ({ ...d, tickError: err?.message || String(err), libState: detectionStatus.state, libError: detectionStatus.error }))
       } finally {
         tickInFlightRef.current = false
       }
@@ -385,7 +442,20 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
               {phase === 'processing' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/60">
                   <Loader2 size={28} className="animate-spin text-brand-red" />
-                  <p className="text-sm text-white">{t('decks.scan.identifying')}</p>
+                  <p className="text-sm text-white">
+                    {t('decks.scan.identifying')}
+                    {processingSeconds > 0 && ` (${processingSeconds}s)`}
+                  </p>
+                  {/* Card recognition retries through transient upstream
+                      failures (see recognizeCard's timeout comment in
+                      api/client.js) — past ~15s this is very likely still
+                      working, not stuck, so say so rather than leaving a
+                      bare spinner that looks identical to hung. */}
+                  {processingSeconds >= 15 && (
+                    <p className="text-xs text-text-muted max-w-[220px] text-center">
+                      Still working — the recognition service may be slow right now.
+                    </p>
+                  )}
                 </div>
               )}
 
@@ -404,6 +474,15 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
             {phase === 'hunting' && (
               <p className="text-xs text-text-muted text-center max-w-xs">{t('decks.scan.liveHint')}</p>
             )}
+
+            {/* Temporary on-device diagnostic readout — no devtools access on
+                a phone, and the detection loop previously failed completely
+                silently (see cardDetection.js's detectionStatus comment). */}
+            <div className="text-[10px] font-mono text-text-muted/60 text-center max-w-xs leading-relaxed break-words">
+              cam:{cameraStatus} lib:{debugInfo.libState || 'idle'} ticks:{debugInfo.tickCount}
+              {debugInfo.libError && <><br />lib error: {debugInfo.libError}</>}
+              {debugInfo.tickError && <><br />tick error: {debugInfo.tickError}</>}
+            </div>
 
             {phase === 'error' && (
               <div className={`${ERROR_BANNER_CLASS} w-full max-w-sm`}>

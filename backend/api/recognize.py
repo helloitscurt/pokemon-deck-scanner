@@ -1203,6 +1203,83 @@ async def recognize_card(
         trace.save()
 
 
+@router.post("/match-text")
+async def match_card_text(
+    # Structured fields parsed client-side from OCR (see
+    # frontend/src/utils/cardOcr.js) — see docs/plans/live-card-scanner.md's
+    # Phase 2. name is the only one match_card_info requires (it raises 422
+    # without one); everything else narrows candidates but is optional,
+    # matching what OCR can and can't reliably read off a card.
+    name: str = Form(...),
+    name_en: str | None = Form(default=None),
+    number_local: str | None = Form(default=None),
+    number_total: str | None = Form(default=None),
+    set_code: str | None = Form(default=None),
+    regulation_mark: str | None = Form(default=None),
+    card_type: str | None = Form(default=None),
+    hp: str | None = Form(default=None),
+    language: str | None = Form(default=None),
+    artist: str | None = Form(default=None),
+    # The same cropped-card image OCR ran against — not sent to any vision
+    # API here (allow_visual_verification=False below), only used for pHash
+    # so this path can still resolve an OCR-ambiguous card for free. See
+    # "Free disambiguation already exists: pHash" in the plan.
+    file: UploadFile = File(...),
+    source: str | None = Form(default=None),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        raw_image = await read_limited_upload(file, remaining_job_bytes=MAX_FILE_BYTES)
+        sanitized = sanitize_image_bytes(raw_image)
+    except ScanUploadError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    card_info = {
+        "name": name,
+        "name_en": name_en,
+        "number_local": number_local,
+        "number_total": number_total,
+        "set_code": set_code,
+        "regulation_mark": regulation_mark,
+        "card_type": card_type,
+        "hp": hp,
+        "language": language,
+        "artist": artist,
+    }
+
+    # provider="ocr" (not a real ScanProvider — this path never calls one)
+    # distinguishes these traces from vision-API scans in diagnostics, which
+    # is the only way to later measure the plan's open question: how often
+    # OCR alone resolves confidently vs. falls back to the paid call.
+    trace = create_scan_trace(
+        db,
+        current_user.id,
+        mode="single",
+        filename="ocr-match.jpg",
+        provider="ocr",
+        source=source,
+    )
+    trace.set_image(sanitized.data)
+    trace.record_extraction(parsed=card_info)
+    try:
+        result = await match_card_info(
+            db,
+            card_info,
+            allow_visual_verification=False,
+            photo_bytes=sanitized.data,
+            trace=trace,
+        )
+        if trace.enabled:
+            result["trace_id"] = trace.trace_id
+        return result
+    except HTTPException as exc:
+        trace.record_error(str(exc.detail))
+        raise
+    finally:
+        trace.save()
+
+
 COMPOSITE_PROMPT = """This image contains {count} separate Pokemon Trading Card Game cards.
 They are arranged left-to-right, then top-to-bottom, and each card has a white index number
 on a black square directly above it. Identify every card. Read that index label instead of

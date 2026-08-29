@@ -3,3 +3,6 @@
 # normalization, no text diffing.
 frontend/public/opencv/opencv.js binary
 frontend/public/opencv/jscanify.js binary
+frontend/public/tesseract/worker.min.js binary
+frontend/public/tesseract/tesseract-core-simd-lstm.wasm.js binary
+frontend/public/tesseract/eng.traineddata binary

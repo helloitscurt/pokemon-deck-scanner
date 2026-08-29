@@ -807,3 +807,43 @@ Two open questions from the review, both resolved with you:
    share one URL-hash-keyed cache (`services/image_cache.py`) instead of
    independently re-downloading the same TCGdex images. Full design under
    "Free disambiguation already exists: pHash" above.
+
+## Phase 2: implemented (build steps 9-10), step 11 pending real-device measurement
+
+Build steps 9 and 10 are done: `POST /cards/match-text`
+(`backend/api/recognize.py`), `frontend/src/utils/cardOcr.js` (Tesseract.js),
+wired into `DeckCardScanner.jsx`'s capture flow ahead of the existing
+`recognizeCard()` call, which now only fires when OCR found no usable name
+or `match-text` wasn't confident — matching the "Net effect" framing above,
+not the flow diagram's looser "OR straight to the manual picker" phrasing.
+
+**Language scope, resolved with you**: English only for now (not the
+broader multi-language set this app otherwise syncs from TCGdex) — each
+additional language needs its own several-MB `tessdata_fast` trained-data
+file, vendored the same way as `eng.traineddata`
+(`frontend/public/tesseract/VENDORED.md`). A non-English card's OCR
+`name` still gets attempted (Tesseract will produce *some* text off a
+non-English card using the English model), but accuracy is unvalidated for
+that case and expected to be poor — it just falls through to the paid
+`recognizeCard()` fallback like any other unresolved OCR attempt, so this
+is a soft, non-blocking scope limit, not a hard gate. Extending to more
+languages later is additive: vendor the file, no architecture change.
+
+**Real backend seam confirmed empirically, not just by reading code**: the
+new `backend/tests/test_match_text.py` proves `/cards/match-text` resolves
+confidently through the existing deterministic matcher end-to-end (not
+mocked at `match_card_info`'s own level) with OCR-shaped input, and proves
+the route can never itself trigger a paid vision call regardless of
+confidence. It also documents a real, verified gap the plan flagged as
+unknown: `normalize_recognized_card_info()` does **not** tolerate
+letter-O/digit-zero OCR confusion (a genuine "052" misread as "O52" does
+not match) — fixed at the OCR-specific source instead
+(`cardOcr.js`'s `cleanNumberToken`), not in the shared backend matcher the
+trusted Gemini-vision path also relies on.
+
+**Step 11 (measure against real cards) still needs a real device** — same
+as Phase 1's own step 8, this can't be verified any other way. Next
+real-device test should watch for: (a) whether `name` OCR is usable often
+enough for `match-text` to ever get attempted, (b) how often it resolves
+confidently vs. falls back, (c) combined Tesseract.js + OpenCV.js payload
+size/reliability over whatever HTTPS path is in use at the time.

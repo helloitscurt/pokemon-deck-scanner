@@ -10,17 +10,25 @@
 import { act, cleanup, fireEvent, render, screen } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DeckCardScanner from './DeckCardScanner'
-import { recognizeCard } from '../api/client'
+import { matchCardText, recognizeCard } from '../api/client'
 import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
+import { recognizeCardText } from '../utils/cardOcr'
 
 vi.mock('../api/client', () => ({
   recognizeCard: vi.fn(),
+  matchCardText: vi.fn(),
 }))
 
 vi.mock('../utils/cardDetection', () => ({
   detectCardQuad: vi.fn(),
   extractCard: vi.fn(),
   preloadCardDetection: vi.fn(),
+  detectionStatus: { state: 'ready', error: null },
+}))
+
+vi.mock('../utils/cardOcr', () => ({
+  recognizeCardText: vi.fn(),
+  preloadCardOcr: vi.fn(),
 }))
 
 let mockCameraStatus = 'streaming'
@@ -92,12 +100,23 @@ describe('DeckCardScanner', () => {
     stubMediaAndCanvas()
     detectCardQuad.mockResolvedValue(STABLE_QUAD)
     extractCard.mockResolvedValue(fakeCropCanvas())
+    // Default: OCR finds nothing usable, so tryOcrMatch short-circuits and
+    // every existing test below exercises the paid recognizeCard() path
+    // unchanged. Tests that specifically cover the Phase 2 OCR path
+    // override this themselves.
+    recognizeCardText.mockResolvedValue({ name: null })
     onConfirm = vi.fn().mockResolvedValue(undefined)
   })
 
   afterEach(() => {
     cleanup()
     vi.useRealTimers()
+    // restoreAllMocks only reverts vi.spyOn spies to their original
+    // implementation — it does not clear vi.fn()/vi.mock() call history,
+    // which was silently leaking between tests (a "not called at all"
+    // assertion in a later test could see an earlier test's calls).
+    // clearAllMocks resets that history too.
+    vi.clearAllMocks()
     vi.restoreAllMocks()
   })
 
@@ -245,5 +264,68 @@ describe('DeckCardScanner', () => {
 
     fireEvent.click(screen.getByText('decks.scan.tryAgain'))
     expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
+  })
+
+  it('auto-saves via the free OCR match-text path without ever calling the paid recognizeCard', async () => {
+    recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
+    matchCardText.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-ocr1',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(matchCardText).toHaveBeenCalledWith(
+      { name: 'Pikachu', number_local: '25' },
+      expect.anything(),
+      'live_auto_scan',
+    )
+    expect(recognizeCard).not.toHaveBeenCalled()
+    expect(onConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'p1' }),
+      { isAutoSave: true, traceId: 'trace-ocr1' },
+    )
+  })
+
+  it('falls back to the paid recognizeCard when OCR found a name but match-text was not confident', async () => {
+    recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
+    matchCardText.mockResolvedValue({
+      _identity_confident: false,
+      matches: [{ id: 'guess', name: 'Pikachu' }],
+    })
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-paid1',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(matchCardText).toHaveBeenCalled()
+    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
+    // The not-confident OCR guess is discarded, not shown — the paid
+    // call's own result is what gets auto-saved.
+    expect(onConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'p1' }),
+      { isAutoSave: true, traceId: 'trace-paid1' },
+    )
+  })
+
+  it('skips match-text entirely when OCR found no usable name, going straight to the paid call', async () => {
+    recognizeCardText.mockResolvedValue({ name: null })
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-paid2',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(matchCardText).not.toHaveBeenCalled()
+    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
   })
 })

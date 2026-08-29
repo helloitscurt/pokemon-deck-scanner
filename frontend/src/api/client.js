@@ -112,11 +112,37 @@ export const cloneCustomCard = (cardId) => api.post(`/cards/custom/${cardId}/clo
 // Card recognition via Gemini Vision. source is an optional diagnostics
 // label (e.g. "live_auto_scan" vs "manual" from the deck-tracking scanner)
 // — never affects matching, only which UI flow a saved trace records.
+// Overrides the shared 30s default: backend/api/recognize.py retries each
+// Gemini call up to 3x with exponential backoff on a transient failure
+// (408/425/500/502/503/504), and there are two such calls per recognition
+// (identify + visual-match verification) — under real Gemini overload a
+// single recognize measured 89s end to end. 180s leaves real margin above
+// that observed worst case rather than guessing.
 export const recognizeCard = (imageFile, source) => {
   const formData = new FormData()
   formData.append('file', imageFile)
   if (source) formData.append('source', source)
   return api.post('/cards/recognize', formData, {
+    headers: { 'Content-Type': 'multipart/form-data' },
+    timeout: 180000,
+  }).then(r => r.data)
+}
+
+// Phase 2 (docs/plans/live-card-scanner.md): the free, client-OCR-fed match
+// path — same upload shape as recognizeCard() but sends structured text
+// fields (from cardOcr.js) instead of letting a paid vision model read them
+// off the image. fields.name is required by the backend route; the caller
+// is expected to only call this once OCR found one (see DeckCardScanner.jsx).
+export const matchCardText = (fields, imageBlob, source) => {
+  const formData = new FormData()
+  Object.entries(fields).forEach(([key, value]) => {
+    if (value !== null && value !== undefined && value !== '') {
+      formData.append(key, value)
+    }
+  })
+  formData.append('file', imageBlob)
+  if (source) formData.append('source', source)
+  return api.post('/cards/match-text', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
   }).then(r => r.data)
 }
