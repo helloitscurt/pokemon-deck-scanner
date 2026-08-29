@@ -183,6 +183,17 @@ class OwnPhotoPriorityTests(unittest.TestCase):
     # ── binders: equivalent prints ────────────────────────────────────────
 
     def test_equivalent_prints_flags_the_owned_photographed_variant(self):
+        # Set directly for the same reason test_wishlist_scope_equivalents_
+        # are_never_flagged below does: without it, _ensure_card_gameplay_data
+        # (api/binders.py) reaches out to the real TCGdex API — this test
+        # cares about has_scan_photo/equivalent-prints logic, not about that
+        # live fetch succeeding, and a real network call here previously made
+        # this test flaky in CI (observed: passed against this project's own
+        # dev network, failed on GitHub Actions' runner with a KeyError on
+        # "scope" — the endpoint's early-return shape when the fingerprint
+        # never got populated).
+        self.photographed_card.playable_fingerprint = "jigglypuff-035"
+        self.db.commit()
         binder = Binder(name="Ivy's", user_id=self.user.id, binder_type="collection")
         self.db.add(binder)
         self.db.commit()
