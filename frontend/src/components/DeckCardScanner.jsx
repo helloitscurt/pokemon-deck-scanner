@@ -24,6 +24,12 @@ const DETECTION_MAX_WIDTH = 480
 // recognizeCard, independent of whatever aspect ratio the camera itself is.
 const CARD_CROP_WIDTH = 375
 const CARD_CROP_HEIGHT = 525
+// A separate, higher-resolution crop for OCR only (never uploaded, so its
+// size costs client CPU/time, not bandwidth) — Tesseract's accuracy on
+// small printed text benefits from more source pixels than the paid API's
+// upload needs to stay small and fast. Same 2.5:3.5 ratio, just 2x scale.
+const OCR_CROP_WIDTH = CARD_CROP_WIDTH * 2
+const OCR_CROP_HEIGHT = CARD_CROP_HEIGHT * 2
 
 const ERROR_BANNER_CLASS = 'card border-brand-red/30 bg-brand-red/5 text-center py-4'
 
@@ -119,7 +125,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   // previously ran unhandled: a rejected detectCardQuad() call (e.g. a CSP
   // block on WASM compilation) just silently retried forever with the
   // camera visibly live and nothing else ever happening.
-  const [debugInfo, setDebugInfo] = useState({ tickCount: 0, tickError: null })
+  const [debugInfo, setDebugInfo] = useState({ tickCount: 0, tickError: null, ocrName: undefined, ocrNumber: undefined })
   // Recognition (Gemini identify + visual-match, see recognize.py) can take
   // well over a minute under real API load with the backend's own retries —
   // measured 89s in practice. A static "Identifying card..." spinner is
@@ -239,12 +245,20 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   // fresh paid-call attempt rather than shown as-is (see the plan's Phase 2
   // "Net effect": the paid call is the fallback for cards OCR can't
   // confidently resolve, not a second-tier candidate list of its own).
-  const tryOcrMatch = async (cropCanvas, blob) => {
+  const tryOcrMatch = async (nativeFrameSource, quad, blob) => {
     try {
-      const ocrFields = await recognizeCardText(cropCanvas)
+      const ocrCanvas = await extractCard(nativeFrameSource, OCR_CROP_WIDTH, OCR_CROP_HEIGHT, quad)
+      if (!ocrCanvas) return null
+      const ocrFields = await recognizeCardText(ocrCanvas)
+      // Visible, not just inferred from "the paid call ran anyway" — the
+      // only way to tell "OCR found nothing" apart from "OCR found
+      // something but match-text wasn't confident" without this was
+      // reading server logs by hand (see the real-device Wattrel case).
+      setDebugInfo((d) => ({ ...d, ocrName: ocrFields.name, ocrNumber: ocrFields.number_local }))
       if (!ocrFields.name) return null
       return await matchCardText(ocrFields, blob, 'live_auto_scan')
-    } catch {
+    } catch (err) {
+      setDebugInfo((d) => ({ ...d, ocrName: null, ocrNumber: null, tickError: `ocr: ${err?.message || err}` }))
       return null
     }
   }
@@ -265,7 +279,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
       const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
       if (!blob) throw new Error('capture-failed')
 
-      let data = await tryOcrMatch(cropCanvas, blob)
+      let data = await tryOcrMatch(nativeFrameSource, quad, blob)
       if (!data?._identity_confident) {
         data = await recognizeCard(blob, 'live_auto_scan')
       }
@@ -491,6 +505,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
             <div className="text-[10px] font-mono text-text-muted/60 text-center max-w-xs leading-relaxed break-words">
               cam:{cameraStatus} lib:{debugInfo.libState || 'idle'} ticks:{debugInfo.tickCount}
               {debugInfo.libError && <><br />lib error: {debugInfo.libError}</>}
+              {debugInfo.ocrName !== undefined && (
+                <><br />ocr name:{debugInfo.ocrName ?? '(none)'} number:{debugInfo.ocrNumber ?? '(none)'}</>
+              )}
               {debugInfo.tickError && <><br />tick error: {debugInfo.tickError}</>}
             </div>
 

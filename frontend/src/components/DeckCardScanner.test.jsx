@@ -317,6 +317,38 @@ describe('DeckCardScanner', () => {
     )
   })
 
+  it('runs OCR against its own higher-resolution crop, separate from the smaller one uploaded to the paid API', async () => {
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    // Two distinct extractCard calls: one at the upload size, one larger
+    // for OCR only (never uploaded, so its cost is CPU/time, not bandwidth).
+    expect(extractCard).toHaveBeenCalledWith(
+      expect.any(HTMLCanvasElement), 375, 525, expect.anything(),
+    )
+    expect(extractCard).toHaveBeenCalledWith(
+      expect.any(HTMLCanvasElement), 750, 1050, expect.anything(),
+    )
+  })
+
+  it('surfaces what OCR actually found in the on-screen debug readout', async () => {
+    // Debug readout only renders in the camera-view phases (hunting/
+    // processing/success/error), not the candidate-picker view — land in
+    // 'error' (paid call also fails) so it's actually on screen to assert
+    // against, while still proving debugInfo captured the OCR result from
+    // the earlier, successful tryOcrMatch step.
+    recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
+    matchCardText.mockResolvedValue({ _identity_confident: false, matches: [] })
+    recognizeCard.mockRejectedValue(new Error('network down'))
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(document.body.textContent).toContain('ocr name:Pikachu')
+    expect(document.body.textContent).toContain('number:25')
+  })
+
   it('falls back to the paid recognizeCard when OCR found a name but match-text was not confident', async () => {
     recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
     matchCardText.mockResolvedValue({
