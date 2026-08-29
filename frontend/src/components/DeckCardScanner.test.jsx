@@ -333,6 +333,60 @@ describe('DeckCardScanner', () => {
     )
   })
 
+  it('retries OCR at the smaller crop size if the larger one throws, and still resolves via match-text', async () => {
+    // Real-device finding: worker.recognize() rejected outright on the
+    // larger OCR-only crop, with no usable error reason (a Tesseract
+    // worker crash rejects with undefined, not an Error — see
+    // describeError in DeckCardScanner.jsx). Whatever the cause, a
+    // genuinely smaller retry should still be able to succeed.
+    recognizeCardText
+      .mockRejectedValueOnce(undefined)
+      .mockResolvedValueOnce({ name: 'Pikachu', number_local: '25' })
+    matchCardText.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-retry1',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(recognizeCardText).toHaveBeenCalledTimes(2)
+    expect(matchCardText).toHaveBeenCalledWith(
+      { name: 'Pikachu', number_local: '25' },
+      expect.anything(),
+      'live_auto_scan',
+    )
+    expect(recognizeCard).not.toHaveBeenCalled()
+    expect(onConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'p1' }),
+      { isAutoSave: true, traceId: 'trace-retry1' },
+    )
+  })
+
+  it('falls back to the paid call, with a readable error, when OCR fails at both crop sizes', async () => {
+    recognizeCardText.mockRejectedValue(undefined)
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-paid3',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(recognizeCardText).toHaveBeenCalledTimes(2)
+    expect(matchCardText).not.toHaveBeenCalled()
+    // The bug this guards: err?.message || err rendered the literal string
+    // "undefined" for a reject(undefined) — unreadable, not diagnostic.
+    expect(document.body.textContent).not.toMatch(/ocr: undefined\b/)
+    expect(document.body.textContent).toContain('worker may have crashed')
+    expect(onConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'p1' }),
+      { isAutoSave: true, traceId: 'trace-paid3' },
+    )
+  })
+
   it('surfaces what OCR actually found in the on-screen debug readout', async () => {
     // Debug readout only renders in the camera-view phases (hunting/
     // processing/success/error), not the candidate-picker view — land in

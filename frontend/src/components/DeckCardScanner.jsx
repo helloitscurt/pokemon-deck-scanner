@@ -33,6 +33,22 @@ const OCR_CROP_HEIGHT = CARD_CROP_HEIGHT * 2
 
 const ERROR_BANNER_CLASS = 'card border-brand-red/30 bg-brand-red/5 text-center py-4'
 
+// err?.message || err renders the literal string "undefined" when err
+// itself is undefined/null (a caught rejection with no reason — observed
+// for real from a Tesseract.js worker.recognize() failure on a real
+// device) instead of anything diagnostic. Not specific to OCR, so kept
+// generic rather than folded into one call site.
+function describeError(err) {
+  if (err instanceof Error) return err.message || err.name || 'Error'
+  if (typeof err === 'string' && err) return err
+  if (err === undefined || err === null) return '(no error details — worker may have crashed)'
+  try {
+    return JSON.stringify(err)
+  } catch {
+    return String(err)
+  }
+}
+
 function scaleQuad(quad, scaleX, scaleY) {
   const scalePoint = ({ x, y }) => ({ x: x * scaleX, y: y * scaleY })
   return {
@@ -245,25 +261,50 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm }) {
   // fresh paid-call attempt rather than shown as-is (see the plan's Phase 2
   // "Net effect": the paid call is the fallback for cards OCR can't
   // confidently resolve, not a second-tier candidate list of its own).
+  const runOcr = async (nativeFrameSource, quad, width, height) => {
+    const ocrCanvas = await extractCard(nativeFrameSource, width, height, quad)
+    if (!ocrCanvas) return null
+    return recognizeCardText(ocrCanvas)
+  }
+
   const tryOcrMatch = async (nativeFrameSource, quad, blob) => {
+    let ocrFields
     try {
-      const ocrCanvas = await extractCard(nativeFrameSource, OCR_CROP_WIDTH, OCR_CROP_HEIGHT, quad)
-      if (!ocrCanvas) return null
-      const ocrFields = await recognizeCardText(ocrCanvas)
-      // Visible, not just inferred from "the paid call ran anyway" — the
-      // only way to tell "OCR found nothing" apart from "OCR found
-      // something but match-text wasn't confident" without this was
-      // reading server logs by hand (see the real-device Wattrel case).
-      setDebugInfo((d) => ({
-        ...d,
-        ocrName: ocrFields.name,
-        ocrNumber: ocrFields.number_local,
-        ocrRawText: lastOcrRawText.value,
-      }))
-      if (!ocrFields.name) return null
+      ocrFields = await runOcr(nativeFrameSource, quad, OCR_CROP_WIDTH, OCR_CROP_HEIGHT)
+    } catch (err) {
+      // Real-device finding: a Tesseract worker.recognize() call rejected
+      // outright (not just "found nothing") on the larger OCR-only crop —
+      // unconfirmed whether the size itself is why (could as easily be the
+      // tab backgrounding mid-recognition). Retry once at the smaller,
+      // original crop size — a genuinely different, lighter-weight attempt,
+      // not a blind repeat — before giving up on OCR for this card.
+      setDebugInfo((d) => ({ ...d, tickError: `ocr(large): ${describeError(err)}` }))
+      try {
+        ocrFields = await runOcr(nativeFrameSource, quad, CARD_CROP_WIDTH, CARD_CROP_HEIGHT)
+      } catch (err2) {
+        setDebugInfo((d) => ({
+          ...d, ocrName: null, ocrNumber: null, ocrRawText: '',
+          tickError: `ocr: ${describeError(err2)}`,
+        }))
+        return null
+      }
+    }
+    if (!ocrFields) return null
+    // Visible, not just inferred from "the paid call ran anyway" — the
+    // only way to tell "OCR found nothing" apart from "OCR found
+    // something but match-text wasn't confident" without this was
+    // reading server logs by hand (see the real-device Wattrel case).
+    setDebugInfo((d) => ({
+      ...d,
+      ocrName: ocrFields.name,
+      ocrNumber: ocrFields.number_local,
+      ocrRawText: lastOcrRawText.value,
+    }))
+    if (!ocrFields.name) return null
+    try {
       return await matchCardText(ocrFields, blob, 'live_auto_scan')
     } catch (err) {
-      setDebugInfo((d) => ({ ...d, ocrName: null, ocrNumber: null, tickError: `ocr: ${err?.message || err}` }))
+      setDebugInfo((d) => ({ ...d, tickError: `match-text: ${describeError(err)}` }))
       return null
     }
   }
