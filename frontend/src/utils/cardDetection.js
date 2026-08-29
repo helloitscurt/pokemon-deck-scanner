@@ -13,6 +13,13 @@
 
 let readyPromise = null
 
+// Mutable, not React state — DeckCardScanner polls this on its own tick
+// loop to show a visible status readout. Exists because ensureReady()'s
+// failures were previously swallowed inside an unhandled promise rejection
+// in the detection loop: camera visible, nothing else ever happened, and
+// the only trace was a devtools console line no one could see on a phone.
+export const detectionStatus = { state: 'idle', error: null }
+
 function loadScript(src) {
   return new Promise((resolve, reject) => {
     const script = document.createElement('script')
@@ -32,14 +39,22 @@ function loadScript(src) {
 // call for the rest of the page's lifetime with the same stale rejection.
 function ensureReady() {
   if (!readyPromise) {
+    detectionStatus.state = 'loading'
+    detectionStatus.error = null
     readyPromise = loadScript('/opencv/opencv.js')
       .then(() => new Promise((resolve) => {
         window.cv['onRuntimeInitialized'] = resolve
       }))
       .then(() => loadScript('/opencv/jscanify.js'))
       .then(() => new window.jscanify())
+      .then((scanner) => {
+        detectionStatus.state = 'ready'
+        return scanner
+      })
       .catch((err) => {
         readyPromise = null
+        detectionStatus.state = 'error'
+        detectionStatus.error = err?.message || String(err)
         throw err
       })
   }
