@@ -1,0 +1,5 @@
+# Vendored third-party builds — keep byte-identical to their upstream
+# source (see frontend/public/opencv/VENDORED.md); no line-ending
+# normalization, no text diffing.
+frontend/public/opencv/opencv.js binary
+frontend/public/opencv/jscanify.js binary
