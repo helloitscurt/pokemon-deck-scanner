@@ -10,7 +10,7 @@ import { resolveCardImageUrl } from '../utils/imageUrl'
 import { CardModal } from '../components/CardItem'
 import { CompactCardArtwork } from '../components/UnifiedCard'
 import DeckCardScanner from '../components/DeckCardScanner'
-import { isDeckCardFound, isDeckCardMissing, missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
+import { missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
 
 export default function DeckDetail() {
   const { instanceId } = useParams()
@@ -110,13 +110,15 @@ export default function DeckDetail() {
   const hpClass = progress >= 66 ? 'healthy' : progress >= 33 ? 'medium' : 'low'
   const cards = data.cards || []
   const visibleCards = selectVisibleDeckCards(cards, filter, sortBy)
-  // Tab counts are card TYPES (rows), matching what's actually listed below —
-  // distinct from the physical-card totals in the header above. Missing and
-  // Found deliberately overlap rather than partition the deck: a card
-  // needing 4 copies with 1 scanned is both still Missing (3 more needed)
-  // and already Found (you have one) — see utils/deckChecklist.js.
-  const missingTypeCount = cards.filter(isDeckCardMissing).length
-  const foundTypeCount = cards.filter(isDeckCardFound).length
+  // Tab counts are physical-card sums, matching the header's "X / 60" —
+  // NOT the number of rows the tab lists (a 60-card deck is usually ~20
+  // unique rows once energy stacks are counted once each). Missing and
+  // Found still deliberately overlap as ROW FILTERS: a card needing 4
+  // copies with 1 scanned appears in both lists (3 more needed, but you've
+  // found one) — see utils/deckChecklist.js. The counts here are simply
+  // physical-card totals, independent of that row overlap.
+  const missingPhysicalCount = data.total_count - data.scanned_count
+  const foundPhysicalCount = data.scanned_count
 
   return (
     <div className="space-y-4 pb-2">
@@ -164,9 +166,9 @@ export default function DeckDetail() {
       <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
         <div className="flex w-full min-w-0 gap-2 overflow-x-auto pb-1 sm:w-auto">
           {[
-            { key: 'missing', label: `${t('decks.detail.missing')} (${missingTypeCount})` },
-            { key: 'found', label: `${t('decks.detail.found')} (${foundTypeCount})` },
-            { key: 'all', label: `${t('decks.detail.all')} (${cards.length})` },
+            { key: 'missing', label: `${t('decks.detail.missing')} (${missingPhysicalCount})` },
+            { key: 'found', label: `${t('decks.detail.found')} (${foundPhysicalCount})` },
+            { key: 'all', label: `${t('decks.detail.all')} (${data.total_count})` },
           ].map(({ key, label }) => (
             <button
               key={key}
