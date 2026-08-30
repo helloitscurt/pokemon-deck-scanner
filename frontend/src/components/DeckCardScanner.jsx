@@ -563,7 +563,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                       working, not stuck, so say so rather than leaving a
                       bare spinner that looks identical to hung. */}
                   {processingSeconds >= 15 && (
-                    <p className="text-xs text-text-muted max-w-[220px] text-center">
+                    <p className="text-sm text-white/90 max-w-[220px] text-center">
                       Still working — the recognition service may be slow right now.
                     </p>
                   )}
