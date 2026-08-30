@@ -948,34 +948,71 @@ for this phase:
    already works (`decks.py:418-452`): a *unique* number match against this
    deck's still-missing cards is sufficient on its own; pHash is one option
    among three, not a hard requirement.
-4. **Perf shape: cheap heuristic every tick, real OCR throttled.** A
-   non-OCR sharpness score updates every detection tick for instant visual
-   feedback (a "hold steady" cue); actual Tesseract OCR — the thing that
-   produces the real percentage — runs on its own throttled cadence,
-   independent of the 90ms detection tick.
+4. **Perf shape, simplified after review: no separate cheap-heuristic tier
+   — just throttled real OCR.** The original draft paired a cheap,
+   every-tick sharpness score with a slower throttled OCR pass. Dropped:
+   one signal is simpler for the user to read (no "two numbers claiming to
+   mean progress" confusion) and removes a whole file plus the extra
+   main-thread OpenCV cost the review flagged. Tesseract OCR — the thing
+   that produces the actual percentage — runs on its own throttled cadence
+   (~500-800ms), independent of the 90ms quad-detection tick, using **its
+   own dedicated Tesseract worker**, not the one `recognizeCardText` uses
+   at capture time (see Decision 5).
+5. **A dedicated second Tesseract worker for the continuous pass**, not a
+   shared/reset one. Verified against tesseract.js's own source
+   (`createWorker.js`, `worker/browser/send.js`) that `setParameters` and
+   `recognize` are both jobs queued on one worker, processed one at a time
+   — sharing `cardOcr.js`'s existing singleton would mean a whitelist set
+   for the narrow number-only call leaks into the next full-card capture
+   call, and the two calls would queue behind each other instead of
+   running concurrently. A second worker costs some memory but removes
+   that whole bug class outright; the ~4MB `eng.traineddata` itself is
+   still fetched once and shared via the same IndexedDB cache
+   `cardOcr.js` already relies on — only the worker instance is
+   duplicated, not the language-data download.
+6. **The throttled OCR pass is strictly serial**: never start a new pass
+   while the previous one is still in flight. This is a stronger version
+   of a plain "skip if busy" guard — because at most one pass can ever be
+   outstanding, passes cannot resolve out of order, which removes the need
+   for a separate generation-counter/staleness check entirely.
+7. **Auto-trigger threshold: number-OCR-confidence ≥ 80%, sustained for 3
+   consecutive throttled passes, and regex-valid** (`NUMBER_PATTERN`)
+   before attempting the deck-scoped match — mirroring Path A's own
+   "sustained, not instantaneous" philosophy (8 consecutive detection
+   frames there; 3 consecutive OCR passes here, on a much slower ~500-800ms
+   cadence). This is a gate on **when to attempt**, not authority to save:
+   the actual auto-save still requires the existing uniqueness check
+   (unique number/name match, or pHash) — a clean, confidently-read
+   misread could otherwise land on a different card that's also missing
+   from the deck, and 80%/3-passes doesn't protect against that on its
+   own. Like `cardOcr.js`'s existing `NAME_BAND_FRACTION`/
+   `MIN_NAME_CONFIDENCE`, these are reasoned starting points to tune
+   against real devices, not empirically validated numbers.
 
 ## Revised flow
 
 ```
 [live video] --(every ~90ms, main thread)--> quad detection (unchanged, Phase 1)
                     |                                    |
-         quad steady N frames?                 sharpness score of the
-                    |                          number-band region (cheap,
-        [Path A: existing Phase 1/2       same OpenCV instance, no OCR)
-         flow, completely unchanged]                     |
-                                              [~every 500-800ms, own
-                                               throttle, skipped if the
-                                               previous pass is still
-                                               running]
+         quad steady N frames?                 numberBand.js picks a crop:
+                    |                          bottom-left of the detected
+        [Path A: existing Phase 1/2            quad if one exists, else the
+         flow, completely unchanged]           raw frame (zoomed past edges)
                                                            |
-                                        Tesseract OCR on JUST the number
-                                        crop (Web Worker, off main thread;
-                                        char-whitelisted to speed it up)
+                                              [~every 500-800ms, own throttle,
+                                               strictly serial — never starts
+                                               a new pass while one is still
+                                               in flight]
+                                                           |
+                                  Tesseract OCR on the number crop, on its
+                                  OWN dedicated worker (not the capture-time
+                                  worker), char-whitelisted for speed
                                                            |
                                           live "N% — 052/198" readout
                                                            |
-                                   sustained >= threshold, M consecutive
-                                   passes, regex-valid?
+                              confidence >= 80%, sustained 3 consecutive
+                              passes, regex-valid? (gates WHEN to attempt,
+                              not authority to save — see Decision 7)
                                                            |
                           FIRES ONCE, then the throttled OCR loop pauses
                           (mirrors Path A's own capture-then-pause
@@ -998,10 +1035,9 @@ for this phase:
 
 | File | Change |
 |---|---|
-| `frontend/src/utils/cardSharpness.js` | **New.** Laplacian-variance blur score on a canvas region, using the same `window.cv` instance `cardDetection.js` already loads — needs a small export added there, e.g. `getCv()`, returning the already-initialized instance from `ensureReady()` rather than re-running its script-loading logic. Cheap enough to run every detection tick; explicitly **not** an OCR-readiness predictor — see Risks. **Not unit-testable the way `quadStability.js` is** — see Q-1 in Review findings; it needs a real loaded OpenCV.js against real pixel data, not plain coordinate math. |
-| `frontend/src/utils/cardOcr.js` | **New export**, e.g. `recognizeNumberRegion(canvas)` — a second, narrower Tesseract call restricted to a digit/slash/letter character whitelist (Tesseract's `tessedit_char_whitelist`, unused today) for speed, distinct from the existing full-card `recognizeCardText` used at capture time. **Decision needed before implementation, not an implicit default: does this share `ensureWorker()`'s single cached worker with the capture-time call, or get its own?** See M-1 in Review findings — `setParameters` and `recognize` are both jobs queued on one worker in tesseract.js's own implementation (verified in `node_modules/tesseract.js/src/createWorker.js`), so a whitelist set for this call persists onto the next call on the same worker, and the two calls cannot run concurrently. |
+| `frontend/src/utils/cardOcr.js` | **New export**, e.g. `recognizeNumberRegion(canvas)` — a second, narrower Tesseract call restricted to a digit/slash/letter character whitelist (Tesseract's `tessedit_char_whitelist`, unused today) for speed, distinct from the existing full-card `recognizeCardText` used at capture time. **Decided (resolves M-1 in Review findings): runs on its own dedicated worker**, not `ensureWorker()`'s existing singleton — see Decision 5 above for why sharing it was rejected (stateful whitelist, serialized jobs). |
 | `frontend/src/utils/numberBand.js` | **New.** Given either a detected quad+source or, when no quad exists (zoomed past the edges), the raw video frame, returns the crop to feed the throttled OCR pass. Bottom-left band heuristic when a quad exists (mirrors `cardOcr.js`'s existing top-band heuristic for the name); a periodic wider/full-frame fallback (see Risks) when nothing has been read for several passes in a row, so a nonstandard layout doesn't get stuck at 0% forever. |
-| `frontend/src/components/DeckCardScanner.jsx` | New continuous-loop state (`focusScore`, `liveNumberConfidence`, `liveNumberText`) and **its own in-flight ref for the throttled OCR pass, separate from the existing `tickInFlightRef`** — see S-1 in Review findings: `tickInFlightRef` guards the 90ms detection tick itself, and awaiting a several-hundred-ms Tesseract call inside it would stall quad detection, defeating the whole point of throttling OCR separately. Also needs a generation counter or similar so an out-of-order-resolving pass can't overwrite a fresher one (S-2). New UI: a fast focus/sharpness cue plus the slower, real percentage — kept **visually distinct** (see Risks). New Path B branch alongside the existing stability branch, firing **once** per sustained-threshold crossing then pausing until resolved (A-1/R-1) — both branches call the same `confirmCard`, not a second save path. |
+| `frontend/src/components/DeckCardScanner.jsx` | New continuous-loop state (`liveNumberConfidence`, `liveNumberText`, consecutive-high-confidence-pass count) and **its own strictly-serial in-flight ref for the throttled OCR pass, separate from the existing `tickInFlightRef`** — see S-1 in Review findings: `tickInFlightRef` guards the 90ms detection tick itself, and awaiting a several-hundred-ms Tesseract call inside it would stall quad detection, defeating the whole point of throttling OCR separately. Strictly-serial (never start a new pass while one is in flight — Decision 6) resolves S-2's stale-result race by construction, no separate generation counter needed. New Path B branch alongside the existing stability branch, firing **once** when confidence sustains ≥80% for 3 consecutive passes (Decision 7), then pausing until resolved (A-1/R-1) — both branches call the same `confirmCard`, not a second save path. |
 | `backend/api/decks.py` | `match_deck_image` gets a new optional `skip_phash: bool = Form(default=False)`. When true, skip straight to the number/name-unique tiers — see "pHash false-positive risk" below for why this is needed, not optional polish. |
 | `frontend/src/api/client.js` | `matchDeckImage` gets the new optional flag threaded through. |
 | `frontend/src/i18n/en.js` | New copy: the live confidence readout's label, and a hint text (e.g. "Low confidence — try zooming in on the number"). |
@@ -1009,29 +1045,26 @@ for this phase:
 
 ## Risks (devil's advocate pass)
 
-- **A sharpness score is a focus/blur proxy, not an OCR-readiness
-  predictor.** It won't detect glare off foil, a JPEG-compressed feed, or a
-  number that's sharp but tilted/skewed relative to the lens. Selling it as
-  the same kind of signal as the real percentage would be misleading — keep
-  it a distinct, secondary cue ("hold steady" / a small bar), never
-  overwritten by or confused with the actual OCR-confidence percentage.
-- **OpenCV.js runs on the main thread** (verified: `cardDetection.js`'s
-  `detectCardQuad` calls `cv.imread`/etc. directly, no worker) — it's
-  already inside the 90ms tick budget the Phase 1 tuning notes call out as
-  hard-won (autofocus-settling tuning, `DeckCardScanner.jsx:13-30`). Adding
-  a Laplacian pass to every tick is real, if small, additional main-thread
-  cost on top of an already-budgeted loop — worth a real-device timing
-  check before assuming it's free, not just assumed cheap because Laplacian
-  variance is a cheap algorithm in the abstract.
+- **Simplified after review: no separate sharpness heuristic.** The
+  original draft paired an every-tick Laplacian-variance blur score with
+  the throttled OCR pass, as a cheap "hold steady" cue. Dropped per
+  Decision 4 — it wasn't an OCR-readiness predictor anyway (couldn't
+  detect glare or a tilted-but-sharp number), it added main-thread OpenCV
+  cost to an already-budgeted 90ms tick, and two numbers competing to mean
+  "progress" was worse for the user than one. The throttled real-OCR
+  percentage is now the only live signal.
 - **Tesseract runs in a Web Worker** (verified: `createWorker` in
   `cardOcr.js:21`), so the throttled real-OCR pass won't block the
   main-thread detection loop — but a phone still has few CPU cores, and
   running quad detection (main thread) and OCR (worker) concurrently for
   the entire time a user is positioning a card is real, sustained load, not
-  today's brief one-shot cost. The throttle must be an in-flight guard
-  (skip firing a new pass if the last one hasn't resolved), not a bare
-  `setInterval`, or a slow phone backs up a queue of overlapping OCR calls
-  under exactly the conditions (phone struggling) where that's worst.
+  today's brief one-shot cost. Per Decision 6, the throttle is **strictly
+  serial** (never start a new pass while the last hasn't resolved), not a
+  bare `setInterval` — on a struggling phone this means passes simply
+  space out further rather than backing up into a queue of overlapping
+  calls, which also happens to be what removes the stale-result race S-2
+  originally flagged (at most one pass in flight, so none can resolve out
+  of order).
 - **pHash false-positive risk on a partial image — this is why
   `skip_phash` is a real requirement, not a nice-to-have.** `match_deck_image`
   (`decks.py:342`) requires an uploaded `file` unconditionally and runs
@@ -1046,11 +1079,14 @@ for this phase:
   photos, not fragments, so its false-positive behavior on a fragment is
   unvalidated. The frontend must set `skip_phash=true` on every Path B
   call, not rely on pHash naturally declining to match.
-- **OCR read-confidence is not identification confidence — the plan's own
-  Decision 3 mitigates this, but it's worth stating plainly.** A high
-  Tesseract confidence means "I'm sure I read these characters correctly,"
-  not "this is definitely your card." The design already treats sustained
-  high OCR confidence as a **gate on when to attempt** the (already
+- **OCR read-confidence is not identification confidence — Decision 7
+  mitigates this, but it's worth stating plainly, with a concrete failure
+  mode.** A high Tesseract confidence means "I'm sure I read these
+  characters correctly," not "this is definitely your card." A clean,
+  confidently-read misread (e.g. `052` misread as `057`) can still collide
+  with a *different* card that's also missing from the deck — 80%/3-passes
+  doesn't rule that out by itself. The design treats sustained high OCR
+  confidence as a **gate on when to attempt** the (already
   unique-match-only) deck-scoped match — never as sufficient to save by
   itself — which is the right mitigation, but it should stay that way
   through implementation: nothing should shortcut straight from "OCR% is
@@ -1066,8 +1102,8 @@ for this phase:
   belong entirely to Path A. As a user zooms in, `detectCardQuad` will
   transition from finding a quad to finding none; that transition is
   expected and must not visibly disrupt the accumulating number-confidence
-  readout, which is tracking a different thing (sharpness/OCR text) than
-  quad presence.
+  readout, which is tracking a different thing (OCR text) than quad
+  presence.
 - **Battery.** Gate the whole continuous-OCR loop behind `phase === 'hunting'`
   (same gating the existing detection loop already uses) so it stops the
   instant a capture/save is in flight — matches existing lifecycle, not a
@@ -1095,27 +1131,19 @@ for this phase:
   `DeckCardScanner.jsx` row now specify **fire once, then pause until
   resolved** — the same shape Path A's own capture already uses — as a
   requirement, not an implementation detail to sort out later.
-- **`ensureWorker()`'s single cached Tesseract worker is shared, stateful
-  state across both OCR call sites — verified against tesseract.js's own
-  source, not assumed.** `createWorker.js`'s `setParameters` and
-  `recognize` are both jobs posted as messages to one underlying worker
-  (`worker/browser/send.js` is a plain `postMessage`); the engine processes
-  them one at a time, and a parameter set by `setParameters` persists for
-  every subsequent job on that same worker. Two concrete failure modes if
-  Phase 3's narrow, whitelisted `recognizeNumberRegion()` reuses today's
-  singleton worker unchanged: (1) the digit/slash/letter whitelist it sets
-  silently carries over into the next full-card `recognizeCardText()` call
-  at capture time, which needs the unrestricted charset to read a card's
-  name — breaking Path A's OCR tier, not just Phase 3's own; (2) recognize
-  jobs queue rather than run concurrently, so a throttled number-only pass
-  in flight exactly when a stability-triggered capture fires (Path A) makes
-  that capture's OCR wait behind it, adding latency at the moment a user
-  has just successfully held a card steady. Needs an explicit decision
-  before implementation: reset parameters around every full-card call and
-  accept the queuing, or give the continuous pass its own second worker
-  (the ~4MB `eng.traineddata` itself can still be shared via the same
-  IndexedDB cache `cardOcr.js` already relies on — only the worker
-  instance, not the trained-data download, would be duplicated).
+- **Resolved: `ensureWorker()`'s single cached Tesseract worker will NOT be
+  shared with the new continuous pass — see Decision 5.** Originally
+  flagged (M-1) as a real risk if reused unchanged: `createWorker.js`'s
+  `setParameters` and `recognize` are both jobs posted to one worker
+  (verified in `node_modules/tesseract.js`), processed one at a time, with
+  `setParameters` persisting across subsequent jobs — so a shared worker
+  would have let the narrow number-only whitelist silently leak into
+  Path A's full-card capture-time OCR, and made the two calls queue behind
+  each other. A dedicated second worker for the continuous pass removes
+  both problems outright, at the cost of a second worker's memory
+  footprint (not a second trained-data download — the ~4MB
+  `eng.traineddata` is still shared via `cardOcr.js`'s existing IndexedDB
+  cache).
 - **Tesseract's `confidence` score is not a calibrated probability, and
   it's specifically unreliable on the character classes this feature cares
   about most.** It's an internal engine heuristic, and this codebase
@@ -1126,7 +1154,7 @@ for this phase:
   from this project's own Phase 2 build). Showing a raw Tesseract
   confidence to a user as "N%" implies more certainty than the engine
   itself guarantees. The plan's structural mitigation (a gate on *when* to
-  attempt a match, never proof of one — see Decision 3 above) is the right
+  attempt a match, never proof of one — see Decision 7 above) is the right
   fix technically, but the UI copy should avoid language like "78% sure
   this is your card," which the number doesn't actually support.
 - **The character whitelist is a plausible but unvalidated speed/accuracy
@@ -1144,22 +1172,15 @@ for this phase:
 
 - **`numberBand.js`** (the region-selection math) is genuinely pure and
   testable the same way `quadStability.js` is today — plain coordinates in,
-  a crop rectangle out. **`cardSharpness.js` is not**, and the plan
-  originally overclaimed this — corrected per Q-1 in Review findings:
-  verified `quadStability.test.js` exercises plain `{x, y}` objects with no
-  WASM/DOM dependency at all, while a Laplacian-variance score needs real
-  canvas pixel data through a loaded `cv.Laplacian`, categorically the same
-  kind of untestable-in-Vitest problem `cardOcr.js`'s own
-  `recognizeCardText` already has (only its pure parsing helpers,
-  `parseCardOcrText`/`pickCardName`, get direct test coverage; the
-  Tesseract call itself doesn't). Scope unit tests to whatever pure
-  pre/post-processing wraps the Laplacian call, not the blur computation
-  itself.
-- **New: a stale-result-race test** for the out-of-order-resolution guard
-  (S-2 in Review findings) — feed the throttled OCR loop two passes where
-  the first is artificially delayed past the second's completion, and
-  assert the displayed confidence/number reflects the second (fresher) pass,
-  not whichever happened to resolve last.
+  a crop rectangle out.
+- **A serial-guard test**: assert the throttled OCR loop skips starting a
+  new pass while one is still in flight, rather than queuing or overlapping
+  it. This is what makes a separate stale-result-race test unnecessary
+  (Decision 6) — with at most one pass ever outstanding, there's no
+  "two passes resolve out of order" case left to test.
+- **A sustained-threshold test**: a single pass at ≥80% must NOT trigger
+  Path B; three consecutive passes at ≥80% must. Covers the "one lucky
+  noisy frame" case Decision 7 exists to rule out.
 - Backend: a test asserting `skip_phash=true` skips the pHash block even
   with ≥2 image-bearing candidates present. **Every existing call site in
   `test_deck_image_match.py` needs `skip_phash=False` added explicitly**
@@ -1176,37 +1197,39 @@ for this phase:
   positioning before a card is even close to readable; hold a good zoom
   steady for several seconds after a confident match already fired and
   confirm no further `match-image` calls go out until the next physical
-  card (A-1/R-1); and, if a stability-triggered capture (Path A) happens to
-  land while a throttled number-only pass is still in flight, confirm the
-  capture's own OCR isn't visibly delayed waiting behind it (M-1).
+  card (A-1/R-1); if a stability-triggered capture (Path A) happens to land
+  while a throttled number-only pass is still in flight, confirm the
+  capture's own OCR isn't visibly delayed (verifies the dedicated-worker
+  decision actually avoided the queuing it was meant to avoid); and,
+  against a deck with two missing cards whose numbers are a plausible OCR
+  misread of each other, confirm a misread never auto-saves the wrong one
+  (the uniqueness check, not the 80%/3-passes gate, is what should catch
+  this).
 
 ## Build order
 
-12. **Decide the Tesseract worker question first** (M-1 in Review findings)
-    — one shared worker with parameters reset around every full-card call,
-    or a second dedicated worker for the continuous pass. Blocks step 13
-    from being written correctly either way.
-13. `cardSharpness.js` (+ `getCv()` export from `cardDetection.js`) and
-    `numberBand.js` — only `numberBand.js`'s pure region math gets direct
-    unit tests (Q-1); `cardSharpness.js` is scoped like `cardOcr.js`'s own
-    untested Tesseract call, not like `quadStability.js`.
-14. `cardOcr.js`'s `recognizeNumberRegion`, char-whitelisted per step 12's
-    decision, tested against fixture text the same way
+12. `numberBand.js`, unit-tested independently of the component.
+13. `cardOcr.js`'s `recognizeNumberRegion`, char-whitelisted, on its own
+    dedicated Tesseract worker per Decision 5 (not `ensureWorker()`'s
+    singleton) — tested against fixture text the same way
     `parseCardOcrText`/`pickCardName` already are.
-15. Backend: `skip_phash` flag on `match_deck_image`, tested both ways —
+14. Backend: `skip_phash` flag on `match_deck_image`, tested both ways —
     including updating every existing direct call site in
     `test_deck_image_match.py` to pass `skip_phash=False` explicitly
     (Q-3/D-1), not just adding new cases.
-16. Wire the continuous loop into `DeckCardScanner.jsx`: live focus +
-    percentage UI, a throttled-OCR in-flight guard kept separate from the
-    existing `tickInFlightRef` (S-1), a generation guard against
-    out-of-order results (S-2), and a Path B trigger that fires once per
-    sustained-threshold crossing and then pauses until resolved (A-1/R-1) —
-    calling the existing `confirmCard`, not a second save path. Multi-persona
-    + `ui-review` pass, per this project's established rhythm.
-17. Real-device test per the Testing section above — this phase's accuracy
+15. Wire the continuous loop into `DeckCardScanner.jsx`: live percentage
+    UI, a strictly-serial throttled-OCR in-flight guard kept separate from
+    the existing `tickInFlightRef` (S-1, and this serialization is what
+    resolves S-2 by construction per Decision 6), and a Path B trigger that
+    fires once when confidence sustains ≥80% for 3 consecutive passes
+    (Decision 7) and then pauses until resolved (A-1/R-1) — calling the
+    existing `confirmCard`, not a second save path. Multi-persona +
+    `ui-review` pass, per this project's established rhythm.
+16. Real-device test per the Testing section above — this phase's accuracy
     and "does it actually feel useful, not distracting" verdict is unknown
-    until measured, same as Phase 2's own numbers were.
+    until measured, same as Phase 2's own numbers were. This includes
+    calibrating the 80%/3-passes threshold itself, which is a starting
+    guess, not a validated number.
 
 ## Review findings — Phase 3 (multi-persona + OCR-model-expert pass)
 
@@ -1218,16 +1241,47 @@ engine behavior, not just general code quality.
 
 | Tag | Sev | Finding | Addressed in |
 |---|---|---|---|
-| M-1 | HIGH | `ensureWorker()`'s single cached Tesseract worker is shared, stateful state — verified in tesseract.js's own source, not assumed: `setParameters`/`recognize` are both jobs queued on one worker, so a char-whitelist set by the new narrow OCR call would persist onto the next full-card call, and the two calls can't run concurrently | New "Decision needed before implementation" note on `cardOcr.js`'s file-table row, new Risks bullet, new build-order step 12 gating step 13 |
-| A-1 | HIGH | Path B's match trigger cadence was unspecified — read as firing on every throttled pass while confidence stayed high, not once | Flow diagram annotated "fires once, then pauses"; new Risks bullet; build-order step 16 |
-| Q-1 | HIGH | Testing section incorrectly claimed `cardSharpness.js` follows the same pure-unit-test convention as `quadStability.js` — verified they're categorically different (plain coordinates vs. real WASM pixel data) | Testing section corrected; file-table row updated; build-order step 13 |
-| Q-3 / D-1 | MED | New `skip_phash` Form param breaks every existing direct call site in `test_deck_image_match.py` unless each is updated — verified all ~10 sites already spell out every `Form(...)` param explicitly, for exactly this reason | New file-table row for the test file; Testing section corrected; build-order step 15 |
-| S-1 | MED | Throttled OCR pass needs its own in-flight guard, separate from `tickInFlightRef` — awaiting it inside the existing guard would stall the 90ms detection tick it's meant to run alongside | File-table row + build-order step 16 |
-| S-2 | MED | No guard specified against an out-of-order-resolving OCR pass overwriting a fresher result | File-table row, new Testing bullet, build-order step 16 |
+| M-1 | HIGH | `ensureWorker()`'s single cached Tesseract worker is shared, stateful state — verified in tesseract.js's own source, not assumed: `setParameters`/`recognize` are both jobs queued on one worker, so a char-whitelist set by the new narrow OCR call would persist onto the next full-card call, and the two calls can't run concurrently | Resolved by decision — see "Phase 3 decisions" below (dedicated second worker); build-order step 13 |
+| A-1 | HIGH | Path B's match trigger cadence was unspecified — read as firing on every throttled pass while confidence stayed high, not once | Flow diagram annotated "fires once, then pauses"; new Risks bullet; build-order step 15 |
+| Q-1 | HIGH | Testing section incorrectly claimed `cardSharpness.js` follows the same pure-unit-test convention as `quadStability.js` — verified they're categorically different (plain coordinates vs. real WASM pixel data) | Moot — `cardSharpness.js` was cut entirely in the simplification pass below; `numberBand.js`'s pure region math is the only unit-testable piece left, build-order step 12 |
+| Q-3 / D-1 | MED | New `skip_phash` Form param breaks every existing direct call site in `test_deck_image_match.py` unless each is updated — verified all ~10 sites already spell out every `Form(...)` param explicitly, for exactly this reason | New file-table row for the test file; Testing section corrected; build-order step 14 |
+| S-1 | MED | Throttled OCR pass needs its own in-flight guard, separate from `tickInFlightRef` — awaiting it inside the existing guard would stall the 90ms detection tick it's meant to run alongside | File-table row + build-order step 15 |
+| S-2 | MED | No guard specified against an out-of-order-resolving OCR pass overwriting a fresher result | Resolved by decision — see "Phase 3 decisions" below (strictly-serial guard makes overlap, and so staleness, structurally impossible); build-order step 15 |
 | R-1 | MED | Same root cause as A-1, from the operational-load angle: `match_deck_image` writes a `ScanTrace` file unconditionally on every call, with no existing rate limit — a repeating (not one-shot) trigger multiplies trace-file and DB-match load per physical card | Same fixes as A-1; new Risks bullet naming the disk-growth blast radius explicitly |
-| M-2 | MED | Tesseract's `confidence` is an uncalibrated engine heuristic, specifically unreliable on the O/0, I/l/1 confusions this app already corrects for post-hoc — showing it raw as "N%" overstates certainty | New Risks bullet; UI-copy caution noted for build-order step 16 |
+| M-2 | MED | Tesseract's `confidence` is an uncalibrated engine heuristic, specifically unreliable on the O/0, I/l/1 confusions this app already corrects for post-hoc — showing it raw as "N%" overstates certainty | New Risks bullet; UI-copy caution noted for build-order step 15 |
 | M-3 | LOW | Character-whitelisting speeds up OCR but could also inflate confidence on a genuinely bad read by narrowing the answer space, rather than being a pure win | New Risks bullet, flagged as unvalidated-until-measured like the rest of this phase |
 | R-2 | LOW | Plan hedged "unverified" on whether `document.visibilitychange` is handled anywhere in this codebase's camera code | Checked directly — confirmed not handled anywhere relevant; wording corrected from "unverified" to a stated, verified gap |
-| S-3 | LOW | `getCv()`'s proposed semantics (return the already-initialized instance vs. re-run loading) were left implicit | File-table row now states it explicitly |
+| S-3 | LOW | `getCv()`'s proposed semantics (return the already-initialized instance vs. re-run loading) were left implicit | Moot — see below: `cardSharpness.js` (its only caller) was cut, so `getCv()` is no longer needed at all |
 | B | — | No schema/query changes anywhere in this phase | Clean, no finding |
 | X | — | Checked explicitly: `skip_phash` doesn't bypass `Depends(get_current_user)` or `_get_owned_instance`'s ownership scoping — it only selects which already-scoped matching tier runs, and isn't interpolated anywhere. No new injection or cross-user surface | Clean, stated as a checked conclusion rather than skipped |
+
+## Phase 3 decisions (post-review simplification pass)
+
+Confirmed with you after the review above. All four resolve or sidestep a
+finding from the table rather than ignoring it:
+
+1. **Drop the sharpness heuristic entirely** (no `cardSharpness.js`, no
+   `getCv()` export). One live signal (throttled OCR confidence) instead of
+   two. Removes the main-thread-cost concern the review raised about
+   running a Laplacian pass every 90ms, and makes S-3 moot outright rather
+   than needing an answer.
+2. **The continuous OCR pass gets its own dedicated Tesseract worker**,
+   not `ensureWorker()`'s shared singleton. Directly resolves M-1 (stateful
+   whitelist leaking across calls; jobs queuing instead of running
+   concurrently) by removing the sharing that caused it, at the cost of a
+   second worker's memory footprint.
+3. **The throttled OCR pass is strictly serial** (never starts a new pass
+   while one is in flight). Resolves S-2 (stale out-of-order results) as a
+   side effect, not a separately-built fix — with at most one pass ever
+   outstanding, there's nothing left to resolve out of order.
+4. **Auto-trigger threshold: OCR confidence ≥80% on the number, sustained
+   for 3 consecutive throttled passes, regex-valid** — a gate on *when* to
+   attempt the existing deck-scoped match, not authority to save by itself
+   (the uniqueness check still owns that decision, per M-2/the
+   misread-collision risk above). Both numbers are starting points to
+   calibrate on a real device, not validated thresholds.
+
+A-1, R-1, Q-1, Q-3/D-1, M-2, M-3, and R-2 from the table above were already
+addressed in the Phase 3 text directly (flow diagram, file table, Risks,
+and Testing sections) and didn't need a decision here — only the four
+above required an explicit choice between named alternatives.
