@@ -13,7 +13,10 @@ into a continuous background readout with a live confidence percentage,
 specifically so a user can react to a low reading by physically zooming in
 on the collector number — a capability the Phase 1/2 pipeline doesn't
 support today, since it requires the whole card's outline in frame to do
-anything at all.
+anything at all. **Phase 4** makes the tuning constants Phase 1 and Phase 3
+otherwise hardcode (how long a card must hold steady, Phase 3's auto-trigger
+confidence threshold) into user-configurable settings, since the right
+values genuinely depend on the phone's own camera and CPU, not just taste.
 
 ## Scope (confirmed with user)
 
@@ -1285,3 +1288,175 @@ A-1, R-1, Q-1, Q-3/D-1, M-2, M-3, and R-2 from the table above were already
 addressed in the Phase 3 text directly (flow diagram, file table, Risks,
 and Testing sections) and didn't need a decision here — only the four
 above required an explicit choice between named alternatives.
+
+---
+
+# Phase 4: user-configurable scanner tuning
+
+Gated on Phase 3, since it exposes Phase 3's auto-trigger threshold as well
+as Phase 1's existing quad-stability constants.
+
+## Why this needs a real design, not just exposing some sliders
+
+Verified: today's tuning is hardcoded module-level constants in
+`DeckCardScanner.jsx` (`DETECTION_INTERVAL_MS = 90`,
+`REQUIRED_STABLE_FRAMES = 8` → ~720ms dwell, `STABILITY_TOLERANCE_PROPORTION
+= 0.07`), tuned specifically against real-device testing (see the file's
+own build-history comments on autofocus settling). Phase 3 proposes two
+more (80% confidence, 3 consecutive passes). Making these user-editable
+raises a question the existing scanner-settings screen doesn't have to
+answer: **where does the value live?**
+
+Checked the existing pattern first: `ScannerSettingsCard.jsx`'s
+provider/model/API key settings are backed by `UserSetting`
+(`user_id` + key/value, `models.py:497`) — account-level, synced to every
+device that account logs into. That's correct for "which AI provider" (an
+account-level choice) but wrong for camera/detection tuning, which depends
+on a specific phone's camera and CPU — syncing a value tuned on a fast
+phone onto an older device on the same account would silently make that
+device's scanner worse, not better.
+
+## Decisions (confirmed with you)
+
+1. **Two-layer storage: an account-level default, overridable per device.**
+   The account-level value (new `UserSetting` key) is what a fresh device
+   sees before it's been tuned locally — useful the first time someone
+   opens the scanner on a new phone. A per-device `localStorage` value, when
+   present, wins over the account default for whichever fields it sets.
+   This is real, additional complexity over either flavor alone (two
+   storage layers, a merge/precedence rule) — accepted deliberately because
+   neither single-layer option was actually correct for this specific data.
+2. **Presets as the primary control, with an Advanced section exposing raw
+   values** — mirrors this app's own existing precedent
+   (`ScannerSettingsCard.jsx`'s admin-only "Advanced model" section). Most
+   users pick Fast/Balanced/Careful; a preset choice is itself just a
+   named bundle of the same raw values Advanced exposes directly.
+3. **"Balanced" is defined as exactly today's shipped values** — 720ms
+   dwell, 0.07 tolerance, 80%/3-passes. Anyone who never opens the new
+   settings screen gets identical behavior to what's already been
+   real-device tested; this phase changes nothing by default.
+4. **Not everything new belongs in the device-override bucket.** Two
+   related-but-different settings ride along on the same screen and need
+   different homes:
+   - **"Show scanner diagnostics"** (the always-on debug text block at
+     `DeckCardScanner.jsx:761-787` — raw OCR text, tick counts, per-word
+     confidences — verified it renders unconditionally today, with no
+     existing toggle) is a personal preference disconnected from device
+     hardware. Per-device `localStorage`, off by default — simplest
+     option, and there's no reason a preference like this should sync.
+   - **"Auto-save when confident" vs. "always confirm before saving"** is a
+     trust posture, not a hardware property — it doesn't get better or
+     worse based on which phone is being used. Account-level
+     (`UserSetting`), alongside provider/model.
+
+## Config resolution and value bounds
+
+For each of the four tunable fields (dwell ms, tolerance proportion,
+auto-trigger confidence %, auto-trigger consecutive passes), resolution
+order is: **per-device override (if that specific field is set) → account
+default (preset-derived, or the stored custom values if the account's
+preset is `"custom"`) → hardcoded factory constant** (the current Phase
+1/3 values, used only if the account setting hasn't loaded yet). A partial
+device override (a user only tweaked the confidence threshold locally, say)
+must merge field-by-field, not replace the whole config wholesale — this
+matters because there's no other way to change one field per-device without
+duplicating every other value onto that device too.
+
+Illustrative preset values (starting points, not validated — same caveat
+every other threshold in this document carries):
+
+| Preset | Dwell | Tolerance | Auto-trigger confidence | Consecutive passes |
+|---|---|---|---|---|
+| Fast | ~500ms | 0.09 | 75% | 2 |
+| **Balanced (default)** | **~720ms** | **0.07** | **80%** | **3** |
+| Careful | ~1080ms | 0.05 | 88% | 4 |
+
+**Every raw field needs a clamped valid range, enforced on both save paths
+(the account endpoint and the local override), not just the UI slider's
+own min/max.** A garbage value (dwell near 0, tolerance near 1.0) wouldn't
+just misbehave — it could make the scanner unusable, or spam auto-trigger
+attempts. Suggested bounds (also unvalidated): dwell 300-2000ms, tolerance
+0.03-0.15, confidence 50-95%, consecutive passes 1-6. The auto-trigger's
+own uniqueness-check gate (Phase 3, Decision 7) still bounds the actual
+damage a reckless custom value can do — a low threshold produces more
+*attempts*, not more *wrong saves* — but more attempts still means more
+`ScanTrace` writes and DB calls (same R-1 concern Phase 3 already flags),
+so validation is still worth doing, not just relying on that downstream
+gate.
+
+## New/changed files
+
+| File | Change |
+|---|---|
+| `backend/models.py` | No new table — reuses existing `UserSetting` (`user_id`, `key`, `value`) with two new keys: `scanner_tuning` (JSON: `{preset, custom}`) and `scanner_auto_save_mode` (`"auto"` \| `"always_confirm"`). |
+| `backend/api/settings.py` | New GET/PUT for the two keys above — kept separate from `getScannerConfiguration`/`updateScannerConfiguration` (provider/model/key) rather than folded in, since that endpoint's "Test and save" capability-probe flow is specific to providers and has nothing to do with these fields. |
+| `frontend/src/api/client.js` | New `getScannerTuning()`/`updateScannerTuning()` thin wrappers over the new endpoints. |
+| `frontend/src/utils/scannerTuning.js` | **New.** Plain `localStorage.getItem`/`setItem` under one JSON key (matches this app's existing convention — see `useTheme.js`'s direct `localStorage` use, no wrapper abstraction elsewhere in this codebase) for the per-device override, plus the resolve-with-precedence function both `DeckCardScanner.jsx` and the new settings UI call. |
+| `frontend/src/components/ScannerSettingsCard.jsx` (or a new sibling card) | New "Scanner tuning" section: preset picker, Advanced raw-value fields, a "this device" indicator when a local override is active, and a "Reset to account default" action. Separate section from provider/model, not folded into the same form — different save semantics (no "Test and save" capability probe applies here). |
+| `frontend/src/components/DeckCardScanner.jsx` | Module-level constants (`DETECTION_INTERVAL_MS`, `REQUIRED_STABLE_FRAMES`, `STABILITY_TOLERANCE_PROPORTION`, and Phase 3's auto-trigger threshold/pass-count) become values resolved at scanner-open time via `scannerTuning.js`, not hardcoded. The always-on debug block gets gated behind the new diagnostics toggle. |
+| `frontend/src/i18n/en.js` | New copy: preset names/descriptions, Advanced field labels, the diagnostics and auto-save toggles. |
+
+## Risks
+
+- **This touches already-shipped, real-device-tested Phase 1 code, not
+  just new Phase 3 surface.** Turning `DETECTION_INTERVAL_MS` and friends
+  from compile-time constants into a runtime-resolved value is a real
+  change to code the plan elsewhere describes as "unchanged" (Path A). The
+  Balanced-preset-equals-today's-values decision (Decision 3) keeps
+  default *behavior* identical, but the *code path* producing that
+  behavior changes — worth a real-device regression pass on Path A
+  specifically, not just the new settings UI.
+- **Partial-override merge correctness.** A device override that only sets
+  one field must not blank out the others — a naive "device override
+  replaces the whole config object" implementation would silently reset
+  every field the user didn't mean to touch back to a `Fast`-like preset's
+  defaults (or `undefined`) the moment any single field is customized
+  locally.
+- **Garbage values are a real (if bounded) risk, not just an edge case** —
+  see the clamping requirement above. Both the account-level PUT and the
+  local override write need the same validation, since either can be the
+  source of an effective value at runtime.
+- **Two related toggles, two different storage homes, on one screen.**
+  Diagnostics (per-device) and auto-save mode (per-account) sit next to
+  the tuning preset (two-layer) on the same settings section — worth being
+  deliberate in the UI about which control is "just this device" and which
+  is "everywhere you're logged in," since the tuning preset's own
+  per-device override affordance could otherwise make a user assume
+  *everything* on the screen works that way.
+- **Scope check.** This is the most complex of the three storage options
+  considered (a single per-device or single per-account setting would each
+  have been simpler to build) — deliberately chosen because neither
+  simpler option was actually correct for hardware-dependent values. Worth
+  remaining aware that this is added complexity in service of correctness,
+  not a default to reach for on future settings without the same
+  hardware-dependency reasoning.
+
+## Testing
+
+- `scannerTuning.js`'s resolution function: pure unit tests — device
+  override present/absent/partial, account default present/absent,
+  fall-through to hardcoded factory values, and that a partial device
+  override merges field-by-field rather than replacing the whole config.
+- Backend: validation-bounds tests for both new `UserSetting` keys
+  (reject out-of-range values) and a round-trip test for each key.
+- Manual, real-device: confirm Balanced preset behaves identically to
+  today's shipped scanner (the regression check the Risks section above
+  calls for); confirm a per-device override on one phone doesn't appear
+  when logging into the same account on a second phone; confirm the
+  diagnostics toggle actually hides the debug block; confirm an
+  auto-save-disabled account always lands in the candidate picker even on
+  an otherwise-confident match.
+
+## Build order
+
+18. Backend: the two new `UserSetting` keys, validation bounds, GET/PUT
+    endpoints, tested both ways.
+19. `scannerTuning.js`: resolution-with-precedence logic and the
+    `localStorage` read/write for the device-override layer, unit-tested
+    independently of any component.
+20. Wire `DeckCardScanner.jsx`'s constants over to resolved values, and gate
+    the debug block behind the diagnostics toggle. Real-device regression
+    pass on Path A specifically (see Risks) before touching anything else.
+21. Settings UI: preset picker + Advanced section + the two independently-
+    homed toggles, wired to the endpoints/localStorage from steps 18-19.
+22. Real-device test per the Testing section above.
