@@ -26,7 +26,7 @@ from services.phash import (
     phash_best_match as _phash_best_match,
 )
 from services.scan_storage import MAX_FILE_BYTES, ScanUploadError, read_limited_upload, sanitize_image_bytes
-from services.scan_trace import ScanTrace, create_scan_trace
+from services.scan_trace import ScanTrace, create_scan_trace, redact_sensitive
 from services.scan_providers import (
     GEMINI,
     SCANNER_CAPABILITY_DEGRADED,
@@ -398,6 +398,17 @@ async def post_gemini_generate(
                     ),
                 )
             if resp.status_code in GEMINI_TRANSIENT_STATUS_CODES:
+                # The user-facing detail (below) has always just said
+                # "temporarily overloaded" — real question asked while
+                # debugging a run of these: what does Gemini's own response
+                # actually say? Never logged before now. redact_sensitive
+                # defends against an upstream error echoing the API key
+                # back (has happened with other providers' error bodies).
+                logger.warning(
+                    "Gemini transient status=%s attempt=%s/%s body=%s",
+                    resp.status_code, attempt + 1, max_attempts,
+                    redact_sensitive(resp.text)[:500],
+                )
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
