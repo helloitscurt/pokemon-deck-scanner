@@ -617,6 +617,64 @@ class DeterministicMatchingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(confident)
         self.assertIsNone(decision)
 
+    def test_artist_and_regulation_mark_resolve_a_numberless_trainer_card(self):
+        # Real-device finding: a promo Trainer card (Picnicker) whose number
+        # Gemini couldn't read never reached confidence, even though TCGdex
+        # resolved its name to exactly one unambiguous candidate — Trainer
+        # cards have no HP at all, so the artist+hp fallback (see the test
+        # above) can never fire for them. This is the fix: artist + one more
+        # corroborating signal, gated to non-Pokemon card types.
+        recognized = normalize_recognized_card_info({
+            "card_type": "Trainer",
+            "artist": "5ban Graphics",
+            "regulation_mark": "G",
+        })
+        candidates = [{
+            "id": "svp-114",
+            "artist": "5ban Graphics",
+            "regulation_mark": "G",
+        }]
+
+        confident, decision = _metadata_decision(recognized, candidates)
+
+        self.assertTrue(confident)
+        self.assertEqual(decision, "artist_metadata")
+
+    def test_artist_alone_does_not_resolve_a_numberless_trainer_card(self):
+        # The same bar as number_metadata's own — one anchor signal isn't
+        # enough on its own, it needs a second corroborating signal too.
+        recognized = normalize_recognized_card_info({
+            "card_type": "Trainer",
+            "artist": "5ban Graphics",
+        })
+        candidates = [{"id": "svp-114", "artist": "5ban Graphics"}]
+
+        confident, decision = _metadata_decision(recognized, candidates)
+
+        self.assertFalse(confident)
+        self.assertIsNone(decision)
+
+    def test_artist_and_regulation_mark_do_not_resolve_a_numberless_pokemon_card(self):
+        # Must stay scoped to card types that structurally have no HP — a
+        # Pokemon card just happening to have no visible HP in frame is a
+        # weaker signal than a Trainer card where HP was never possible in
+        # the first place, so this new path must not loosen the bar there.
+        recognized = normalize_recognized_card_info({
+            "card_type": "Pokemon",
+            "artist": "5ban Graphics",
+            "regulation_mark": "G",
+        })
+        candidates = [{
+            "id": "some-pokemon-card",
+            "artist": "5ban Graphics",
+            "regulation_mark": "G",
+        }]
+
+        confident, decision = _metadata_decision(recognized, candidates)
+
+        self.assertFalse(confident)
+        self.assertIsNone(decision)
+
     async def test_shared_matcher_is_used_without_visual_call_for_composites(self):
         recognized = {"name": "Pikachu", "number_local": "25"}
         candidates = [{"id": "right", "number": "25"}, {"id": "wrong", "number": "26"}]
