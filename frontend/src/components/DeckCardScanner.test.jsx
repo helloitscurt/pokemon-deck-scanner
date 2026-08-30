@@ -220,6 +220,50 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).not.toHaveBeenCalled()
   })
 
+  it('captures a new card swapped in right after a save, even when the frame is never empty in between', async () => {
+    // Real-device finding: sliding the next card into frame before the
+    // previous one is fully out never produces a "no quad" tick. A plain
+    // boolean gate cleared only by an empty frame left this permanently
+    // blocking capture — every card after the first few silently stopped
+    // auto-scanning until the user closed and reopened the scanner.
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-abc123',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+    recognizeCard.mockClear()
+    onConfirm.mockClear()
+    // Checkmark + cooldown elapse (see CHECKMARK_DURATION_MS /
+    // COOLDOWN_AFTER_CHECKMARK_MS) — detectCardQuad is never made to
+    // return null at any point, matching a fast physical swap.
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+
+    const SWAPPED_QUAD = {
+      topLeftCorner: { x: 300, y: 250 },
+      topRightCorner: { x: 400, y: 250 },
+      bottomLeftCorner: { x: 300, y: 400 },
+      bottomRightCorner: { x: 400, y: 400 },
+    }
+    detectCardQuad.mockResolvedValue(SWAPPED_QUAD)
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p2', name: 'Charmander' }],
+      trace_id: 'trace-def456',
+    })
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(recognizeCard).toHaveBeenCalledTimes(1)
+    expect(onConfirm).toHaveBeenCalledWith(
+      expect.objectContaining({ id: 'p2' }),
+      { isAutoSave: true, traceId: 'trace-def456' },
+    )
+  })
+
   it('falls back to the tap-to-confirm picker on an ambiguous match, and pauses further auto-capture while it is shown', async () => {
     recognizeCard.mockResolvedValue({
       _identity_confident: false,
@@ -518,15 +562,19 @@ describe('DeckCardScanner', () => {
     )
   })
 
-  it('does not show a cancel option until processing has taken a while', async () => {
+  it('shows a cancel option as soon as processing starts, not gated behind the "still working" delay', async () => {
     matchDeckImage.mockImplementation(() => new Promise(() => {})) // never settles in this test
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
-    expect(screen.queryByText('decks.scan.cancel')).not.toBeInTheDocument()
+    expect(screen.getByText('decks.scan.cancel')).toBeInTheDocument()
+    // The "still working" reassurance is still delayed — only the ability
+    // to back out is immediate.
+    expect(screen.queryByText(/Still working/)).not.toBeInTheDocument()
 
     await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
     expect(screen.getByText('decks.scan.cancel')).toBeInTheDocument()
+    expect(screen.getByText(/Still working/)).toBeInTheDocument()
   })
 
   it('cancelling a long-running match returns to hunting without ever falling through to the paid call', async () => {
@@ -544,8 +592,8 @@ describe('DeckCardScanner', () => {
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     await advanceTicks(REQUIRED_STABLE_FRAMES)
-    await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
-
+    // No delay first — the button is available immediately, not just once
+    // processing has been running a while.
     await act(async () => {
       fireEvent.click(screen.getByText('decks.scan.cancel'))
       await Promise.resolve()

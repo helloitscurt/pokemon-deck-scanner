@@ -8,7 +8,7 @@ import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
 import { useCameraStream } from '../hooks/useCameraStream'
 import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } from '../utils/cardDetection'
 import { lastOcrRawText, lastOcrWords, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
-import { createStabilityTracker } from '../utils/quadStability'
+import { createStabilityTracker, quadsAreStable } from '../utils/quadStability'
 
 // Real-device tuning, three passes: first (5 frames @ 2% tolerance @
 // 180ms = 900ms dwell) felt slow and twitchy — ordinary jitter from
@@ -142,13 +142,28 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   const tickInFlightRef = useRef(false)
   const cameraFallbackLockedRef = useRef(false)
   const timersRef = useRef([])
-  // Set right after a successful auto-save; cleared the first time a
-  // detection tick sees no card at all. Without this, a still-sitting card
-  // the user hasn't physically moved away yet gets auto-detected as stable
-  // again within a few hundred ms of returning to 'hunting' — a real,
-  // observed redundant re-scan of an already-saved card (see build step 8/11
-  // real-device notes), not a hypothetical.
-  const awaitingCardRemovalRef = useRef(false)
+  // Set to the just-captured quad (detection-frame coordinates) right after
+  // a successful auto-save; cleared the first time a detection tick sees
+  // either no card at all, or a quad that has moved away from the captured
+  // one. Without this, a still-sitting card the user hasn't physically
+  // moved away yet gets auto-detected as stable again within a few hundred
+  // ms of returning to 'hunting' — a real, observed redundant re-scan of an
+  // already-saved card (see build step 8/11 real-device notes).
+  //
+  // Comparing against the captured quad's position (not just "is any quad
+  // present") matters because a fast card swap — the next card slid in
+  // before the previous one is fully out of frame — never produces a
+  // literal empty frame. With a plain boolean cleared only on "no quad",
+  // that left this permanently blocking capture until the scanner was
+  // closed and reopened (real-device report: works fine for the first few
+  // cards, then silently stops auto-capturing entirely).
+  const awaitingCardRemovalRef = useRef(null)
+  // The detection-frame quad a capture was just attempted against — read by
+  // enterSuccessCooldown to seed awaitingCardRemovalRef above. Kept
+  // separate from the native-resolution quad captureAndRecognize works
+  // with (see scaleQuad calls below); this one stays in the same
+  // detection-frame coordinate space the tick loop's own comparisons use.
+  const pendingCaptureQuadRef = useRef(null)
 
   // hunting | processing | ambiguous | success | error | cameraDenied
   const [phase, setPhase] = useState('hunting')
@@ -193,7 +208,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   useEffect(() => {
     if (!isOpen) return
     cameraFallbackLockedRef.current = false
-    awaitingCardRemovalRef.current = false
+    awaitingCardRemovalRef.current = null
     setResult(null)
     setError(null)
     setConfirmError(null)
@@ -225,7 +240,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     setError(null)
     setPhase('success')
     setShowCheckmark(true)
-    awaitingCardRemovalRef.current = true
+    awaitingCardRemovalRef.current = pendingCaptureQuadRef.current
     timersRef.current.push(setTimeout(() => setShowCheckmark(false), CHECKMARK_DURATION_MS))
     timersRef.current.push(setTimeout(() => {
       stabilityTrackerRef.current.reset()
@@ -460,7 +475,14 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
         detectionCanvas.getContext('2d').drawImage(video, 0, 0, detectionWidth, detectionHeight)
 
         const quad = await detectCardQuad(detectionCanvas)
-        if (!quad) awaitingCardRemovalRef.current = false
+        if (!quad) {
+          awaitingCardRemovalRef.current = null
+        } else if (
+          awaitingCardRemovalRef.current
+          && !quadsAreStable(awaitingCardRemovalRef.current, quad, detectionWidth, detectionHeight, STABILITY_TOLERANCE_PROPORTION)
+        ) {
+          awaitingCardRemovalRef.current = null
+        }
         const { consecutiveStableFrames, readyToCapture } = stabilityTrackerRef.current.observe(
           quad, detectionWidth, detectionHeight,
         )
@@ -479,6 +501,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
           captureCanvas.height = video.videoHeight
           captureCanvas.getContext('2d').drawImage(video, 0, 0)
           const nativeQuad = scaleQuad(quad, video.videoWidth / detectionWidth, video.videoHeight / detectionHeight)
+          pendingCaptureQuadRef.current = quad
           await captureAndRecognize(captureCanvas, nativeQuad)
         }
       } catch (err) {
@@ -542,11 +565,8 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
       className="fixed inset-0 z-[200] flex flex-col"
       style={{ background: 'rgba(0,0,0,0.95)', backdropFilter: 'blur(8px)', WebkitBackdropFilter: 'blur(8px)' }}
     >
-      <div className="flex items-center justify-between px-4 pt-6 pb-4 flex-shrink-0">
-        <div>
-          <p className="text-[10px] text-text-muted uppercase tracking-[0.2em]">{t('decks.scan.title')}</p>
-          <h2 className="text-lg font-black text-white">{t('decks.scan.subtitle')}</h2>
-        </div>
+      <div className="flex items-center justify-between px-4 pt-4 pb-2 flex-shrink-0">
+        <p className="text-[10px] text-text-muted uppercase tracking-[0.2em]">{t('decks.scan.title')}</p>
         <button
           onClick={handleClose}
           aria-label={t('common.close')}
@@ -608,23 +628,24 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                       working, not stuck, so say so rather than leaving a
                       bare spinner that looks identical to hung. */}
                   {processingSeconds >= 15 && (
-                    <>
-                      <p className="text-sm text-white/90 max-w-[220px] text-center">
-                        Still working — the recognition service may be slow right now.
-                      </p>
-                      {/* btn-ghost's text-text-secondary assumes a light
-                          background — unreadable on this dark overlay, same
-                          issue already fixed for the text above it. Styled
-                          explicitly instead of reusing that class. */}
-                      <button
-                        type="button"
-                        onClick={cancelProcessing}
-                        className="px-4 py-2 rounded-lg text-sm font-medium text-white border border-white/30 hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 transition-colors"
-                      >
-                        {t('decks.scan.cancel')}
-                      </button>
-                    </>
+                    <p className="text-sm text-white/90 max-w-[220px] text-center">
+                      Still working — the recognition service may be slow right now.
+                    </p>
                   )}
+                  {/* Visible from the moment processing starts, not gated
+                      behind the "still working" delay — a real request in
+                      flight, so it should always be possible to back out.
+                      btn-ghost's text-text-secondary assumes a light
+                      background — unreadable on this dark overlay, same
+                      issue already fixed for the text above it. Styled
+                      explicitly instead of reusing that class. */}
+                  <button
+                    type="button"
+                    onClick={cancelProcessing}
+                    className="px-4 py-2 rounded-lg text-sm font-medium text-white border border-white/30 hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 transition-colors"
+                  >
+                    {t('decks.scan.cancel')}
+                  </button>
                 </div>
               )}
 
@@ -646,8 +667,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
 
             {/* Temporary on-device diagnostic readout — no devtools access on
                 a phone, and the detection loop previously failed completely
-                silently (see cardDetection.js's detectionStatus comment). */}
-            <div className="text-sm font-mono text-white/90 text-center max-w-xs leading-relaxed break-words">
+                silently (see cardDetection.js's detectionStatus comment).
+                Widened to match the video's own max-w-sm (was max-w-xs) and
+                given longer text/word slices below — freed up by dropping
+                the header subtitle line, and this is the thing the user is
+                actually watching while positioning a card. */}
+            <div className="text-sm font-mono text-white/90 text-center max-w-sm leading-relaxed break-words">
               cam:{cameraStatus} lib:{debugInfo.libState || 'idle'} ticks:{debugInfo.tickCount}
               {debugInfo.libError && <><br />lib error: {debugInfo.libError}</>}
               {debugInfo.ocrName !== undefined && (
@@ -655,7 +680,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
               )}
               {debugInfo.ocrRawText !== undefined && (
                 <><br />ocr raw:{debugInfo.ocrRawText.trim()
-                  ? JSON.stringify(debugInfo.ocrRawText.replace(/\s+/g, ' ').trim().slice(0, 150))
+                  ? JSON.stringify(debugInfo.ocrRawText.replace(/\s+/g, ' ').trim().slice(0, 220))
                   : '(empty)'}</>
               )}
               {debugInfo.ocrWords !== undefined && (
@@ -666,8 +691,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                     // would have preferred if position let it through.
                     // A real card produced more than fit in the earlier
                     // line-level view's smaller slice, hiding the very
-                    // word that mattered — 12 gives more headroom.
-                    .slice().sort((a, b) => b.confidence - a.confidence).slice(0, 12)
+                    // word that mattered — 16 gives more headroom (wider
+                    // readout now, see the container's own comment above).
+                    .slice().sort((a, b) => b.confidence - a.confidence).slice(0, 16)
                     .map((w) => `"${w.text.slice(0, 15)}"@y${w.y0}(${w.confidence})`)
                     .join(' ')}</>
               )}

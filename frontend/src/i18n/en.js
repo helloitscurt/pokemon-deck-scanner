@@ -452,7 +452,6 @@ const en = {
     },
     scan: {
       title: 'Scan a card',
-      subtitle: 'Point your camera at a card from this deck.',
       takePhoto: 'Take photo',
       identifying: 'Identifying card…',
       failed: 'Could not identify this card. Try again.',
