@@ -112,6 +112,48 @@ def _missing_deck_cards(db: Session, instance: DeckInstance) -> list[Card]:
     return db.query(Card).filter(Card.id.in_(missing_ids)).all()
 
 
+def _levenshtein(a: str, b: str) -> int:
+    """Classic edit distance (insert/delete/substitute), O(len(a)*len(b))
+    with only the previous row kept — fine here since both inputs are a
+    single card name and a short OCR'd window, never catalog-scale."""
+    if a == b:
+        return 0
+    if not a:
+        return len(b)
+    if not b:
+        return len(a)
+    previous_row = list(range(len(b) + 1))
+    for i, ca in enumerate(a, start=1):
+        current_row = [i] + [0] * len(b)
+        for j, cb in enumerate(b, start=1):
+            current_row[j] = min(
+                previous_row[j] + 1,
+                current_row[j - 1] + 1,
+                previous_row[j - 1] + (0 if ca == cb else 1),
+            )
+        previous_row = current_row
+    return previous_row[-1]
+
+
+def _fuzzy_name_in(name: str, target: str) -> bool:
+    """Approximate substring containment, tolerant of a small number of
+    OCR misreads inside the name itself (e.g. Tesseract reading
+    "Picnicker" as "Picnicken") — not just noise words around it, which
+    plain `in` containment already handled. Allowed edit distance scales
+    with name length so short names ("Ivysaur") still need a near-exact
+    hit; a single wrong character is proportionally more likely to sink
+    a long, uncommon word than a short one, so tolerance widens with
+    length rather than using one fixed threshold for every name."""
+    max_distance = 0 if len(name) <= 3 else 1 if len(name) <= 8 else 2
+    if max_distance == 0:
+        return name in target
+    for window_len in range(max(1, len(name) - max_distance), len(name) + max_distance + 1):
+        for start in range(len(target) - window_len + 1):
+            if _levenshtein(name, target[start:start + window_len]) <= max_distance:
+                return True
+    return False
+
+
 def _deck_card_candidate(card: Card) -> dict:
     """Shapes a Card row into the {id, image, ...} dict services/phash.py's
     download_candidate_images/phash_best_match expect — the same shape
@@ -389,17 +431,17 @@ async def match_deck_image(
                 decision = "deck_number_unique"
 
         if winner is None and name:
-            # Substring, not equality — OCR's name output can include
+            # Fuzzy substring, not equality — OCR's name output can include
             # adjacent noise words it couldn't confidently drop (see
             # cardOcr.js's pickCardName), e.g. a real "Potion" card OCR'd
-            # as "bern PRALINE Fe Potion". A card's own short, clean name
-            # showing up anywhere inside that noisier string is still a
-            # real signal a flat equality check would have missed
-            # entirely.
+            # as "bern PRALINE Fe Potion", and can also misread a character
+            # inside the name itself (e.g. "Picnicker" -> "Picnicken"). A
+            # flat equality check missed the first; a strict substring
+            # check still missed the second. See _fuzzy_name_in.
             target = name.casefold()
             name_matches = [
                 c for c in candidates
-                if c["name"] and c["name"].casefold() in target
+                if c["name"] and _fuzzy_name_in(c["name"].casefold(), target)
             ]
             # Same uniqueness requirement as the number tier — an
             # ambiguous substring match (e.g. two candidates whose names

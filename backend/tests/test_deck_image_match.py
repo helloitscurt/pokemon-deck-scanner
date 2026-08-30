@@ -167,6 +167,24 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["matches"][0]["id"], self.card_a.id)
         self.assertEqual(result["_identity_decision"], "deck_name_unique")
 
+    async def test_falls_back_to_a_unique_name_match_despite_a_single_character_ocr_misread(self):
+        # OCR's other real-device failure mode: a misread character
+        # *inside* the name itself, not just noise around it (e.g.
+        # Tesseract reading "Picnicker" as "Picnicken"). A strict
+        # substring check would miss this entirely; a small edit-distance
+        # tolerance should still resolve it uniquely.
+        self._mark_scanned(self.card_b.id)
+        self._mark_scanned(self.card_c.id)
+        with patch("api.decks.download_candidate_images", new=AsyncMock(return_value={})):
+            result = await match_deck_image(
+                self.instance.id, file=_upload(7), number_local=None,
+                name="bern PRALINE Fe Sprigadito", source=None,
+                current_user=self.user, db=self.db,
+            )
+        self.assertTrue(result["_identity_confident"])
+        self.assertEqual(result["matches"][0]["id"], self.card_a.id)
+        self.assertEqual(result["_identity_decision"], "deck_name_unique")
+
     async def test_does_not_trust_an_ambiguous_name_substring_match(self):
         # Two of this deck's still-missing cards both happen to have their
         # name contained in the OCR'd text — must not guess between them.
