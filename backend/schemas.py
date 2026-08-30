@@ -195,6 +195,12 @@ class CollectionItemResponse(BaseModel):
     # "already_complete", "not_in_deck", or unset/None for a plain add with
     # no deck instance involved at all.
     deck_scan_status: Optional[str] = None
+    # Only ever set alongside deck_scan_status == "already_complete" — the
+    # deck's expected quantity for this card (scanned_quantity is always
+    # equal to it in that state, capped by register_scan). The scan UI uses
+    # this to say e.g. "4/4 Pikachu already scanned" instead of just naming
+    # the status.
+    deck_scan_quantity: Optional[int] = None
 
     class Config:
         from_attributes = True

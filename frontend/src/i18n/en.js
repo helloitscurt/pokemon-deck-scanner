@@ -470,10 +470,8 @@ const en = {
       undo: 'Undo',
       undone: 'Scan undone.',
       undoFailed: 'Couldn’t undo — check your connection and try again.',
-      notInDeck: 'Not in this deck',
       notInDeckDetail: 'isn’t part of this deck — still added to your collection.',
-      alreadyComplete: 'Already have enough',
-      alreadyCompleteDetail: 'you already have enough of these for this deck.',
+      alreadyCompleteDetail: 'already scanned',
     },
   },
 

@@ -6,7 +6,7 @@ api/collection.py's ensure_card_exists is the natural direction (a niche
 feature reaching into the core collection module), not the other way around.
 """
 import datetime
-from typing import Optional
+from typing import Optional, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -23,13 +23,19 @@ SCAN_ALREADY_COMPLETE = "already_complete"
 SCAN_NOT_IN_DECK = "not_in_deck"
 
 
-def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str, quantity: int = 1) -> Optional[str]:
+def register_scan(
+    db: Session, user_id: int, deck_instance_id: int, card_id: str, quantity: int = 1,
+) -> Tuple[Optional[str], Optional[int]]:
     """Count a confirmed collection add toward one deck instance's scan progress.
 
-    Returns which of the SCAN_* outcomes above applied, or None if the instance
-    isn't this user's (shouldn't happen in practice — the scanner always sends a
-    real instance id — but there's no scan-progress outcome to report either
-    way). A NOT_IN_DECK or ALREADY_COMPLETE card still lands in the general
+    Returns (status, expected_quantity) — status is one of the SCAN_* outcomes
+    above, or None if the instance isn't this user's (shouldn't happen in
+    practice — the scanner always sends a real instance id — but there's no
+    scan-progress outcome to report either way). expected_quantity is only
+    ever populated alongside SCAN_ALREADY_COMPLETE (scanned_quantity always
+    equals it there, capped by the increment logic below) — the scan UI needs
+    it to say e.g. "4/4 Pikachu already scanned" rather than just naming the
+    status. A NOT_IN_DECK or ALREADY_COMPLETE card still lands in the general
     collection (see api/collection.py), it just doesn't move deck progress.
     """
     instance = db.query(DeckInstance).filter(
@@ -37,14 +43,14 @@ def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str
         DeckInstance.user_id == user_id,
     ).first()
     if not instance:
-        return None
+        return None, None
 
     deck_card = db.query(DeckCard).filter(
         DeckCard.deck_id == instance.deck_id,
         DeckCard.card_id == card_id,
     ).first()
     if not deck_card:
-        return SCAN_NOT_IN_DECK
+        return SCAN_NOT_IN_DECK, None
 
     now = datetime.datetime.utcnow()
     scanned = db.query(ScannedCard).filter(
@@ -54,7 +60,7 @@ def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str
     if scanned and scanned.scanned_quantity >= deck_card.expected_quantity:
         scanned.last_scanned_at = now
         db.commit()
-        return SCAN_ALREADY_COMPLETE
+        return SCAN_ALREADY_COMPLETE, deck_card.expected_quantity
 
     if scanned:
         scanned.scanned_quantity = min(scanned.scanned_quantity + quantity, deck_card.expected_quantity)
@@ -67,7 +73,7 @@ def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str
             last_scanned_at=now,
         ))
     db.commit()
-    return SCAN_COUNTED
+    return SCAN_COUNTED, None
 
 
 def unregister_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str, quantity: int = 1) -> bool:

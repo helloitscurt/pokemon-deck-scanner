@@ -102,15 +102,19 @@ export default function DeckDetail() {
       // an unrelated earlier scan (already_complete).
       const deckScanStatus = response.data.deck_scan_status
       if (deckScanStatus === 'not_in_deck' || deckScanStatus === 'already_complete') {
-        const detailKey = deckScanStatus === 'not_in_deck' ? 'decks.scan.notInDeckDetail' : 'decks.scan.alreadyCompleteDetail'
-        // 10s, double the other toasts here (5s) — a warning needs real
-        // reading time, not just a glance.
+        // e.g. "4/4 Pikachu already scanned" — deck_scan_quantity (the
+        // deck's expected_quantity, see register_scan) is only ever set
+        // alongside 'already_complete'; scanned_quantity always equals it
+        // in that state, so one number covers both sides of the fraction.
+        const warningText = deckScanStatus === 'already_complete'
+          ? `${response.data.deck_scan_quantity}/${response.data.deck_scan_quantity} ${candidate.name} ${t('decks.scan.alreadyCompleteDetail')}`
+          : `${candidate.name} ${t('decks.scan.notInDeckDetail')}`
         toast(() => (
           <span className="flex items-center gap-2">
             <AlertTriangle size={16} className="flex-shrink-0 text-yellow" />
-            <span className="min-w-0 flex-1 text-yellow">{candidate.name} {t(detailKey)}</span>
+            <span className="min-w-0 flex-1 text-yellow">{warningText}</span>
           </span>
-        ), { duration: 10000, style: { border: '1px solid #eab308' } })
+        ), { duration: 7000, style: { border: '1px solid #eab308' } })
         return
       }
       if (!isAutoSave) {

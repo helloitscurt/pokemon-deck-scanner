@@ -197,7 +197,7 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).toHaveBeenCalledTimes(1)
   })
 
-  it('shows a distinct warning (not the green checkmark) when the save did not count toward deck progress', async () => {
+  it('shows a distinct warning (not the green checkmark) naming the card when the save did not count toward deck progress', async () => {
     // onConfirm resolves with the axios response add_to_collection actually
     // returns — deck_scan_status is set only when the scan didn't move deck
     // progress (see backend services/deck_progress.py's SCAN_* constants).
@@ -214,18 +214,81 @@ describe('DeckCardScanner', () => {
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(screen.queryByLabelText('decks.scan.captured')).not.toBeInTheDocument()
-    expect(screen.getByLabelText('decks.scan.notInDeck')).toBeInTheDocument()
-    expect(screen.getByText('decks.scan.notInDeck')).toBeInTheDocument()
+    // "Pikachu decks.scan.notInDeckDetail" — t is mocked to identity, so
+    // the translated suffix comes through as its own raw key.
+    expect(screen.getByText(/Pikachu decks\.scan\.notInDeckDetail/)).toBeInTheDocument()
 
-    // Double the plain checkmark's hold (900ms + 600ms cooldown = 1500ms
-    // total) — a warning needs real reading time. Still up at the point a
-    // checkmark would already be long gone...
-    await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
-    expect(screen.getByLabelText('decks.scan.notInDeck')).toBeInTheDocument()
+    // 1.5x the plain checkmark's hold (900ms * 1.5 = 1350ms) — a warning
+    // needs real reading time. Still up at the point a checkmark (900ms)
+    // would already be long gone...
+    await act(async () => { await vi.advanceTimersByTimeAsync(1200) })
+    expect(screen.getByText(/Pikachu decks\.scan\.notInDeckDetail/)).toBeInTheDocument()
 
-    // ...but gone by its own full duration (1800ms hold + 600ms cooldown).
-    await act(async () => { await vi.advanceTimersByTimeAsync(900) })
-    expect(screen.queryByLabelText('decks.scan.notInDeck')).not.toBeInTheDocument()
+    // ...but gone by its own full 1350ms hold.
+    await act(async () => { await vi.advanceTimersByTimeAsync(300) })
+    expect(screen.queryByText(/Pikachu decks\.scan\.notInDeckDetail/)).not.toBeInTheDocument()
+  })
+
+  it('shows the deck quantity in the warning for a card already at its expected quantity', async () => {
+    onConfirm.mockResolvedValue({
+      data: { card_id: 'p1', deck_scan_status: 'already_complete', deck_scan_quantity: 4 },
+    })
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-abc123',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    // "4/4 Pikachu decks.scan.alreadyCompleteDetail" — deck_scan_quantity
+    // covers both sides of the fraction (scanned_quantity always equals it
+    // in this state, see register_scan).
+    expect(screen.getByText(/4\/4 Pikachu decks\.scan\.alreadyCompleteDetail/)).toBeInTheDocument()
+  })
+
+  it('keeps the video feed live behind a warning, unlike the frozen frame behind the green checkmark', async () => {
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-abc123',
+    })
+
+    // Baseline: the green-checkmark path still freezes the feed — real-device
+    // report was specifically about the warning, not this.
+    onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled()
+    cleanup()
+    vi.clearAllMocks()
+
+    // The warning path: the feed must keep playing underneath it.
+    onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'not_in_deck' } })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    expect(HTMLMediaElement.prototype.pause).not.toHaveBeenCalled()
+  })
+
+  it('dismisses the warning early on tap, returning straight to hunting', async () => {
+    onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'not_in_deck' } })
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-abc123',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    const warning = screen.getByText(/Pikachu decks\.scan\.notInDeckDetail/)
+
+    await act(async () => { fireEvent.click(warning) })
+
+    // Gone well before WARNING_DURATION_MS (1350ms) would have elapsed on
+    // its own — a tap ends it immediately, not just shortens the wait.
+    expect(screen.queryByText(/Pikachu decks\.scan\.notInDeckDetail/)).not.toBeInTheDocument()
+    expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
   })
 
   it('does not immediately re-capture the same still-visible card right after a successful auto-save', async () => {

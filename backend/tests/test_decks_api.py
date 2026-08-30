@@ -191,6 +191,7 @@ class DeckTrackingApiTests(unittest.TestCase):
             db=self.db,
         )
         self.assertEqual(result.deck_scan_status, "counted")
+        self.assertIsNone(result.deck_scan_quantity)
         progress = get_deck_instance(instance.id, current_user=self.user, db=self.db)
         self.assertEqual(progress.scanned_count, 1)
 
@@ -207,6 +208,7 @@ class DeckTrackingApiTests(unittest.TestCase):
             db=self.db,
         )
         self.assertEqual(result.deck_scan_status, "not_in_deck")
+        self.assertIsNone(result.deck_scan_quantity)
         self.assertEqual(result.quantity, 1)  # still added to the general collection
         progress = get_deck_instance(instance.id, current_user=self.user, db=self.db)
         self.assertEqual(progress.scanned_count, 0)
@@ -227,6 +229,7 @@ class DeckTrackingApiTests(unittest.TestCase):
             db=self.db,
         )
         self.assertEqual(result.deck_scan_status, "already_complete")
+        self.assertEqual(result.deck_scan_quantity, 1)  # card_a's expected_quantity
         self.assertEqual(result.quantity, 2)  # still added to the general collection
         progress = get_deck_instance(instance.id, current_user=self.user, db=self.db)
         card_a_row = next(c for c in progress.cards if c.card_id == self.card_a.id)

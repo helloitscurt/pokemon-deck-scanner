@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Response
 from sqlalchemy import func, or_
 from sqlalchemy.orm import Session, joinedload
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from api.auth import get_current_user
 from database import get_db
 from models import BinderCard, CollectionItem, CollectionCardPhoto, Card, ProductCard, ProductPurchase, Set, User
@@ -108,12 +108,15 @@ def find_matching_collection_item(
     ).first()
 
 
-def _apply_deck_scan(db: Session, current_user: User, item: CollectionItemCreate, effective_card_id: str) -> Optional[str]:
+def _apply_deck_scan(
+    db: Session, current_user: User, item: CollectionItemCreate, effective_card_id: str,
+) -> Tuple[Optional[str], Optional[int]]:
     """Update deck-instance progress for a confirmed collection add, if requested.
 
-    Returns register_scan's outcome (see services/deck_progress.py's SCAN_*
-    constants) so the caller can surface it in the response, or None if no
-    deck instance was targeted or the update failed.
+    Returns register_scan's (status, expected_quantity) outcome (see
+    services/deck_progress.py's SCAN_* constants) so the caller can surface it
+    in the response, or (None, None) if no deck instance was targeted or the
+    update failed.
 
     A failure here must never make an already-committed collection add look
     like it failed — this is a secondary effect of the add, not part of it.
@@ -122,7 +125,7 @@ def _apply_deck_scan(db: Session, current_user: User, item: CollectionItemCreate
     mis-report a successfully added card as failed.
     """
     if not item.deck_instance_id:
-        return None
+        return None, None
     try:
         return register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
     except Exception:
@@ -130,7 +133,7 @@ def _apply_deck_scan(db: Session, current_user: User, item: CollectionItemCreate
             "Failed to update deck instance %s progress for card %s",
             item.deck_instance_id, effective_card_id,
         )
-        return None
+        return None, None
 
 
 def _annotate_product_sources(db: Session, current_user: User, items: list[CollectionItem]) -> list[CollectionItem]:
@@ -602,7 +605,7 @@ def add_to_collection(
         existing.quantity += item.quantity or 1
         db.commit()
         db.refresh(existing)
-        existing.deck_scan_status = _apply_deck_scan(db, current_user, item, effective_card_id)
+        existing.deck_scan_status, existing.deck_scan_quantity = _apply_deck_scan(db, current_user, item, effective_card_id)
         return _annotate_collection_item(db, current_user, existing)
     else:
         db_item = CollectionItem(
@@ -618,7 +621,7 @@ def add_to_collection(
         db.add(db_item)
         db.commit()
         db.refresh(db_item)
-        db_item.deck_scan_status = _apply_deck_scan(db, current_user, item, effective_card_id)
+        db_item.deck_scan_status, db_item.deck_scan_quantity = _apply_deck_scan(db, current_user, item, effective_card_id)
         return _annotate_collection_item(db, current_user, db_item)
 
 

@@ -135,8 +135,9 @@ describe('DeckDetail scan confirmation toasts', () => {
     expect(toast.success).not.toHaveBeenCalled()
     expect(toast).toHaveBeenCalledTimes(1)
     const [ToastContent, options] = toast.mock.calls[0]
-    // Double the plain/Undo toasts' 5s — a warning needs real reading time.
-    expect(options).toMatchObject({ duration: 10000 })
+    // 7s, longer than the plain/Undo toasts' 5s — a warning needs real
+    // reading time.
+    expect(options).toMatchObject({ duration: 7000 })
     render(<ToastContent />)
     expect(screen.getByText(/Mewtwo/)).toBeInTheDocument()
     expect(screen.getByText(/decks\.scan\.notInDeckDetail/)).toBeInTheDocument()
@@ -145,8 +146,8 @@ describe('DeckDetail scan confirmation toasts', () => {
     expect(screen.queryByText('decks.scan.undo')).not.toBeInTheDocument()
   })
 
-  it('shows a warning toast for a manual pick already at its expected quantity', async () => {
-    addToCollection.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'already_complete' } })
+  it('shows a warning toast with the deck quantity for a manual pick already at its expected quantity', async () => {
+    addToCollection.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'already_complete', deck_scan_quantity: 4 } })
     await renderLoaded()
 
     await act(async () => {
@@ -157,8 +158,9 @@ describe('DeckDetail scan confirmation toasts', () => {
     expect(toast).toHaveBeenCalledTimes(1)
     const ToastContent = toast.mock.calls[0][0]
     render(<ToastContent />)
-    expect(screen.getByText(/Charmander/)).toBeInTheDocument()
-    expect(screen.getByText(/decks\.scan\.alreadyCompleteDetail/)).toBeInTheDocument()
+    // "4/4 Charmander already scanned" — deck_scan_quantity covers both
+    // sides of the fraction (scanned_quantity always equals it here).
+    expect(screen.getByText(/4\/4 Charmander decks\.scan\.alreadyCompleteDetail/)).toBeInTheDocument()
   })
 
   it('still adds the card to the collection even when the scan does not count toward the deck', async () => {
