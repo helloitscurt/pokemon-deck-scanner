@@ -33,7 +33,7 @@ const CHECKMARK_DURATION_MS = 900
 // dismissible early with a tap (see the warning overlay's onClick below),
 // so a longer default here doesn't cost anything when the user's ready to
 // move on sooner.
-const WARNING_DURATION_MS = CHECKMARK_DURATION_MS * 1.5
+const WARNING_DURATION_MS = 4000
 const COOLDOWN_AFTER_CHECKMARK_MS = 600
 // Detection runs on a downscaled frame — full contour detection on a native
 // camera resolution every ~180ms is too slow for a phone browser. The crop

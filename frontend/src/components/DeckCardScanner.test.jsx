@@ -218,13 +218,12 @@ describe('DeckCardScanner', () => {
     // the translated suffix comes through as its own raw key.
     expect(screen.getByText(/Pikachu decks\.scan\.notInDeckDetail/)).toBeInTheDocument()
 
-    // 1.5x the plain checkmark's hold (900ms * 1.5 = 1350ms) — a warning
-    // needs real reading time. Still up at the point a checkmark (900ms)
-    // would already be long gone...
-    await act(async () => { await vi.advanceTimersByTimeAsync(1200) })
+    // 4s hold — a warning needs real reading time. Still up at the point a
+    // checkmark (900ms) would already be long gone...
+    await act(async () => { await vi.advanceTimersByTimeAsync(3700) })
     expect(screen.getByText(/Pikachu decks\.scan\.notInDeckDetail/)).toBeInTheDocument()
 
-    // ...but gone by its own full 1350ms hold.
+    // ...but gone by its own full 4s hold.
     await act(async () => { await vi.advanceTimersByTimeAsync(300) })
     expect(screen.queryByText(/Pikachu decks\.scan\.notInDeckDetail/)).not.toBeInTheDocument()
   })
@@ -285,8 +284,8 @@ describe('DeckCardScanner', () => {
 
     await act(async () => { fireEvent.click(warning) })
 
-    // Gone well before WARNING_DURATION_MS (1350ms) would have elapsed on
-    // its own — a tap ends it immediately, not just shortens the wait.
+    // Gone well before WARNING_DURATION_MS (4s) would have elapsed on its
+    // own — a tap ends it immediately, not just shortens the wait.
     expect(screen.queryByText(/Pikachu decks\.scan\.notInDeckDetail/)).not.toBeInTheDocument()
     expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
   })
