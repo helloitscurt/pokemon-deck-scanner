@@ -10,18 +10,21 @@ import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } fr
 import { lastOcrRawText, lastOcrWords, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
 import { createStabilityTracker } from '../utils/quadStability'
 
-const DETECTION_INTERVAL_MS = 180
-// Real-device finding: the default 5 frames at the default 2% corner-
-// movement tolerance (quadStability.js) made capture feel slow and
-// twitchy — normal frame-to-frame jitter from lighting/shadows on a
-// downscaled 480px-wide detection frame routinely exceeded a ~10px
-// tolerance, resetting the stability streak before it ever reached 5.
-// Loosened both: a real card repositioning still moves corners by far
-// more than either threshold allows, so this doesn't meaningfully risk
-// capturing mid-motion, just tolerates the jitter that was never actually
-// motion.
+// Real-device tuning, twice: first pass (5 frames @ 2% tolerance @ 180ms)
+// felt slow and twitchy — ordinary jitter from lighting/shadows on the
+// downscaled 480px-wide detection frame kept exceeding tolerance and
+// resetting the streak. Second pass loosened both but was still too slow
+// overall — halving the tick interval (180ms -> 90ms) directly halves the
+// minimum stable-hold time for the SAME 3-frame requirement (270ms vs
+// 540ms) without weakening reliability by also demanding fewer confirming
+// reads; tickInFlightRef already self-throttles if a device can't keep up
+// with 90ms ticks, so this degrades gracefully rather than piling up work.
+// Tolerance loosened further too (4% -> 7%) — a real card repositioning
+// still moves corners far past either threshold, so neither change
+// meaningfully risks capturing mid-motion.
+const DETECTION_INTERVAL_MS = 90
 const REQUIRED_STABLE_FRAMES = 3
-const STABILITY_TOLERANCE_PROPORTION = 0.04
+const STABILITY_TOLERANCE_PROPORTION = 0.07
 const CHECKMARK_DURATION_MS = 900
 const COOLDOWN_AFTER_CHECKMARK_MS = 600
 // Detection runs on a downscaled frame — full contour detection on a native
