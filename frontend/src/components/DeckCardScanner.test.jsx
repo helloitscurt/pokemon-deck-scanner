@@ -197,6 +197,27 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).toHaveBeenCalledTimes(1)
   })
 
+  it('shows a distinct warning (not the green checkmark) when the save did not count toward deck progress', async () => {
+    // onConfirm resolves with the axios response add_to_collection actually
+    // returns — deck_scan_status is set only when the scan didn't move deck
+    // progress (see backend services/deck_progress.py's SCAN_* constants).
+    // A silent identical-looking checkmark here was the exact bug report:
+    // no way to tell an off-deck/duplicate scan apart from a real match.
+    onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'not_in_deck' } })
+    recognizeCard.mockResolvedValue({
+      _identity_confident: true,
+      matches: [{ id: 'p1', name: 'Pikachu' }],
+      trace_id: 'trace-abc123',
+    })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(screen.queryByLabelText('decks.scan.captured')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('decks.scan.notInDeck')).toBeInTheDocument()
+    expect(screen.getByText('decks.scan.notInDeck')).toBeInTheDocument()
+  })
+
   it('does not immediately re-capture the same still-visible card right after a successful auto-save', async () => {
     // Real-device finding: a card the user hasn't physically moved away yet
     // was getting auto-detected as stable again within ~3s of a successful

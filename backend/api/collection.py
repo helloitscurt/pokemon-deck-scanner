@@ -108,8 +108,12 @@ def find_matching_collection_item(
     ).first()
 
 
-def _apply_deck_scan(db: Session, current_user: User, item: CollectionItemCreate, effective_card_id: str) -> None:
+def _apply_deck_scan(db: Session, current_user: User, item: CollectionItemCreate, effective_card_id: str) -> Optional[str]:
     """Update deck-instance progress for a confirmed collection add, if requested.
+
+    Returns register_scan's outcome (see services/deck_progress.py's SCAN_*
+    constants) so the caller can surface it in the response, or None if no
+    deck instance was targeted or the update failed.
 
     A failure here must never make an already-committed collection add look
     like it failed — this is a secondary effect of the add, not part of it.
@@ -118,14 +122,15 @@ def _apply_deck_scan(db: Session, current_user: User, item: CollectionItemCreate
     mis-report a successfully added card as failed.
     """
     if not item.deck_instance_id:
-        return
+        return None
     try:
-        register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
+        return register_scan(db, current_user.id, item.deck_instance_id, effective_card_id, item.quantity or 1)
     except Exception:
         logger.exception(
             "Failed to update deck instance %s progress for card %s",
             item.deck_instance_id, effective_card_id,
         )
+        return None
 
 
 def _annotate_product_sources(db: Session, current_user: User, items: list[CollectionItem]) -> list[CollectionItem]:
@@ -597,7 +602,7 @@ def add_to_collection(
         existing.quantity += item.quantity or 1
         db.commit()
         db.refresh(existing)
-        _apply_deck_scan(db, current_user, item, effective_card_id)
+        existing.deck_scan_status = _apply_deck_scan(db, current_user, item, effective_card_id)
         return _annotate_collection_item(db, current_user, existing)
     else:
         db_item = CollectionItem(
@@ -613,7 +618,7 @@ def add_to_collection(
         db.add(db_item)
         db.commit()
         db.refresh(db_item)
-        _apply_deck_scan(db, current_user, item, effective_card_id)
+        db_item.deck_scan_status = _apply_deck_scan(db, current_user, item, effective_card_id)
         return _annotate_collection_item(db, current_user, db_item)
 
 

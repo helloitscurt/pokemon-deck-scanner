@@ -6,39 +6,56 @@ api/collection.py's ensure_card_exists is the natural direction (a niche
 feature reaching into the core collection module), not the other way around.
 """
 import datetime
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
 from models import DeckCard, DeckInstance, ScannedCard
 
+# register_scan's return values — surfaced all the way up to the scan UI
+# (see api/collection.py's CollectionItemResponse.deck_scan_status) so a
+# card that didn't actually move deck progress can be flagged instead of
+# looking identical to one that did. Real-device finding: silently no-oping
+# here (the previous behavior) meant an off-deck or already-complete card
+# got the exact same "Scanned" toast as a card that filled a missing slot.
+SCAN_COUNTED = "counted"
+SCAN_ALREADY_COMPLETE = "already_complete"
+SCAN_NOT_IN_DECK = "not_in_deck"
 
-def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str, quantity: int = 1) -> None:
+
+def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str, quantity: int = 1) -> Optional[str]:
     """Count a confirmed collection add toward one deck instance's scan progress.
 
-    Silently no-ops if the instance isn't this user's, or the card isn't part of
-    that deck's template — a scanned card that doesn't match the active deck
-    still lands in the general collection (see api/collection.py), it just
-    doesn't move deck progress.
+    Returns which of the SCAN_* outcomes above applied, or None if the instance
+    isn't this user's (shouldn't happen in practice — the scanner always sends a
+    real instance id — but there's no scan-progress outcome to report either
+    way). A NOT_IN_DECK or ALREADY_COMPLETE card still lands in the general
+    collection (see api/collection.py), it just doesn't move deck progress.
     """
     instance = db.query(DeckInstance).filter(
         DeckInstance.id == deck_instance_id,
         DeckInstance.user_id == user_id,
     ).first()
     if not instance:
-        return
+        return None
 
     deck_card = db.query(DeckCard).filter(
         DeckCard.deck_id == instance.deck_id,
         DeckCard.card_id == card_id,
     ).first()
     if not deck_card:
-        return
+        return SCAN_NOT_IN_DECK
 
     now = datetime.datetime.utcnow()
     scanned = db.query(ScannedCard).filter(
         ScannedCard.deck_instance_id == instance.id,
         ScannedCard.card_id == card_id,
     ).first()
+    if scanned and scanned.scanned_quantity >= deck_card.expected_quantity:
+        scanned.last_scanned_at = now
+        db.commit()
+        return SCAN_ALREADY_COMPLETE
+
     if scanned:
         scanned.scanned_quantity = min(scanned.scanned_quantity + quantity, deck_card.expected_quantity)
         scanned.last_scanned_at = now
@@ -50,6 +67,7 @@ def register_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str
             last_scanned_at=now,
         ))
     db.commit()
+    return SCAN_COUNTED
 
 
 def unregister_scan(db: Session, user_id: int, deck_instance_id: int, card_id: str, quantity: int = 1) -> bool:

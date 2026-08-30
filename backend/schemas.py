@@ -190,6 +190,11 @@ class CollectionItemResponse(BaseModel):
     has_scan_photo: bool = False
     product_sources: List[CollectionProductSourceResponse] = Field(default_factory=list)
     card: Optional[CardWithSet] = None
+    # Set only by add_to_collection when the request targeted a deck instance
+    # (see services/deck_progress.py's SCAN_* constants) — "counted",
+    # "already_complete", "not_in_deck", or unset/None for a plain add with
+    # no deck instance involved at all.
+    deck_scan_status: Optional[str] = None
 
     class Config:
         from_attributes = True

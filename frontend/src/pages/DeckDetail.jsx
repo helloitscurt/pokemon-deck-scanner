@@ -1,7 +1,7 @@
 import { useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
-import { ArrowLeft, Camera, RotateCcw, Trash2 } from 'lucide-react'
+import { AlertTriangle, ArrowLeft, Camera, RotateCcw, Trash2 } from 'lucide-react'
 import toast from 'react-hot-toast'
 import { getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection, undoLastScan } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
@@ -87,6 +87,30 @@ export default function DeckDetail() {
     mutationFn: ({ candidate }) => addToCollection({ card_id: candidate.id, quantity: 1, deck_instance_id: Number(instanceId) }),
     onSuccess: (response, { candidate, isAutoSave, traceId }) => {
       invalidate()
+      // deck_scan_status (see backend services/deck_progress.py's SCAN_*
+      // constants) is only meaningful here — it's set by add_to_collection
+      // exactly when this add targeted a deck instance. A card that's not
+      // part of this deck's template, or one that's already at its
+      // expected quantity, still lands in the general collection (hence no
+      // early return before invalidate() above) but must not look like a
+      // normal successful match — same plain toast either way was the bug
+      // report this is fixing. Applies to both auto-saves and manual taps
+      // from the ambiguous candidate list; no Undo button here (unlike the
+      // isAutoSave branch below) since there is nothing meaningful to
+      // reverse: register_scan never moved deck progress for this scan, so
+      // the undo route would either 404 (not_in_deck) or wrongly decrement
+      // an unrelated earlier scan (already_complete).
+      const deckScanStatus = response.data.deck_scan_status
+      if (deckScanStatus === 'not_in_deck' || deckScanStatus === 'already_complete') {
+        const detailKey = deckScanStatus === 'not_in_deck' ? 'decks.scan.notInDeckDetail' : 'decks.scan.alreadyCompleteDetail'
+        toast(() => (
+          <span className="flex items-center gap-2">
+            <AlertTriangle size={16} className="flex-shrink-0 text-yellow" />
+            <span className="min-w-0 flex-1 text-yellow">{candidate.name} {t(detailKey)}</span>
+          </span>
+        ), { duration: 5000, style: { border: '1px solid #eab308' } })
+        return
+      }
       if (!isAutoSave) {
         toast.success(`${t('decks.scan.scanned')}: ${candidate.name}`)
         return
@@ -272,7 +296,7 @@ export default function DeckDetail() {
                 <p className={`flex-shrink-0 text-lg font-bold ${missing > 0 ? 'text-brand-red' : 'text-green'}`}>
                   {missing > 0
                     ? `${missing}/${deckCard.expected_quantity} ${t('decks.detail.missingCount')}`
-                    : t('decks.detail.foundLabel')}
+                    : `${deckCard.scanned_quantity}/${deckCard.expected_quantity} ${t('decks.detail.foundLabel')}`}
                 </p>
               </button>
             )

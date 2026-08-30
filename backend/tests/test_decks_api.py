@@ -185,13 +185,52 @@ class DeckTrackingApiTests(unittest.TestCase):
 
     def test_collection_add_with_deck_instance_id_updates_progress(self):
         instance = self._create_deck()
+        result = add_to_collection(
+            CollectionItemCreate(card_id=self.card_a.id, quantity=1, deck_instance_id=instance.id),
+            current_user=self.user,
+            db=self.db,
+        )
+        self.assertEqual(result.deck_scan_status, "counted")
+        progress = get_deck_instance(instance.id, current_user=self.user, db=self.db)
+        self.assertEqual(progress.scanned_count, 1)
+
+    def test_collection_add_flags_a_card_not_in_the_deck(self):
+        # The scan UI needs this to warn the user the card they just scanned
+        # isn't part of the deck they're tracking — it still lands in their
+        # general collection (see the scanned_count assertion below), but
+        # deck_scan_status must say so rather than looking identical to a
+        # card that filled a missing slot.
+        instance = self._create_deck()
+        result = add_to_collection(
+            CollectionItemCreate(card_id=self.card_c.id, quantity=1, deck_instance_id=instance.id),
+            current_user=self.user,
+            db=self.db,
+        )
+        self.assertEqual(result.deck_scan_status, "not_in_deck")
+        self.assertEqual(result.quantity, 1)  # still added to the general collection
+        progress = get_deck_instance(instance.id, current_user=self.user, db=self.db)
+        self.assertEqual(progress.scanned_count, 0)
+
+    def test_collection_add_flags_a_duplicate_past_the_deck_s_expected_quantity(self):
+        # card_a's expected_quantity is 1 (see _create_deck) — a second scan
+        # of it doesn't move deck progress at all, and the UI needs to tell
+        # that apart from the first (progress-moving) scan of the same card.
+        instance = self._create_deck()
         add_to_collection(
             CollectionItemCreate(card_id=self.card_a.id, quantity=1, deck_instance_id=instance.id),
             current_user=self.user,
             db=self.db,
         )
-        result = get_deck_instance(instance.id, current_user=self.user, db=self.db)
-        self.assertEqual(result.scanned_count, 1)
+        result = add_to_collection(
+            CollectionItemCreate(card_id=self.card_a.id, quantity=1, deck_instance_id=instance.id),
+            current_user=self.user,
+            db=self.db,
+        )
+        self.assertEqual(result.deck_scan_status, "already_complete")
+        self.assertEqual(result.quantity, 2)  # still added to the general collection
+        progress = get_deck_instance(instance.id, current_user=self.user, db=self.db)
+        card_a_row = next(c for c in progress.cards if c.card_id == self.card_a.id)
+        self.assertEqual(card_a_row.scanned_quantity, 1)  # unchanged by the redundant scan
 
     def test_bulk_add_deck_scan_failure_does_not_mark_item_failed(self):
         """Regression test: if register_scan raises, bulk-add must still report

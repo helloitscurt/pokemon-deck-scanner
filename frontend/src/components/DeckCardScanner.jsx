@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { Camera, Check, Loader2, X } from 'lucide-react'
+import { AlertTriangle, Camera, Check, Loader2, X } from 'lucide-react'
 import { matchDeckImage, recognizeCard } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
@@ -164,11 +164,19 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // with (see scaleQuad calls below); this one stays in the same
   // detection-frame coordinate space the tick loop's own comparisons use.
   const pendingCaptureQuadRef = useRef(null)
+  // Most recent quad the tick loop actually saw, refreshed every tick and
+  // cleared the moment a tick finds nothing — read by handleScanNow so the
+  // manual "Scan now" button can fire off the same quad the overlay is
+  // currently drawing, without waiting for REQUIRED_STABLE_FRAMES of hold
+  // time. Detection-frame coordinates, same space as pendingCaptureQuadRef.
+  const latestQuadRef = useRef(null)
 
   // hunting | processing | ambiguous | success | error | cameraDenied
   const [phase, setPhase] = useState('hunting')
   const [videoAspect, setVideoAspect] = useState(3 / 4)
   const [showCheckmark, setShowCheckmark] = useState(false)
+  // 'counted' | 'already_complete' | 'not_in_deck' — see enterSuccessCooldown.
+  const [checkmarkStatus, setCheckmarkStatus] = useState('counted')
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [confirmError, setConfirmError] = useState(null)
@@ -209,6 +217,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     if (!isOpen) return
     cameraFallbackLockedRef.current = false
     awaitingCardRemovalRef.current = null
+    latestQuadRef.current = null
     setResult(null)
     setError(null)
     setConfirmError(null)
@@ -235,10 +244,18 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     abortControllerRef.current?.abort()
   }, [])
 
-  const enterSuccessCooldown = () => {
+  // deckScanStatus (see backend services/deck_progress.py's SCAN_* constants,
+  // round-tripped through onConfirm's response below) picks which overlay
+  // shows: the usual green checkmark for "counted", or a yellow warning for
+  // a card that didn't move deck progress at all — not in this deck's
+  // template, or already at its expected quantity. Silently treating those
+  // the same as a real match (the previous behavior) meant a mis-scan or a
+  // duplicate looked identical to a correctly-tracked card.
+  const enterSuccessCooldown = (deckScanStatus = 'counted') => {
     setResult(null)
     setError(null)
     setPhase('success')
+    setCheckmarkStatus(deckScanStatus)
     setShowCheckmark(true)
     awaitingCardRemovalRef.current = pendingCaptureQuadRef.current
     timersRef.current.push(setTimeout(() => setShowCheckmark(false), CHECKMARK_DURATION_MS))
@@ -280,14 +297,14 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     setConfirmingKey(key)
     setConfirmError(null)
     try {
-      await onConfirm(candidate, { isAutoSave, traceId })
+      const response = await onConfirm(candidate, { isAutoSave, traceId })
       // The fallback path skips the checkmark theater — just clear back to
       // the ready-to-scan-next state (resetForNextCard already routes to
       // 'cameraDenied' vs 'hunting' correctly based on the same lock).
       if (cameraFallbackLockedRef.current) {
         resetForNextCard()
       } else {
-        enterSuccessCooldown()
+        enterSuccessCooldown(response?.data?.deck_scan_status)
       }
       return true
     } catch {
@@ -440,6 +457,45 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     abortControllerRef.current?.abort()
   }
 
+  // Manual override for when the auto-capture is taking too long to kick in
+  // (quad detected but not holding steady long enough, or REQUIRED_STABLE_
+  // FRAMES just feels slow to an impatient user who can see the card is
+  // sitting right there). Fires the same captureAndRecognize path the tick
+  // loop's own readyToCapture branch uses, seeded with whatever quad the
+  // tick loop most recently saw (latestQuadRef) rather than waiting for a
+  // fresh stable streak. If no quad has been seen at all (e.g. detection is
+  // struggling with lighting/angle), falls back to the full video frame —
+  // still worth sending; recognizeCard doesn't require a perfectly
+  // perspective-corrected crop, just a photo of the card.
+  const handleScanNow = async () => {
+    if (phase !== 'hunting' || cameraStatus !== 'streaming') return
+    if (tickInFlightRef.current) return
+    const video = videoRef.current
+    const captureCanvas = captureCanvasRef.current
+    if (!video || !captureCanvas || video.readyState < 2 || !video.videoWidth) return
+
+    tickInFlightRef.current = true
+    try {
+      const seen = latestQuadRef.current
+      const nativeQuad = seen
+        ? scaleQuad(seen.quad, video.videoWidth / seen.detectionWidth, video.videoHeight / seen.detectionHeight)
+        : {
+          topLeftCorner: { x: 0, y: 0 },
+          topRightCorner: { x: video.videoWidth, y: 0 },
+          bottomLeftCorner: { x: 0, y: video.videoHeight },
+          bottomRightCorner: { x: video.videoWidth, y: video.videoHeight },
+        }
+
+      captureCanvas.width = video.videoWidth
+      captureCanvas.height = video.videoHeight
+      captureCanvas.getContext('2d').drawImage(video, 0, 0)
+      pendingCaptureQuadRef.current = seen?.quad || null
+      await captureAndRecognize(captureCanvas, nativeQuad)
+    } finally {
+      tickInFlightRef.current = false
+    }
+  }
+
   // ---- live detection loop: only runs while actively hunting ----
   useEffect(() => {
     if (phase !== 'hunting' || cameraStatus !== 'streaming') return undefined
@@ -475,6 +531,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
         detectionCanvas.getContext('2d').drawImage(video, 0, 0, detectionWidth, detectionHeight)
 
         const quad = await detectCardQuad(detectionCanvas)
+        latestQuadRef.current = quad ? { quad, detectionWidth, detectionHeight } : null
         if (!quad) {
           awaitingCardRemovalRef.current = null
         } else if (
@@ -650,19 +707,48 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
               )}
 
               {phase === 'success' && showCheckmark && (
-                <div className="absolute inset-0 flex items-center justify-center bg-black/60">
-                  <span
-                    className="inline-flex items-center justify-center rounded-full border border-green/40 bg-green/90 p-4 text-white shadow-lg"
-                    aria-label={t('decks.scan.captured')}
-                  >
-                    <Check size={32} strokeWidth={3} aria-hidden />
-                  </span>
+                <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60">
+                  {checkmarkStatus === 'counted' ? (
+                    <span
+                      className="inline-flex items-center justify-center rounded-full border border-green/40 bg-green/90 p-4 text-white shadow-lg"
+                      aria-label={t('decks.scan.captured')}
+                    >
+                      <Check size={32} strokeWidth={3} aria-hidden />
+                    </span>
+                  ) : (
+                    // Distinct from the green checkmark above (both the icon
+                    // and an explicit caption, not just a color swap) — a
+                    // card that didn't actually move deck progress (not
+                    // part of this deck's template, or already at its
+                    // expected quantity) must not look like a normal
+                    // successful match.
+                    <span
+                      className="inline-flex items-center justify-center rounded-full border border-yellow/50 bg-yellow/90 p-4 text-black shadow-lg"
+                      aria-label={t(checkmarkStatus === 'not_in_deck' ? 'decks.scan.notInDeck' : 'decks.scan.alreadyComplete')}
+                    >
+                      <AlertTriangle size={32} strokeWidth={2.5} aria-hidden />
+                    </span>
+                  )}
+                  {checkmarkStatus !== 'counted' && (
+                    <p className="text-sm font-semibold text-yellow max-w-[220px] text-center">
+                      {t(checkmarkStatus === 'not_in_deck' ? 'decks.scan.notInDeck' : 'decks.scan.alreadyComplete')}
+                    </p>
+                  )}
                 </div>
               )}
             </div>
 
             {phase === 'hunting' && (
-              <p className="text-xs text-text-muted text-center max-w-xs">{t('decks.scan.liveHint')}</p>
+              <div className="flex flex-col items-center gap-2">
+                <p className="text-xs text-text-muted text-center max-w-xs">{t('decks.scan.liveHint')}</p>
+                <button
+                  type="button"
+                  onClick={handleScanNow}
+                  className="btn-ghost text-sm"
+                >
+                  {t('decks.scan.scanNow')}
+                </button>
+              </div>
             )}
 
             {/* Temporary on-device diagnostic readout — no devtools access on
