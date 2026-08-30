@@ -10,20 +10,22 @@ import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } fr
 import { lastOcrRawText, lastOcrWords, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
 import { createStabilityTracker } from '../utils/quadStability'
 
-// Real-device tuning, twice: first pass (5 frames @ 2% tolerance @ 180ms)
-// felt slow and twitchy — ordinary jitter from lighting/shadows on the
-// downscaled 480px-wide detection frame kept exceeding tolerance and
-// resetting the streak. Second pass loosened both but was still too slow
-// overall — halving the tick interval (180ms -> 90ms) directly halves the
-// minimum stable-hold time for the SAME 3-frame requirement (270ms vs
-// 540ms) without weakening reliability by also demanding fewer confirming
-// reads; tickInFlightRef already self-throttles if a device can't keep up
-// with 90ms ticks, so this degrades gracefully rather than piling up work.
-// Tolerance loosened further too (4% -> 7%) — a real card repositioning
-// still moves corners far past either threshold, so neither change
-// meaningfully risks capturing mid-motion.
+// Real-device tuning, three passes: first (5 frames @ 2% tolerance @
+// 180ms = 900ms dwell) felt slow and twitchy — ordinary jitter from
+// lighting/shadows on the downscaled 480px-wide detection frame kept
+// exceeding tolerance and resetting the streak. Second loosened both.
+// Third halved the tick interval (180ms -> 90ms) and cut required frames
+// to 3, landing at 270ms dwell — too little: capture was firing before
+// the phone's own camera autofocus had actually settled, visible as
+// consistently poor OCR on small print (collector numbers) specifically,
+// even though the detected quad itself looked "stable" the whole time —
+// quad stability and focus sharpness are different things the quad alone
+// can't see. Required frames raised back up (3 -> 8, 720ms dwell) to give
+// autofocus real time to lock before the crop is taken; interval stays at
+// 90ms (unrelated to this — that's sampling rate, not dwell time) and
+// tolerance stays loose (jitter was never the accuracy problem).
 const DETECTION_INTERVAL_MS = 90
-const REQUIRED_STABLE_FRAMES = 3
+const REQUIRED_STABLE_FRAMES = 8
 const STABILITY_TOLERANCE_PROPORTION = 0.07
 const CHECKMARK_DURATION_MS = 900
 const COOLDOWN_AFTER_CHECKMARK_MS = 600
