@@ -11,7 +11,17 @@ import { lastOcrRawText, lastOcrWords, preloadCardOcr, recognizeCardText } from 
 import { createStabilityTracker } from '../utils/quadStability'
 
 const DETECTION_INTERVAL_MS = 180
-const REQUIRED_STABLE_FRAMES = 5
+// Real-device finding: the default 5 frames at the default 2% corner-
+// movement tolerance (quadStability.js) made capture feel slow and
+// twitchy — normal frame-to-frame jitter from lighting/shadows on a
+// downscaled 480px-wide detection frame routinely exceeded a ~10px
+// tolerance, resetting the stability streak before it ever reached 5.
+// Loosened both: a real card repositioning still moves corners by far
+// more than either threshold allows, so this doesn't meaningfully risk
+// capturing mid-motion, just tolerates the jitter that was never actually
+// motion.
+const REQUIRED_STABLE_FRAMES = 3
+const STABILITY_TOLERANCE_PROPORTION = 0.04
 const CHECKMARK_DURATION_MS = 900
 const COOLDOWN_AFTER_CHECKMARK_MS = 600
 // Detection runs on a downscaled frame — full contour detection on a native
@@ -120,7 +130,10 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   const detectionCanvasRef = useRef(null)
   const overlayCanvasRef = useRef(null)
   const captureCanvasRef = useRef(null)
-  const stabilityTrackerRef = useRef(createStabilityTracker({ requiredConsecutiveFrames: REQUIRED_STABLE_FRAMES }))
+  const stabilityTrackerRef = useRef(createStabilityTracker({
+    requiredConsecutiveFrames: REQUIRED_STABLE_FRAMES,
+    toleranceProportion: STABILITY_TOLERANCE_PROPORTION,
+  }))
   const tickInFlightRef = useRef(false)
   const cameraFallbackLockedRef = useRef(false)
   const timersRef = useRef([])

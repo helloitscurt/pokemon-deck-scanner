@@ -51,7 +51,7 @@ vi.mock('../contexts/SettingsContext', () => ({
 }))
 
 const DETECTION_INTERVAL_MS = 180
-const REQUIRED_STABLE_FRAMES = 5
+const REQUIRED_STABLE_FRAMES = 3 // must match DeckCardScanner.jsx's own constant
 
 const STABLE_QUAD = {
   topLeftCorner: { x: 10, y: 10 },
