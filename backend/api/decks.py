@@ -409,6 +409,19 @@ async def match_deck_image(
                 winner = name_matches[0]
                 decision = "deck_name_unique"
 
+        # Plain server log, not the opt-in ScanTrace file system — visible
+        # via `docker logs` for every scan with zero setup, which is what
+        # actually answered "how was this card identified?" the first time
+        # it was asked. ScanTrace still records richer per-candidate detail
+        # (pHash distances, etc.) when a user has opted into it.
+        logger.info(
+            "deck match-image: instance=%s candidates=%s ocr_number=%r ocr_name=%r "
+            "-> confident=%s decision=%s winner=%s",
+            instance_id, len(candidates), number_local, name,
+            winner is not None, decision,
+            f"{winner['id']} ({winner['name']})" if winner else None,
+        )
+
         result = {
             "matches": [winner] if winner else [],
             "_identity_confident": winner is not None,
