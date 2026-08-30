@@ -103,12 +103,14 @@ export default function DeckDetail() {
       const deckScanStatus = response.data.deck_scan_status
       if (deckScanStatus === 'not_in_deck' || deckScanStatus === 'already_complete') {
         const detailKey = deckScanStatus === 'not_in_deck' ? 'decks.scan.notInDeckDetail' : 'decks.scan.alreadyCompleteDetail'
+        // 10s, double the other toasts here (5s) — a warning needs real
+        // reading time, not just a glance.
         toast(() => (
           <span className="flex items-center gap-2">
             <AlertTriangle size={16} className="flex-shrink-0 text-yellow" />
             <span className="min-w-0 flex-1 text-yellow">{candidate.name} {t(detailKey)}</span>
           </span>
-        ), { duration: 5000, style: { border: '1px solid #eab308' } })
+        ), { duration: 10000, style: { border: '1px solid #eab308' } })
         return
       }
       if (!isAutoSave) {

@@ -216,6 +216,16 @@ describe('DeckCardScanner', () => {
     expect(screen.queryByLabelText('decks.scan.captured')).not.toBeInTheDocument()
     expect(screen.getByLabelText('decks.scan.notInDeck')).toBeInTheDocument()
     expect(screen.getByText('decks.scan.notInDeck')).toBeInTheDocument()
+
+    // Double the plain checkmark's hold (900ms + 600ms cooldown = 1500ms
+    // total) — a warning needs real reading time. Still up at the point a
+    // checkmark would already be long gone...
+    await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+    expect(screen.getByLabelText('decks.scan.notInDeck')).toBeInTheDocument()
+
+    // ...but gone by its own full duration (1800ms hold + 600ms cooldown).
+    await act(async () => { await vi.advanceTimersByTimeAsync(900) })
+    expect(screen.queryByLabelText('decks.scan.notInDeck')).not.toBeInTheDocument()
   })
 
   it('does not immediately re-capture the same still-visible card right after a successful auto-save', async () => {

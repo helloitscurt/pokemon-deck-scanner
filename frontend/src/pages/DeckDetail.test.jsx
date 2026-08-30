@@ -135,7 +135,8 @@ describe('DeckDetail scan confirmation toasts', () => {
     expect(toast.success).not.toHaveBeenCalled()
     expect(toast).toHaveBeenCalledTimes(1)
     const [ToastContent, options] = toast.mock.calls[0]
-    expect(options).toMatchObject({ duration: 5000 })
+    // Double the plain/Undo toasts' 5s — a warning needs real reading time.
+    expect(options).toMatchObject({ duration: 10000 })
     render(<ToastContent />)
     expect(screen.getByText(/Mewtwo/)).toBeInTheDocument()
     expect(screen.getByText(/decks\.scan\.notInDeckDetail/)).toBeInTheDocument()

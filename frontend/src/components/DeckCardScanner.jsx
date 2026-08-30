@@ -28,6 +28,9 @@ const DETECTION_INTERVAL_MS = 90
 const REQUIRED_STABLE_FRAMES = 8
 const STABILITY_TOLERANCE_PROPORTION = 0.07
 const CHECKMARK_DURATION_MS = 900
+// A warning (not in this deck / already have enough) needs real reading
+// time — the green checkmark doesn't, it's just a "yep, got it" tick.
+const WARNING_DURATION_MS = CHECKMARK_DURATION_MS * 2
 const COOLDOWN_AFTER_CHECKMARK_MS = 600
 // Detection runs on a downscaled frame — full contour detection on a native
 // camera resolution every ~180ms is too slow for a phone browser. The crop
@@ -258,11 +261,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     setCheckmarkStatus(deckScanStatus)
     setShowCheckmark(true)
     awaitingCardRemovalRef.current = pendingCaptureQuadRef.current
-    timersRef.current.push(setTimeout(() => setShowCheckmark(false), CHECKMARK_DURATION_MS))
+    const holdDuration = deckScanStatus === 'counted' ? CHECKMARK_DURATION_MS : WARNING_DURATION_MS
+    timersRef.current.push(setTimeout(() => setShowCheckmark(false), holdDuration))
     timersRef.current.push(setTimeout(() => {
       stabilityTrackerRef.current.reset()
       setPhase('hunting')
-    }, CHECKMARK_DURATION_MS + COOLDOWN_AFTER_CHECKMARK_MS))
+    }, holdDuration + COOLDOWN_AFTER_CHECKMARK_MS))
   }
 
   const resetForNextCard = () => {
