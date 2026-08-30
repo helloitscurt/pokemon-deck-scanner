@@ -171,6 +171,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // indistinguishable from hung at that duration; a running clock isn't.
   const [processingSeconds, setProcessingSeconds] = useState(0)
   const processingTimerRef = useRef(null)
+  // Set at the start of any processing-phase network call, cleared once it
+  // settles — cancelProcessing() aborts whichever request is currently
+  // live. A real AbortController (not just a "please ignore the result"
+  // flag) so a cancelled request actually stops, instead of continuing to
+  // tie up the connection/backend for a result nobody wants anymore.
+  const abortControllerRef = useRef(null)
 
   const cameraActive = isOpen && phase !== 'cameraDenied'
   const { videoRef, status: cameraStatus } = useCameraStream({ active: cameraActive })
@@ -211,6 +217,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   useEffect(() => () => {
     clearTimers()
     clearInterval(processingTimerRef.current)
+    abortControllerRef.current?.abort()
   }, [])
 
   const enterSuccessCooldown = () => {
@@ -292,11 +299,17 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     return recognizeCardText(ocrCanvas)
   }
 
-  const tryOcrMatch = async (nativeFrameSource, quad, blob) => {
+  const tryOcrMatch = async (nativeFrameSource, quad, blob, signal) => {
     let ocrFields = null
     try {
       ocrFields = await runOcr(nativeFrameSource, quad, OCR_CROP_WIDTH, OCR_CROP_HEIGHT)
     } catch (err) {
+      // A user-cancelled request must propagate all the way out to
+      // captureAndRecognize, not be swallowed here as "OCR failed, fall
+      // back to the next tier" — that would silently keep going (and
+      // eventually fire the paid call) after the user explicitly asked to
+      // stop.
+      if (signal.aborted) throw err
       // Real-device finding: a Tesseract worker.recognize() call rejected
       // outright (not just "found nothing") on the larger OCR-only crop —
       // unconfirmed whether the size itself is why (could as easily be the
@@ -309,6 +322,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
       try {
         ocrFields = await runOcr(nativeFrameSource, quad, CARD_CROP_WIDTH, CARD_CROP_HEIGHT)
       } catch (err2) {
+        if (signal.aborted) throw err2
         setDebugInfo((d) => ({
           ...d, ocrName: null, ocrNumber: null, ocrRawText: '', ocrWords: [],
           tickError: `ocr: ${describeError(err2)}`,
@@ -343,8 +357,10 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
         deckInstanceId, blob,
         { numberLocal: ocrFields?.number_local, name: ocrFields?.name },
         'live_auto_scan',
+        signal,
       )
     } catch (err) {
+      if (signal.aborted) throw err
       setDebugInfo((d) => ({ ...d, tickError: `deck-match: ${describeError(err)}` }))
       return null
     }
@@ -360,15 +376,17 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     // double the initial scanner-open payload for a feature that only
     // pays off after detection already succeeded.
     preloadCardOcr()
+    const controller = new AbortController()
+    abortControllerRef.current = controller
     try {
       const cropCanvas = await extractCard(nativeFrameSource, CARD_CROP_WIDTH, CARD_CROP_HEIGHT, quad)
       if (!cropCanvas) throw new Error('extract-failed')
       const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
       if (!blob) throw new Error('capture-failed')
 
-      let data = await tryOcrMatch(nativeFrameSource, quad, blob)
+      let data = await tryOcrMatch(nativeFrameSource, quad, blob, controller.signal)
       if (!data?._identity_confident) {
-        data = await recognizeCard(blob, 'live_auto_scan')
+        data = await recognizeCard(blob, 'live_auto_scan', controller.signal)
       }
       const topCandidate = data?.matches?.[0]
 
@@ -383,12 +401,28 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
         setPhase('ambiguous')
       }
     } catch (err) {
+      // User-initiated (cancelProcessing) — go straight back to hunting,
+      // not the error banner; this isn't a failure, it's what was asked
+      // for.
+      if (controller.signal.aborted) {
+        resetForNextCard()
+        return
+      }
       setError(t('decks.scan.failed'))
       setDebugInfo((d) => ({ ...d, tickError: `capture: ${err?.message || err}` }))
       setPhase('error')
     } finally {
       clearInterval(processingTimerRef.current)
+      if (abortControllerRef.current === controller) abortControllerRef.current = null
     }
+  }
+
+  // Aborts whichever processing-phase request is currently in flight (the
+  // free deck-match tier, or the paid recognizeCard fallback) — see
+  // abortControllerRef's own comment for why this is a real
+  // AbortController, not just a "please ignore the eventual result" flag.
+  const cancelProcessing = () => {
+    abortControllerRef.current?.abort()
   }
 
   // ---- live detection loop: only runs while actively hunting ----
@@ -478,13 +512,24 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     setError(null)
     setConfirmError(null)
     setPhase('processing')
+    setProcessingSeconds(0)
+    processingTimerRef.current = setInterval(() => setProcessingSeconds((s) => s + 1), 1000)
+    const controller = new AbortController()
+    abortControllerRef.current = controller
     try {
-      const data = await recognizeCard(file, 'manual')
+      const data = await recognizeCard(file, 'manual', controller.signal)
       setResult(data)
       setPhase('ambiguous')
     } catch (err) {
+      if (controller.signal.aborted) {
+        setPhase('cameraDenied')
+        return
+      }
       setError(err?.response?.data?.detail || t('decks.scan.failed'))
       setPhase('cameraDenied')
+    } finally {
+      clearInterval(processingTimerRef.current)
+      if (abortControllerRef.current === controller) abortControllerRef.current = null
     }
   }
 
@@ -563,9 +608,22 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                       working, not stuck, so say so rather than leaving a
                       bare spinner that looks identical to hung. */}
                   {processingSeconds >= 15 && (
-                    <p className="text-sm text-white/90 max-w-[220px] text-center">
-                      Still working — the recognition service may be slow right now.
-                    </p>
+                    <>
+                      <p className="text-sm text-white/90 max-w-[220px] text-center">
+                        Still working — the recognition service may be slow right now.
+                      </p>
+                      {/* btn-ghost's text-text-secondary assumes a light
+                          background — unreadable on this dark overlay, same
+                          issue already fixed for the text above it. Styled
+                          explicitly instead of reusing that class. */}
+                      <button
+                        type="button"
+                        onClick={cancelProcessing}
+                        className="px-4 py-2 rounded-lg text-sm font-medium text-white border border-white/30 hover:bg-white/10 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 transition-colors"
+                      >
+                        {t('decks.scan.cancel')}
+                      </button>
+                    </>
                   )}
                 </div>
               )}

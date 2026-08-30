@@ -155,7 +155,7 @@ describe('DeckCardScanner', () => {
 
     // Labeled so a saved trace can later be told apart from a manual scan
     // — see services/scan_trace.py's "source" field.
-    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
+    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan', expect.anything())
     // The quad passed here is scaled up from the downscaled detection
     // canvas to native (640x480) resolution — not STABLE_QUAD's raw
     // coordinates — so this checks shape/dimensions, not exact numbers.
@@ -278,7 +278,7 @@ describe('DeckCardScanner', () => {
       fireEvent.change(fileInput, { target: { files: [file] } })
     })
 
-    expect(recognizeCard).toHaveBeenCalledWith(file, 'manual')
+    expect(recognizeCard).toHaveBeenCalledWith(file, 'manual', expect.anything())
     expect(screen.getByText('Card A')).toBeInTheDocument()
 
     fireEvent.click(screen.getByText('Card A'))
@@ -318,6 +318,7 @@ describe('DeckCardScanner', () => {
       expect.anything(),
       { numberLocal: '25', name: 'Pikachu' },
       'live_auto_scan',
+      expect.anything(),
     )
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
@@ -342,7 +343,7 @@ describe('DeckCardScanner', () => {
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(matchDeckImage).toHaveBeenCalledWith(
-      '3', expect.anything(), { numberLocal: null, name: null }, 'live_auto_scan',
+      '3', expect.anything(), { numberLocal: null, name: null }, 'live_auto_scan', expect.anything(),
     )
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
@@ -363,7 +364,7 @@ describe('DeckCardScanner', () => {
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(matchDeckImage).not.toHaveBeenCalled()
-    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
+    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan', expect.anything())
   })
 
   it('runs OCR against its own higher-resolution crop, separate from the smaller one uploaded to the paid API', async () => {
@@ -401,7 +402,7 @@ describe('DeckCardScanner', () => {
 
     expect(recognizeCardText).toHaveBeenCalledTimes(2)
     expect(matchDeckImage).toHaveBeenCalledWith(
-      '3', expect.anything(), { numberLocal: '25', name: 'Pikachu' }, 'live_auto_scan',
+      '3', expect.anything(), { numberLocal: '25', name: 'Pikachu' }, 'live_auto_scan', expect.anything(),
     )
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
@@ -425,7 +426,7 @@ describe('DeckCardScanner', () => {
     // No OCR hints at all, but the deck-scoped match still runs — pure
     // pHash against this deck's own missing cards.
     expect(matchDeckImage).toHaveBeenCalledWith(
-      '3', expect.anything(), { numberLocal: undefined, name: undefined }, 'live_auto_scan',
+      '3', expect.anything(), { numberLocal: undefined, name: undefined }, 'live_auto_scan', expect.anything(),
     )
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
@@ -510,10 +511,52 @@ describe('DeckCardScanner', () => {
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(matchDeckImage).toHaveBeenCalled()
-    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan')
+    expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan', expect.anything())
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
       { isAutoSave: true, traceId: 'trace-paid1' },
     )
+  })
+
+  it('does not show a cancel option until processing has taken a while', async () => {
+    matchDeckImage.mockImplementation(() => new Promise(() => {})) // never settles in this test
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    expect(screen.queryByText('decks.scan.cancel')).not.toBeInTheDocument()
+
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
+    expect(screen.getByText('decks.scan.cancel')).toBeInTheDocument()
+  })
+
+  it('cancelling a long-running match returns to hunting without ever falling through to the paid call', async () => {
+    // Mirrors what a real cancelled axios request does: rejects once the
+    // AbortSignal fires, rather than resolving/rejecting on its own.
+    matchDeckImage.mockImplementation((instanceId, blob, fields, source, signal) => (
+      new Promise((resolve, reject) => {
+        signal.addEventListener('abort', () => {
+          const err = new Error('canceled')
+          err.name = 'CanceledError'
+          reject(err)
+        })
+      })
+    ))
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('decks.scan.cancel'))
+      await Promise.resolve()
+    })
+
+    // Cancelling is not a failure — straight back to hunting, not the
+    // error banner, and critically not a silent fall-through to the paid
+    // call the user explicitly asked to stop waiting for.
+    expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
+    expect(screen.queryByText('decks.scan.failed')).not.toBeInTheDocument()
+    expect(recognizeCard).not.toHaveBeenCalled()
+    expect(onConfirm).not.toHaveBeenCalled()
   })
 })

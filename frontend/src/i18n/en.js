@@ -457,6 +457,7 @@ const en = {
       identifying: 'Identifying card…',
       failed: 'Could not identify this card. Try again.',
       tryAgain: 'Try again',
+      cancel: 'Cancel',
       noMatch: 'No match found for this card.',
       bestMatch: 'Best match',
       scanAnother: 'Scan another',

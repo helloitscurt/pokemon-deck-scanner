@@ -118,13 +118,18 @@ export const cloneCustomCard = (cardId) => api.post(`/cards/custom/${cardId}/clo
 // (identify + visual-match verification) — under real Gemini overload a
 // single recognize measured 89s end to end. 180s leaves real margin above
 // that observed worst case rather than guessing.
-export const recognizeCard = (imageFile, source) => {
+// signal (optional AbortSignal) lets a caller actually cancel a slow
+// in-flight request — see DeckCardScanner.jsx's cancelProcessing, added
+// because a live Gemini overload can make this run for well over a
+// minute (see the 180s timeout comment above) with no way to back out.
+export const recognizeCard = (imageFile, source, signal) => {
   const formData = new FormData()
   formData.append('file', imageFile)
   if (source) formData.append('source', source)
   return api.post('/cards/recognize', formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
     timeout: 180000,
+    signal,
   }).then(r => r.data)
 }
 
@@ -133,7 +138,8 @@ export const recognizeCard = (imageFile, source) => {
 // — a small, already-known local list — instead of a broad TCGdex catalog
 // search. numberLocal/name (both optional, from cardOcr.js) only narrow
 // among that instance's own cards, never search anything broader.
-export const matchDeckImage = (instanceId, imageBlob, { numberLocal, name } = {}, source) => {
+// signal: see recognizeCard's comment just above.
+export const matchDeckImage = (instanceId, imageBlob, { numberLocal, name } = {}, source, signal) => {
   const formData = new FormData()
   formData.append('file', imageBlob)
   if (numberLocal) formData.append('number_local', numberLocal)
@@ -141,6 +147,7 @@ export const matchDeckImage = (instanceId, imageBlob, { numberLocal, name } = {}
   if (source) formData.append('source', source)
   return api.post(`/decks/instances/${instanceId}/match-image`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
+    signal,
   }).then(r => r.data)
 }
 
