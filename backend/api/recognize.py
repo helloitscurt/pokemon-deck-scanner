@@ -6,6 +6,7 @@ import math
 import os
 import json
 import re
+import time
 from email.utils import parsedate_to_datetime
 from services.tcgdex_languages import is_supported_tcgdex_language, normalize_tcgdex_language
 from services.gemini_rate_limit import (
@@ -354,11 +355,13 @@ async def post_gemini_generate(
     for attempt in range(max_attempts):
         try:
             await acquire_gemini_slot(api_key)
+            request_started = time.monotonic()
             resp = await client.post(
                 gemini_url,
                 headers={"x-goog-api-key": api_key},
                 json=payload,
             )
+            duration = time.monotonic() - request_started
 
             if resp.status_code == 429:
                 retry_reason = gemini_rate_limit_reason(resp)
@@ -405,8 +408,8 @@ async def post_gemini_generate(
                 # defends against an upstream error echoing the API key
                 # back (has happened with other providers' error bodies).
                 logger.warning(
-                    "Gemini transient status=%s attempt=%s/%s body=%s",
-                    resp.status_code, attempt + 1, max_attempts,
+                    "Gemini transient status=%s attempt=%s/%s duration=%.2fs body=%s",
+                    resp.status_code, attempt + 1, max_attempts, duration,
                     redact_sensitive(resp.text)[:500],
                 )
                 if attempt < max_attempts - 1:
@@ -433,6 +436,10 @@ async def post_gemini_generate(
                 record_gemini_success(api_key)
             except Exception:
                 logger.exception("Could not reset Gemini quota state after a successful response")
+            logger.info(
+                "Gemini request succeeded model=%s attempt=%s/%s duration=%.2fs",
+                _requested_gemini_model(gemini_url), attempt + 1, max_attempts, duration,
+            )
             return resp
         except GeminiKeyBlockedError as error:
             raise GeminiRateLimitHTTPException(
@@ -575,6 +582,25 @@ def _metadata_decision(card_info: dict, candidates: list[dict]) -> tuple[bool, s
         return True, "number_metadata"
     if not card_info.get("number_local") and {"artist", "hp"}.issubset(signals):
         return True, "artist_hp"
+    # Trainer/Energy cards have no HP at all, so the artist+hp fallback above
+    # can never fire for them — not even with a perfectly confirmed artist
+    # credit — since "hp" can only ever be an "unknown" signal (both sides
+    # None) for a card type that structurally has no HP stat. Real-device
+    # finding: a promo Trainer card (Picnicker) whose number Gemini
+    # couldn't read never reached confidence despite TCGdex resolving its
+    # name to exactly one unambiguous candidate. Mirrors number_metadata's
+    # own bar (one anchor signal plus one corroborating signal), using
+    # artist as the anchor instead of number — gated to non-Pokemon card
+    # types specifically so this doesn't loosen the bar for a Pokemon card
+    # that simply has no HP visible in frame.
+    card_type = str(card_info.get("card_type") or "").strip().casefold()
+    if (
+        not card_info.get("number_local")
+        and card_type in ("trainer", "energy")
+        and "artist" in signals
+        and signals.intersection({"language", "total", "set", "regulation"})
+    ):
+        return True, "artist_metadata"
     return False, None
 
 

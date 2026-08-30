@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import re
+import time
 from contextlib import nullcontext
 from email.utils import parsedate_to_datetime
 
@@ -535,7 +536,9 @@ async def post_openai_chat(
                 headers["Authorization"] = f"Bearer {api_key}"
 
             request_started_at = datetime.datetime.utcnow()
+            request_started = time.monotonic()
             resp = await client.post(url, headers=headers, json=payload)
+            duration = time.monotonic() - request_started
 
             if resp.status_code == 429:
                 error_type, error_code = openai_error_code(resp)
@@ -592,6 +595,10 @@ async def post_openai_chat(
                     reason="model_not_found",
                 )
             if resp.status_code in OPENAI_TRANSIENT_STATUS_CODES:
+                logger.warning(
+                    "Scanner provider transient status=%s attempt=%s/%s duration=%.2fs",
+                    resp.status_code, attempt + 1, max_attempts, duration,
+                )
                 if attempt < max_attempts - 1:
                     await asyncio.sleep(2 ** attempt)
                     continue
@@ -617,6 +624,10 @@ async def post_openai_chat(
                 # into a failed scan. No endpoint, credential, or upstream text is
                 # included in this diagnostic.
                 logger.warning("Could not reset scanner provider rate-limit state")
+            logger.info(
+                "Scanner provider request succeeded model=%s attempt=%s/%s duration=%.2fs",
+                payload.get("model", ""), attempt + 1, max_attempts, duration,
+            )
             return resp
         except HTTPException:
             raise
