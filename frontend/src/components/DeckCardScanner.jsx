@@ -571,7 +571,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
             {/* Temporary on-device diagnostic readout — no devtools access on
                 a phone, and the detection loop previously failed completely
                 silently (see cardDetection.js's detectionStatus comment). */}
-            <div className="text-[10px] font-mono text-text-muted/60 text-center max-w-xs leading-relaxed break-words">
+            <div className="text-sm font-mono text-white/90 text-center max-w-xs leading-relaxed break-words">
               cam:{cameraStatus} lib:{debugInfo.libState || 'idle'} ticks:{debugInfo.tickCount}
               {debugInfo.libError && <><br />lib error: {debugInfo.libError}</>}
               {debugInfo.ocrName !== undefined && (
