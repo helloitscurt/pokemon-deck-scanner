@@ -29,8 +29,11 @@ const REQUIRED_STABLE_FRAMES = 8
 const STABILITY_TOLERANCE_PROPORTION = 0.07
 const CHECKMARK_DURATION_MS = 900
 // A warning (not in this deck / already have enough) needs real reading
-// time — the green checkmark doesn't, it's just a "yep, got it" tick.
-const WARNING_DURATION_MS = CHECKMARK_DURATION_MS * 2
+// time — the green checkmark doesn't, it's just a "yep, got it" tick. Also
+// dismissible early with a tap (see the warning overlay's onClick below),
+// so a longer default here doesn't cost anything when the user's ready to
+// move on sooner.
+const WARNING_DURATION_MS = CHECKMARK_DURATION_MS * 1.5
 const COOLDOWN_AFTER_CHECKMARK_MS = 600
 // Detection runs on a downscaled frame — full contour detection on a native
 // camera resolution every ~180ms is too slow for a phone browser. The crop
@@ -180,6 +183,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   const [showCheckmark, setShowCheckmark] = useState(false)
   // 'counted' | 'already_complete' | 'not_in_deck' — see enterSuccessCooldown.
   const [checkmarkStatus, setCheckmarkStatus] = useState('counted')
+  // { name, quantity } for a warning (checkmarkStatus !== 'counted') — the
+  // captured card's name and, only for 'already_complete', the deck's
+  // expected quantity for it (see backend services/deck_progress.py's
+  // register_scan), so the warning can say e.g. "4/4 Pikachu already
+  // scanned" instead of a generic message with no specifics.
+  const [checkmarkMeta, setCheckmarkMeta] = useState(null)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   const [confirmError, setConfirmError] = useState(null)
@@ -254,11 +263,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // template, or already at its expected quantity. Silently treating those
   // the same as a real match (the previous behavior) meant a mis-scan or a
   // duplicate looked identical to a correctly-tracked card.
-  const enterSuccessCooldown = (deckScanStatus = 'counted') => {
+  const enterSuccessCooldown = (deckScanStatus = 'counted', meta = null) => {
     setResult(null)
     setError(null)
     setPhase('success')
     setCheckmarkStatus(deckScanStatus)
+    setCheckmarkMeta(meta)
     setShowCheckmark(true)
     awaitingCardRemovalRef.current = pendingCaptureQuadRef.current
     const holdDuration = deckScanStatus === 'counted' ? CHECKMARK_DURATION_MS : WARNING_DURATION_MS
@@ -275,6 +285,18 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     setError(null)
     setConfirmError(null)
     setConfirmingKey(null)
+    stabilityTrackerRef.current.reset()
+    setPhase(cameraFallbackLockedRef.current ? 'cameraDenied' : 'hunting')
+  }
+
+  // Ends a warning overlay early on tap — clears its own pending timers
+  // (the ones enterSuccessCooldown scheduled) instead of waiting out
+  // WARNING_DURATION_MS, so a user who's already read it isn't stuck
+  // waiting. Not offered on the green checkmark — that's already quick
+  // enough not to need a manual dismiss.
+  const dismissWarning = () => {
+    clearTimers()
+    setShowCheckmark(false)
     stabilityTrackerRef.current.reset()
     setPhase(cameraFallbackLockedRef.current ? 'cameraDenied' : 'hunting')
   }
@@ -308,7 +330,10 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
       if (cameraFallbackLockedRef.current) {
         resetForNextCard()
       } else {
-        enterSuccessCooldown(response?.data?.deck_scan_status)
+        enterSuccessCooldown(response?.data?.deck_scan_status, {
+          name: candidate.name,
+          quantity: response?.data?.deck_scan_quantity,
+        })
       }
       return true
     } catch {
@@ -579,16 +604,21 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // Freeze the visible frame instead of letting it keep playing behind the
   // spinner/candidate list/checkmark — matches the plan's "freeze + crop"
   // flow rather than a live feed still moving under a result the user is
-  // looking at.
+  // looking at. A warning overlay is the one exception: it floats over the
+  // feed rather than covering it (see the warning branch below), so the
+  // feed underneath should stay live — a real-device report was that the
+  // warning only ever appeared over a frozen/blacked-out frame, which read
+  // as broken.
   useEffect(() => {
     const video = videoRef.current
     if (!video) return
-    if (phase === 'hunting') {
+    const keepLive = phase === 'hunting' || (phase === 'success' && checkmarkStatus !== 'counted')
+    if (keepLive) {
       video.play().catch(() => {})
     } else {
       video.pause()
     }
-  }, [phase, videoRef])
+  }, [phase, videoRef, checkmarkStatus])
 
   const handleManualFile = async (file) => {
     if (!file) return
@@ -620,6 +650,16 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   if (!isOpen) return null
 
   const matches = (result?.matches || []).slice(0, 6)
+
+  // e.g. "4/4 Pikachu already scanned" — checkmarkMeta.quantity (the deck's
+  // expected_quantity, see register_scan) is only ever set alongside
+  // 'already_complete'; scanned_quantity always equals it in that state, so
+  // one number covers both sides of the fraction. 'not_in_deck' has no
+  // quantity to show (the card isn't in the deck's template at all), so it
+  // stays name + a plain explanation.
+  const warningText = checkmarkStatus === 'already_complete'
+    ? `${checkmarkMeta?.quantity ?? '?'}/${checkmarkMeta?.quantity ?? '?'} ${checkmarkMeta?.name ?? ''} ${t('decks.scan.alreadyCompleteDetail')}`.trim()
+    : `${checkmarkMeta?.name ?? ''} ${t('decks.scan.notInDeckDetail')}`.trim()
 
   return createPortal(
     <div
@@ -676,6 +716,24 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
               <canvas ref={detectionCanvasRef} className="hidden" aria-hidden="true" />
               <canvas ref={captureCanvasRef} className="hidden" aria-hidden="true" />
 
+              {/* Floats over the bottom of the video frame rather than
+                  sitting below it in normal flow — on a phone, a
+                  portrait-aspect video can fill most of the viewport,
+                  pushing anything placed after it below the fold until the
+                  user scrolls. This stays reachable the instant hunting
+                  starts, no scrolling required. */}
+              {phase === 'hunting' && (
+                <div className="absolute inset-x-0 bottom-3 flex justify-center pointer-events-none">
+                  <button
+                    type="button"
+                    onClick={handleScanNow}
+                    className="btn-primary pointer-events-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+                  >
+                    {t('decks.scan.scanNow')}
+                  </button>
+                </div>
+              )}
+
               {phase === 'processing' && (
                 <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 bg-black/60">
                   <Loader2 size={28} className="animate-spin text-brand-red" />
@@ -710,47 +768,47 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                 </div>
               )}
 
-              {phase === 'success' && showCheckmark && (
-                <div className="absolute inset-0 flex flex-col items-center justify-center gap-2 bg-black/60">
-                  {checkmarkStatus === 'counted' ? (
-                    <span
-                      className="inline-flex items-center justify-center rounded-full border border-green/40 bg-green/90 p-4 text-white shadow-lg"
-                      aria-label={t('decks.scan.captured')}
-                    >
-                      <Check size={32} strokeWidth={3} aria-hidden />
-                    </span>
-                  ) : (
-                    // Distinct from the green checkmark above (both the icon
-                    // and an explicit caption, not just a color swap) — a
-                    // card that didn't actually move deck progress (not
-                    // part of this deck's template, or already at its
-                    // expected quantity) must not look like a normal
-                    // successful match.
-                    <span
-                      className="inline-flex items-center justify-center rounded-full border border-yellow/50 bg-yellow/90 p-4 text-black shadow-lg"
-                      aria-label={t(checkmarkStatus === 'not_in_deck' ? 'decks.scan.notInDeck' : 'decks.scan.alreadyComplete')}
-                    >
-                      <AlertTriangle size={32} strokeWidth={2.5} aria-hidden />
-                    </span>
-                  )}
-                  {checkmarkStatus !== 'counted' && (
-                    <p className="text-sm font-semibold text-yellow max-w-[220px] text-center">
-                      {t(checkmarkStatus === 'not_in_deck' ? 'decks.scan.notInDeck' : 'decks.scan.alreadyComplete')}
-                    </p>
-                  )}
+              {phase === 'success' && showCheckmark && checkmarkStatus === 'counted' && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                  <span
+                    className="inline-flex items-center justify-center rounded-full border border-green/40 bg-green/90 p-4 text-white shadow-lg"
+                    aria-label={t('decks.scan.captured')}
+                  >
+                    <Check size={32} strokeWidth={3} aria-hidden />
+                  </span>
+                </div>
+              )}
+
+              {phase === 'success' && showCheckmark && checkmarkStatus !== 'counted' && (
+                // Floats over the still-live video (see the video-play
+                // effect above) instead of covering it with a dark scrim —
+                // a real-device report was that this only ever appeared
+                // over a frozen/blacked-out frame. Tappable to dismiss
+                // early: WARNING_DURATION_MS is generous specifically
+                // because reading it shouldn't be rushed, so the user needs
+                // a way to move on sooner once they have.
+                <div className="absolute inset-x-0 top-4 flex justify-center px-4 pointer-events-none">
+                  <button
+                    type="button"
+                    onClick={dismissWarning}
+                    className="pointer-events-auto flex max-w-[92%] items-center gap-2 rounded-xl border border-yellow/50 bg-black/85 px-4 py-3 text-left shadow-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-yellow/70"
+                  >
+                    <AlertTriangle size={22} className="flex-shrink-0 text-yellow" aria-hidden />
+                    <span className="text-sm font-semibold text-yellow">{warningText}</span>
+                  </button>
                 </div>
               )}
             </div>
 
             {phase === 'hunting' && (
-              <div className="flex flex-col items-center gap-2">
-                <p className="text-xs text-text-muted text-center max-w-xs">{t('decks.scan.liveHint')}</p>
-                <button
-                  type="button"
-                  onClick={handleScanNow}
-                  className="btn-ghost text-sm"
-                >
-                  {t('decks.scan.scanNow')}
+              <p className="text-xs text-text-muted text-center max-w-xs">{t('decks.scan.liveHint')}</p>
+            )}
+
+            {phase === 'error' && (
+              <div className={`${ERROR_BANNER_CLASS} w-full max-w-sm`}>
+                <p className="text-sm text-brand-red">{error}</p>
+                <button onClick={resetForNextCard} className="btn-primary mt-3 mx-auto text-sm">
+                  {t('decks.scan.tryAgain')}
                 </button>
               </div>
             )}
@@ -765,6 +823,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
             <div className="text-sm font-mono text-white/90 text-center max-w-sm leading-relaxed break-words">
               cam:{cameraStatus} lib:{debugInfo.libState || 'idle'} ticks:{debugInfo.tickCount}
               {debugInfo.libError && <><br />lib error: {debugInfo.libError}</>}
+              {debugInfo.tickError && <><br />tick error: {debugInfo.tickError}</>}
               {debugInfo.ocrName !== undefined && (
                 <><br />ocr name:{debugInfo.ocrName ?? '(none)'} number:{debugInfo.ocrNumber ?? '(none)'}</>
               )}
@@ -787,17 +846,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                     .map((w) => `"${w.text.slice(0, 15)}"@y${w.y0}(${w.confidence})`)
                     .join(' ')}</>
               )}
-              {debugInfo.tickError && <><br />tick error: {debugInfo.tickError}</>}
             </div>
-
-            {phase === 'error' && (
-              <div className={`${ERROR_BANNER_CLASS} w-full max-w-sm`}>
-                <p className="text-sm text-brand-red">{error}</p>
-                <button onClick={resetForNextCard} className="btn-ghost mt-3 mx-auto text-sm">
-                  {t('decks.scan.tryAgain')}
-                </button>
-              </div>
-            )}
           </div>
         )}
 
@@ -811,7 +860,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
             {matches.length === 0 && (
               <div className="text-center py-6 space-y-3">
                 <p className="text-sm text-text-secondary">{t('decks.scan.noMatch')}</p>
-                <button onClick={resetForNextCard} className="btn-ghost mx-auto text-sm">{t('decks.scan.tryAgain')}</button>
+                <button onClick={resetForNextCard} className="btn-primary mx-auto text-sm">{t('decks.scan.tryAgain')}</button>
               </div>
             )}
             {matches.map((candidate, i) => {
