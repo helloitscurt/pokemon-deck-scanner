@@ -93,7 +93,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
         ):
             result = await match_deck_image(
                 self.instance.id, file=_upload(7), number_local=None, name=None, source=None,
-                current_user=self.user, db=self.db,
+                skip_phash=False, current_user=self.user, db=self.db,
             )
         self.assertTrue(result["_identity_confident"])
         self.assertEqual(result["matches"][0]["id"], self.card_a.id)
@@ -107,7 +107,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
         ) as mock_download:
             await match_deck_image(
                 self.instance.id, file=_upload(7), number_local=None, name=None, source=None,
-                current_user=self.user, db=self.db,
+                skip_phash=False, current_user=self.user, db=self.db,
             )
         passed_candidates = mock_download.call_args.args[1]
         self.assertEqual(
@@ -123,7 +123,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
         self._mark_scanned(self.card_c.id)
         result = await match_deck_image(
             self.instance.id, file=_upload(7), number_local="1", name=None, source=None,
-            current_user=self.user, db=self.db,
+            skip_phash=False, current_user=self.user, db=self.db,
         )
         self.assertTrue(result["_identity_confident"])
         self.assertEqual(result["matches"][0]["id"], self.card_a.id)
@@ -145,7 +145,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
         with patch("api.decks.download_candidate_images", new=AsyncMock(return_value={})):
             result = await match_deck_image(
                 self.instance.id, file=_upload(7), number_local="1", name=None, source=None,
-                current_user=self.user, db=self.db,
+                skip_phash=False, current_user=self.user, db=self.db,
             )
         self.assertFalse(result["_identity_confident"])
 
@@ -161,7 +161,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
             result = await match_deck_image(
                 self.instance.id, file=_upload(7), number_local=None,
                 name="bern PRALINE Fe Sprigatito", source=None,
-                current_user=self.user, db=self.db,
+                skip_phash=False, current_user=self.user, db=self.db,
             )
         self.assertTrue(result["_identity_confident"])
         self.assertEqual(result["matches"][0]["id"], self.card_a.id)
@@ -179,7 +179,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
             result = await match_deck_image(
                 self.instance.id, file=_upload(7), number_local=None,
                 name="bern PRALINE Fe Sprigadito", source=None,
-                current_user=self.user, db=self.db,
+                skip_phash=False, current_user=self.user, db=self.db,
             )
         self.assertTrue(result["_identity_confident"])
         self.assertEqual(result["matches"][0]["id"], self.card_a.id)
@@ -192,7 +192,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
             result = await match_deck_image(
                 self.instance.id, file=_upload(7), number_local=None,
                 name="Sprigatito Floragato evolution line", source=None,
-                current_user=self.user, db=self.db,
+                skip_phash=False, current_user=self.user, db=self.db,
             )
         self.assertFalse(result["_identity_confident"])
 
@@ -202,7 +202,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
         self._mark_scanned(self.card_c.id)
         result = await match_deck_image(
             self.instance.id, file=_upload(7), number_local=None, name=None, source=None,
-            current_user=self.user, db=self.db,
+            skip_phash=False, current_user=self.user, db=self.db,
         )
         self.assertFalse(result["_identity_confident"])
         self.assertEqual(result["matches"], [])
@@ -211,7 +211,7 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             await match_deck_image(
                 self.instance.id, file=_upload(7), number_local=None, name=None, source=None,
-                current_user=self.other_user, db=self.db,
+                skip_phash=False, current_user=self.other_user, db=self.db,
             )
         self.assertEqual(ctx.exception.status_code, 404)
 
@@ -222,10 +222,28 @@ class DeckImageMatchTests(unittest.IsolatedAsyncioTestCase):
         ) as mock_trace, patch("api.decks.download_candidate_images", new=AsyncMock(return_value={})):
             await match_deck_image(
                 self.instance.id, file=_upload(7), number_local=None, name=None, source="live_auto_scan",
-                current_user=self.user, db=self.db,
+                skip_phash=False, current_user=self.user, db=self.db,
             )
         self.assertEqual(mock_trace.call_args.kwargs["provider"], "deck_image")
         self.assertEqual(mock_trace.call_args.kwargs["source"], "live_auto_scan")
+
+    async def test_skip_phash_bypasses_phash_even_with_enough_candidates_to_run_it(self):
+        # Phase 3's Path B (docs/plans/live-card-scanner.md) uploads a
+        # number-only crop, not a full-card photo — pHash on a fragment
+        # could land closer to the wrong candidate than to no candidate at
+        # all, so skip_phash must skip the comparison entirely rather than
+        # relying on pHash naturally declining to match. Falls through to
+        # the number tier instead, same candidates (3) that would
+        # otherwise be enough for pHash to run.
+        with patch("api.decks.download_candidate_images", new=AsyncMock(return_value={})) as mock_download:
+            result = await match_deck_image(
+                self.instance.id, file=_upload(7), number_local="1", name=None, source="live_zoom_scan",
+                skip_phash=True, current_user=self.user, db=self.db,
+            )
+        mock_download.assert_not_called()
+        self.assertTrue(result["_identity_confident"])
+        self.assertEqual(result["matches"][0]["id"], self.card_a.id)
+        self.assertEqual(result["_identity_decision"], "deck_number_unique")
 
 
 if __name__ == "__main__":

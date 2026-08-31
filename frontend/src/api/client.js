@@ -138,13 +138,18 @@ export const recognizeCard = (imageFile, source, signal) => {
 // — a small, already-known local list — instead of a broad TCGdex catalog
 // search. numberLocal/name (both optional, from cardOcr.js) only narrow
 // among that instance's own cards, never search anything broader.
-// signal: see recognizeCard's comment just above.
-export const matchDeckImage = (instanceId, imageBlob, { numberLocal, name } = {}, source, signal) => {
+// signal: see recognizeCard's comment just above. skipPhash: set by Phase
+// 3's Path B (live-zoom-only scans, no full-card photo) — pHash on a
+// number-only crop could land closer to the wrong candidate than to no
+// candidate at all, so this skips straight to the number/name-unique
+// tiers instead of relying on pHash naturally declining to match.
+export const matchDeckImage = (instanceId, imageBlob, { numberLocal, name } = {}, source, signal, skipPhash) => {
   const formData = new FormData()
   formData.append('file', imageBlob)
   if (numberLocal) formData.append('number_local', numberLocal)
   if (name) formData.append('name', name)
   if (source) formData.append('source', source)
+  if (skipPhash) formData.append('skip_phash', 'true')
   return api.post(`/decks/instances/${instanceId}/match-image`, formData, {
     headers: { 'Content-Type': 'multipart/form-data' },
     signal,

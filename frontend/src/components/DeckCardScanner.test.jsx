@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DeckCardScanner from './DeckCardScanner'
 import { matchDeckImage, recognizeCard } from '../api/client'
 import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrRawText, lastOcrWords, recognizeCardText } from '../utils/cardOcr'
+import { lastOcrRawText, lastOcrWords, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
 
 vi.mock('../api/client', () => ({
   recognizeCard: vi.fn(),
@@ -28,6 +28,7 @@ vi.mock('../utils/cardDetection', () => ({
 
 vi.mock('../utils/cardOcr', () => ({
   recognizeCardText: vi.fn(),
+  recognizeNumberRegion: vi.fn(),
   preloadCardOcr: vi.fn(),
   lastOcrRawText: { value: '' },
   lastOcrWords: { value: [] },
@@ -52,6 +53,8 @@ vi.mock('../contexts/SettingsContext', () => ({
 
 const DETECTION_INTERVAL_MS = 90 // must match DeckCardScanner.jsx's own constant
 const REQUIRED_STABLE_FRAMES = 8 // must match DeckCardScanner.jsx's own constant
+const NUMBER_OCR_INTERVAL_MS = 700 // must match DeckCardScanner.jsx's own constant
+const REQUIRED_HIGH_CONFIDENCE_PASSES = 3 // must match DeckCardScanner.jsx's own constant
 
 const STABLE_QUAD = {
   topLeftCorner: { x: 10, y: 10 },
@@ -73,6 +76,15 @@ function stubMediaAndCanvas() {
     moveTo: vi.fn(), lineTo: vi.fn(), closePath: vi.fn(), stroke: vi.fn(),
   }
   vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context2d)
+  // jsdom has no real toBlob() without the optional `canvas` npm package —
+  // it warns and never invokes the callback at all, which would hang
+  // attemptZoomMatch forever (Path B draws directly onto a real DOM canvas
+  // ref, unlike Path A's mocked extractCard()). Path A itself never hits
+  // this because its own crop comes from the mocked extractCard() return
+  // value, not a raw canvas ref.
+  vi.spyOn(HTMLCanvasElement.prototype, 'toBlob').mockImplementation(function toBlob(callback) {
+    callback(new Blob(['fake'], { type: 'image/jpeg' }))
+  })
   vi.spyOn(HTMLMediaElement.prototype, 'play').mockResolvedValue()
   vi.spyOn(HTMLMediaElement.prototype, 'pause').mockImplementation(() => {})
   Object.defineProperty(HTMLMediaElement.prototype, 'readyState', { configurable: true, value: 4 })
@@ -93,6 +105,16 @@ async function advanceTicks(n = 1) {
   }
 }
 
+// Same idea as advanceTicks, but for Phase 3's Path B throttled loop
+// (700ms cadence) rather than the 90ms detection loop.
+async function advanceNumberOcrTicks(n = 1) {
+  for (let i = 0; i < n; i++) {
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(NUMBER_OCR_INTERVAL_MS)
+    })
+  }
+}
+
 describe('DeckCardScanner', () => {
   let onConfirm
 
@@ -107,6 +129,9 @@ describe('DeckCardScanner', () => {
     // to the paid recognizeCard() path unchanged. Tests that specifically
     // cover the free tiers override these themselves.
     recognizeCardText.mockResolvedValue({ name: null, number_local: null })
+    // Path B never fires by default (null read) — tests below that care
+    // about it override this themselves.
+    recognizeNumberRegion.mockResolvedValue({ number_local: null, number_total: null, confidence: 0 })
     matchDeckImage.mockResolvedValue({ _identity_confident: false, matches: [] })
     // Plain mutable objects, not vi.fn() mocks — clearAllMocks in afterEach
     // doesn't touch these, so reset explicitly to avoid one test's value
@@ -699,5 +724,224 @@ describe('DeckCardScanner', () => {
     expect(screen.queryByText('decks.scan.failed')).not.toBeInTheDocument()
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).not.toHaveBeenCalled()
+  })
+
+  describe('Path B — throttled number-only OCR pass', () => {
+    // Path B's main case is no quad at all (zoomed in past the card's
+    // edges) — nulling detectCardQuad also keeps Path A's own 90ms loop
+    // from accumulating a stability streak and interfering, since
+    // advanceNumberOcrTicks's 700ms fake-timer advances also tick the 90ms
+    // detection interval along the way.
+    beforeEach(() => {
+      detectCardQuad.mockResolvedValue(null)
+    })
+
+    it('does not start a new pass while one is still in flight', async () => {
+      let resolveRegion
+      recognizeNumberRegion.mockImplementation(() => new Promise((resolve) => { resolveRegion = resolve }))
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceNumberOcrTicks(1)
+      expect(recognizeNumberRegion).toHaveBeenCalledTimes(1)
+
+      // Two more ticks elapse while the first pass is still unresolved —
+      // the serial guard must skip starting new ones, not queue them.
+      await advanceNumberOcrTicks(2)
+      expect(recognizeNumberRegion).toHaveBeenCalledTimes(1)
+
+      await act(async () => {
+        resolveRegion({ number_local: null, number_total: null, confidence: 0 })
+        await Promise.resolve()
+      })
+      await advanceNumberOcrTicks(1)
+      expect(recognizeNumberRegion).toHaveBeenCalledTimes(2)
+    })
+
+    it('shows a name preview once the read number uniquely matches a missing card, independent of the auto-trigger threshold', async () => {
+      recognizeNumberRegion.mockResolvedValue({ number_local: '25', number_total: '198', confidence: 60 })
+      render(
+        <DeckCardScanner
+          isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3"
+          missingCards={[{ number: '25', name: 'Pikachu' }]}
+        />,
+      )
+
+      await advanceNumberOcrTicks(1)
+
+      expect(screen.getByText('Pikachu')).toBeInTheDocument()
+      // 60% is below the auto-trigger threshold — a preview, not a save.
+      expect(matchDeckImage).not.toHaveBeenCalled()
+    })
+
+    it('does not attempt a match until confidence sustains for the required streak, only 1-2 passes', async () => {
+      recognizeNumberRegion.mockResolvedValue({ number_local: '25', number_total: '198', confidence: 85 })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceNumberOcrTicks(REQUIRED_HIGH_CONFIDENCE_PASSES - 1)
+
+      expect(matchDeckImage).not.toHaveBeenCalled()
+    })
+
+    it('auto-saves through the existing confirm path once confidence sustains, skipping pHash and labeling the source', async () => {
+      recognizeNumberRegion.mockResolvedValue({ number_local: '25', number_total: '198', confidence: 85 })
+      matchDeckImage.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-zoom1',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceNumberOcrTicks(REQUIRED_HIGH_CONFIDENCE_PASSES)
+
+      // skip_phash (6th arg) true, and a distinct source — this is a
+      // number-only crop, not a full-card photo, so pHash must not run
+      // server-side against it (see the plan's "pHash false-positive
+      // risk").
+      expect(matchDeckImage).toHaveBeenCalledWith(
+        '3', expect.anything(), { numberLocal: '25', name: null }, 'live_zoom_scan', expect.anything(), true,
+      )
+      // Not a second/parallel save path — the same confirmCard/onConfirm
+      // route Path A already uses.
+      expect(onConfirm).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'p1' }),
+        { isAutoSave: true, traceId: 'trace-zoom1' },
+      )
+    })
+
+    it('resumes scanning without a picker when the match is not confident, unlike Path A', async () => {
+      recognizeNumberRegion.mockResolvedValue({ number_local: '25', number_total: '198', confidence: 85 })
+      matchDeckImage.mockResolvedValue({ _identity_confident: false, matches: [] })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceNumberOcrTicks(REQUIRED_HIGH_CONFIDENCE_PASSES)
+
+      expect(recognizeCard).not.toHaveBeenCalled()
+      expect(onConfirm).not.toHaveBeenCalled()
+      expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
+    })
+  })
+
+  describe('recent-scans stack', () => {
+    it('adds the confirmed card to the recent-scans stack after a successful save', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-stack1',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      const thumb = screen.getByAltText('Pikachu')
+      expect(thumb).toHaveAttribute('src', '/api/images/card/p1/small')
+    })
+
+    it('keeps recently confirmed cards in scan order, newest last', async () => {
+      recognizeCard.mockResolvedValueOnce({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-stack2a',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      // Same choreography the "captures a new card swapped in" test above
+      // uses to get a second real capture through the state machine: let
+      // the checkmark/cooldown elapse, then swap in a card at a position
+      // far enough away to clear awaitingCardRemovalRef.
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      const SWAPPED_QUAD = {
+        topLeftCorner: { x: 300, y: 250 },
+        topRightCorner: { x: 400, y: 250 },
+        bottomLeftCorner: { x: 300, y: 400 },
+        bottomRightCorner: { x: 400, y: 400 },
+      }
+      detectCardQuad.mockResolvedValue(SWAPPED_QUAD)
+      recognizeCard.mockResolvedValueOnce({
+        _identity_confident: true,
+        matches: [{ id: 'p2', name: 'Charmander' }],
+        trace_id: 'trace-stack2b',
+      })
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      // The stack appends (newest last), it doesn't prepend — Pikachu
+      // (scanned first) must still precede Charmander in DOM order.
+      const names = screen.getAllByRole('img').map((img) => img.getAttribute('alt'))
+      expect(names.indexOf('Pikachu')).toBeLessThan(names.indexOf('Charmander'))
+    })
+
+    it('drops the oldest thumbnail once the stack exceeds its cap', async () => {
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      // One more scan than RECENT_SCANS_LIMIT (5) — same null-quad/
+      // STABLE_QUAD re-arm technique the "does not immediately re-capture"
+      // test above uses to get a fresh capture through the state machine
+      // each time, rather than a position-based swap.
+      for (let i = 0; i < 6; i++) {
+        recognizeCard.mockResolvedValueOnce({
+          _identity_confident: true,
+          matches: [{ id: `p${i}`, name: `Card${i}` }],
+          trace_id: `trace-cap${i}`,
+        })
+        await advanceTicks(REQUIRED_STABLE_FRAMES)
+        await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+        detectCardQuad.mockResolvedValueOnce(null)
+        await advanceTicks(1)
+        detectCardQuad.mockResolvedValue(STABLE_QUAD)
+      }
+
+      expect(recognizeCard).toHaveBeenCalledTimes(6)
+      // Card0 (the oldest, first scanned) has been dropped; the other 5
+      // remain.
+      expect(screen.queryByAltText('Card0')).not.toBeInTheDocument()
+      expect(screen.getAllByRole('img')).toHaveLength(5)
+      expect(screen.getByAltText('Card5')).toBeInTheDocument()
+    })
+
+    it('keeps the recent-scans stack when the scanner is closed and reopened', async () => {
+      // Real-device feedback: closing the scanner and coming straight back
+      // (e.g. to check something else in the app) shouldn't wipe the scan
+      // history the user was just looking at.
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-reset1',
+      })
+      const { rerender } = render(
+        <DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />,
+      )
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(screen.getByAltText('Pikachu')).toBeInTheDocument()
+
+      rerender(<DeckCardScanner isOpen={false} onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      rerender(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      expect(screen.getByAltText('Pikachu')).toBeInTheDocument()
+    })
+  })
+
+  it('clears the detection outline the instant a capture starts, not once the result banner disappears', async () => {
+    // handleScanNow (unlike the auto-hold tick loop, which redraws the
+    // outline via drawOverlay every tick) never itself touches the overlay
+    // canvas — so any clearRect on it after this triggers can only be the
+    // phase-change cleanup effect's own doing, not drawOverlay's regular
+    // per-tick redraw. matchDeckImage never resolving keeps phase pinned
+    // at 'processing' so there's no race with the checkmark/cooldown timers.
+    matchDeckImage.mockImplementation(() => new Promise(() => {}))
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    // One tick so the overlay canvas has real dimensions and latestQuadRef
+    // has a quad to seed handleScanNow's capture with.
+    await advanceTicks(1)
+
+    const context2d = HTMLCanvasElement.prototype.getContext()
+    context2d.clearRect.mockClear()
+
+    await act(async () => {
+      fireEvent.click(screen.getByText('decks.scan.scanNow'))
+      await Promise.resolve()
+    })
+
+    expect(context2d.clearRect).toHaveBeenCalledWith(0, 0, 640, 480)
   })
 })

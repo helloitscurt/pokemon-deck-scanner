@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useMemo, useState } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ArrowLeft, Camera, RotateCcw, Trash2 } from 'lucide-react'
@@ -10,7 +10,7 @@ import { resolveCardImageUrl } from '../utils/imageUrl'
 import { CardModal } from '../components/CardItem'
 import { CompactCardArtwork } from '../components/UnifiedCard'
 import DeckCardScanner from '../components/DeckCardScanner'
-import { missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
+import { isDeckCardMissing, missingQuantity, selectVisibleDeckCards } from '../utils/deckChecklist'
 
 export default function DeckDetail() {
   const { instanceId } = useParams()
@@ -27,6 +27,16 @@ export default function DeckDetail() {
     queryKey: ['deck-instance', instanceId],
     queryFn: () => getDeckInstance(instanceId),
   })
+
+  // Live scanner's Path B name-preview (docs/plans/live-card-scanner.md,
+  // Decision 8) — reuses this already-fetched list, no new fetch, no
+  // network call from inside the scanner itself.
+  const missingCards = useMemo(() => (
+    (data?.cards || [])
+      .filter(isDeckCardMissing)
+      .map((dc) => ({ number: dc.card?.number, name: dc.card?.name }))
+      .filter((c) => c.number && c.name)
+  ), [data?.cards])
 
   const invalidate = () => {
     queryClient.invalidateQueries({ queryKey: ['deck-instance', instanceId] })
@@ -325,6 +335,7 @@ export default function DeckDetail() {
         onClose={() => setScannerOpen(false)}
         onConfirm={(candidate, meta) => scanMutation.mutateAsync({ candidate, ...meta })}
         deckInstanceId={instanceId}
+        missingCards={missingCards}
       />
     </div>
   )

@@ -361,6 +361,12 @@ async def match_deck_image(
     number_local: str | None = Form(default=None),
     name: str | None = Form(default=None),
     source: str | None = Form(default=None),
+    # Set by the live scanner's Path B (docs/plans/live-card-scanner.md,
+    # Phase 3) when `file` is a number-only crop, not a full-card photo —
+    # pHash on a fragment could land closer to the wrong candidate than to
+    # no candidate at all (see the plan's "pHash false-positive risk" Risk),
+    # so this skips straight to the number/name-unique tiers instead.
+    skip_phash: bool = Form(default=False),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
@@ -399,7 +405,7 @@ async def match_deck_image(
         # margin (see services/phash.py) — with fewer than 2 image-bearing
         # candidates it can never run, regardless of how many missing cards
         # there are (e.g. a near-finished deck with exactly one card left).
-        if len(candidates) >= 2:
+        if not skip_phash and len(candidates) >= 2:
             async with httpx.AsyncClient(timeout=20) as client:
                 candidate_images = await download_candidate_images(
                     client, candidates, db=db,
@@ -458,8 +464,9 @@ async def match_deck_image(
         # (pHash distances, etc.) when a user has opted into it.
         logger.info(
             "deck match-image: instance=%s candidates=%s ocr_number=%r ocr_name=%r "
-            "-> confident=%s decision=%s winner=%s",
+            "source=%r skip_phash=%s -> confident=%s decision=%s winner=%s",
             instance_id, len(candidates), number_local, name,
+            source, skip_phash,
             winner is not None, decision,
             f"{winner['id']} ({winner['name']})" if winner else None,
         )

@@ -109,7 +109,7 @@ const MIN_NAME_CONFIDENCE = 40
 // candidate at all. Filtering per-word lets a good word survive bad
 // neighbors, and adjacent surviving words get joined back into a name in
 // their original reading order (top-to-bottom, then left-to-right).
-function flattenWords(blocks) {
+export function flattenWords(blocks) {
   const words = []
   for (const block of blocks || []) {
     for (const paragraph of block.paragraphs || []) {
@@ -180,4 +180,63 @@ export async function recognizeCardText(cardCanvas) {
     ...parseCardOcrText(rawText),
     name: pickCardName(data?.blocks, cardCanvas?.height),
   }
+}
+
+let numberWorkerPromise = null
+
+// A dedicated second worker for Phase 3's continuous throttled number-only
+// pass (docs/plans/live-card-scanner.md, Decision 5) — deliberately NOT
+// shared with ensureWorker()'s singleton above. Verified against
+// tesseract.js's own source: setParameters/recognize are both jobs queued
+// on one worker, processed serially, and setParameters persists across
+// later jobs — a shared worker would leak this narrow whitelist into Path
+// A's full-card capture-time OCR, and the two calls would queue behind
+// each other instead of running concurrently. The ~4MB eng.traineddata
+// itself is still fetched once and shared via the same IndexedDB cache
+// ensureWorker() already relies on — only the worker instance is
+// duplicated, not the language-data download.
+function ensureNumberWorker() {
+  if (!numberWorkerPromise) {
+    numberWorkerPromise = createWorker('eng', 1, {
+      workerPath: '/tesseract/worker.min.js',
+      corePath: '/tesseract/tesseract-core-simd-lstm.wasm.js',
+      langPath: '/tesseract',
+      gzip: false,
+    }).then(async (worker) => {
+      // Narrows the engine's search space to what a collector number can
+      // ever contain (digits, a slash, and the occasional short alpha
+      // prefix/suffix — see NUMBER_PATTERN). Set once here, not per call —
+      // this worker is never used for anything else, so the whitelist
+      // persisting across every future job on it is exactly what's wanted.
+      await worker.setParameters({
+        tessedit_char_whitelist: '0123456789/ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz',
+      })
+      return worker
+    }).catch((err) => {
+      numberWorkerPromise = null
+      throw err
+    })
+  }
+  return numberWorkerPromise
+}
+
+// A second, narrower OCR call for Phase 3's throttled Path B pass — reads
+// only a small crop already framed on the collector number (see
+// numberBand.js), not a full card. confidence is per the plan's Decision
+// 1: the average confidence of the words that make up the read number
+// text itself, not a whole-crop average that could be diluted by stray
+// noise elsewhere in the crop — falls back to Tesseract's own page-level
+// confidence only when no words were recognized at all (a blank/garbled
+// crop).
+export async function recognizeNumberRegion(canvas) {
+  const worker = await ensureNumberWorker()
+  const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true })
+  const rawText = data?.text || ''
+  const { number_local, number_total } = parseCardOcrText(rawText)
+  const words = flattenWords(data?.blocks)
+  const numberWords = words.filter((w) => /[0-9A-Za-z/]/.test(w.text || ''))
+  const confidence = numberWords.length
+    ? Math.round(numberWords.reduce((sum, w) => sum + (w.confidence ?? 0), 0) / numberWords.length)
+    : Math.round(data?.confidence ?? 0)
+  return { number_local, number_total, confidence }
 }

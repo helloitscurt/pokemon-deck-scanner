@@ -1,14 +1,15 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { AlertTriangle, Camera, Check, Loader2, X } from 'lucide-react'
+import { AlertTriangle, Camera, Check, Loader2, Plus, X } from 'lucide-react'
 import { matchDeckImage, recognizeCard } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
 import { useCameraStream } from '../hooks/useCameraStream'
 import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrRawText, lastOcrWords, preloadCardOcr, recognizeCardText } from '../utils/cardOcr'
+import { lastOcrRawText, lastOcrWords, preloadCardOcr, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
 import { createStabilityTracker, quadsAreStable } from '../utils/quadStability'
+import { computeNumberBandRect } from '../utils/numberBand'
 
 // Real-device tuning, three passes: first (5 frames @ 2% tolerance @
 // 180ms = 900ms dwell) felt slow and twitchy — ordinary jitter from
@@ -51,6 +52,26 @@ const CARD_CROP_HEIGHT = 525
 // upload needs to stay small and fast. Same 2.5:3.5 ratio, just 2x scale.
 const OCR_CROP_WIDTH = CARD_CROP_WIDTH * 2
 const OCR_CROP_HEIGHT = CARD_CROP_HEIGHT * 2
+// Phase 3's Path B (docs/plans/live-card-scanner.md): a throttled, number-
+// only OCR pass independent of Path A's quad-stability capture above —
+// runs whether or not a quad is currently detected, so zooming in past the
+// card's edges still gets a live reading. Reasoned starting points, not
+// empirically calibrated against real devices yet — same caveat every
+// other tuning constant on this page carries.
+const NUMBER_OCR_INTERVAL_MS = 700
+const NUMBER_CONFIDENCE_THRESHOLD = 80
+const NUMBER_CONFIDENCE_MEDIUM_THRESHOLD = 50
+const REQUIRED_HIGH_CONFIDENCE_PASSES = 3
+const NUMBER_BAND_FALLBACK_PASSES = 3
+// How many recently-confirmed cards the on-screen stack keeps at once —
+// see RecentScansStack below. Matches the "3 or 5" the feature was
+// requested at; 5 gives a fuller sense of scan history without the stack
+// growing tall enough to crowd the video feed on a phone.
+const RECENT_SCANS_LIMIT = 5
+// How long the oldest thumbnail's collapse animation runs before it's
+// actually dropped from state (see addRecentScan) — must match the
+// duration in RecentScansStack's own transition classes below.
+const RECENT_SCAN_COLLAPSE_MS = 300
 
 const ERROR_BANNER_CLASS = 'card border-brand-red/30 bg-brand-red/5 text-center py-4'
 
@@ -110,6 +131,131 @@ function drawOverlay(canvas, quad, stableFraction) {
   ctx.stroke()
 }
 
+function normalizeNumberForPreview(value) {
+  return String(value || '').trim().replace(/^0+(?=\d)/, '').toUpperCase()
+}
+
+// Phase 3, Decision 8: a plain client-side lookup against this deck
+// instance's own still-missing cards, no network call. A reasoned
+// approximation of the backend's real normalize_scanner_card_number
+// (strips leading zeros, case-insensitive) — this is only a preview; the
+// actual save decision still goes through the backend's authoritative
+// match.
+function findUniqueMissingCardName(missingCards, numberLocal) {
+  if (!numberLocal || !missingCards?.length) return null
+  const target = normalizeNumberForPreview(numberLocal)
+  const matches = missingCards.filter((c) => normalizeNumberForPreview(c.number) === target)
+  return matches.length === 1 ? matches[0].name : null
+}
+
+function confidenceBadgeClass(confidence) {
+  if (confidence >= NUMBER_CONFIDENCE_THRESHOLD) return 'bg-green/20 text-green'
+  if (confidence >= NUMBER_CONFIDENCE_MEDIUM_THRESHOLD) return 'bg-yellow/20 text-yellow'
+  // NOT the .badge-red/bg-brand-red class — --color-brand-red is
+  // theme-swapped (yellow in "electric", green in "grass", etc., see
+  // index.css and currentBrandRed() above), which would collide with
+  // drawOverlay's unrelated use of that same variable in at least two
+  // themes. pokemon-red (tailwind.config.js) is a fixed, non-theme-swapped
+  // literal (#e3000b) — the actually-fixed token this needs.
+  return 'bg-pokemon-red/20 text-pokemon-red'
+}
+
+// One thumbnail in the recent-scans stack. Mounts at opacity-0/translated
+// down, then flips to its resting state a frame later — a plain mount
+// effect, not a library, so the newest card visibly slides/fades in at the
+// bottom of the stack rather than just popping into place. Also doubles as
+// a quick-add button (Decision: reuse the exact same confirmCard save path
+// every other confirm uses, rather than a separate lightweight call — see
+// onQuickAdd below) — tapping it saves another copy of that same card
+// without needing to physically re-present it to the camera, for
+// duplicates (energy cards especially) where scanning each physical copy
+// individually is pure friction.
+function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confirming, label }) {
+  const [entered, setEntered] = useState(false)
+
+  useEffect(() => {
+    const frame = requestAnimationFrame(() => setEntered(true))
+    return () => cancelAnimationFrame(frame)
+  }, [])
+
+  return (
+    <div
+      className="grid transition-[grid-template-rows] ease-out"
+      style={{
+        gridTemplateRows: collapsing ? '0fr' : '1fr',
+        transitionDuration: `${RECENT_SCAN_COLLAPSE_MS}ms`,
+      }}
+    >
+      <div className="overflow-hidden">
+        <button
+          type="button"
+          onClick={() => onQuickAdd(scan)}
+          disabled={quickAddDisabled}
+          aria-label={label}
+          className="pointer-events-auto relative block transition-all duration-300 ease-out disabled:cursor-not-allowed"
+          style={{
+            opacity: entered && !collapsing ? 1 : 0,
+            transform: entered && !collapsing ? 'translateY(0)' : 'translateY(8px)',
+          }}
+        >
+          <img
+            src={scan.image}
+            alt={scan.name}
+            // 3x the original h-10 (40px) — real-device feedback was that
+            // the card needed to actually be readable at a glance, not
+            // just present as a tiny icon.
+            className="h-[120px] w-auto rounded-lg border border-white/25 object-contain shadow-lg"
+          />
+          {confirming ? (
+            <span className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/60">
+              <Loader2 size={20} className="animate-spin text-white" />
+            </span>
+          ) : (
+            // A plain image doesn't read as tappable on its own — this
+            // marks it as "tap for another" without needing a label
+            // visible at all times.
+            <span className="absolute -right-1.5 -top-1.5 grid h-6 w-6 place-items-center rounded-full border border-white/40 bg-brand-red text-white shadow">
+              <Plus size={14} strokeWidth={3} />
+            </span>
+          )}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+// Vertical stack of the last RECENT_SCANS_LIMIT confirmed cards, newest at
+// the bottom (see addRecentScan, which appends). Anchored to the video's
+// bottom-right corner (not top) so the effect is a real "push up": the
+// newest thumbnail always lands in the same fixed bottom slot, and each
+// earlier one is shifted upward to make room above it purely by normal
+// flex-column layout — no per-item transform math needed. Floats over the
+// video feed rather than sitting in normal flow — same reasoning as the
+// "Scan now" button below: a portrait video can fill most of the
+// viewport, so anything meant to stay visible during hunting has to
+// overlay it, not follow it.
+function RecentScansStack({ scans, collapsingKey, label, onQuickAdd, quickAddDisabled, confirmingKey, quickAddLabel }) {
+  if (!scans.length) return null
+  return (
+    <div
+      className="absolute right-2 bottom-2 z-10 flex flex-col gap-1.5"
+      aria-label={label}
+    >
+      {scans.map((scan) => (
+        <RecentScanThumb
+          key={scan.key}
+          scan={scan}
+          collapsing={scan.key === collapsingKey}
+          onQuickAdd={onQuickAdd}
+          quickAddDisabled={quickAddDisabled}
+          confirming={confirmingKey === scan.key}
+          label={`${quickAddLabel}: ${scan.name}`}
+        />
+      ))}
+    </div>
+  )
+}
+
 /**
  * DeckCardScanner — live continuous-stream scanner for deck-tracking mode.
  * Detects a card in the camera feed client-side (jscanify/OpenCV.js, see
@@ -133,8 +279,13 @@ function drawOverlay(canvas, quad, stableFraction) {
  * full-viewport portal (matching CardScanner.jsx), not the Modal/Sheet
  * wrapper this component used before — a live camera feed doesn't fit a
  * container built for scrollable forms.
+ *
+ * missingCards (optional, docs/plans/live-card-scanner.md Phase 3): this
+ * deck instance's still-missing {number, name} pairs, already fetched by
+ * DeckDetail.jsx — used only for Path B's client-side name-preview lookup
+ * (Decision 8), never sent anywhere.
  */
-export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstanceId }) {
+export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstanceId, missingCards = [] }) {
   const { t } = useSettings()
 
   const manualFileRef = useRef()
@@ -191,6 +342,13 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   const [checkmarkMeta, setCheckmarkMeta] = useState(null)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+  // Last RECENT_SCANS_LIMIT confirmed cards (any save through confirmCard,
+  // auto or manual), newest last — see RecentScansStack. collapsingScanKey
+  // names the one entry currently mid collapse-out animation, cleared once
+  // recentScanRemovalTimerRef's timeout actually drops it from the array.
+  const [recentScans, setRecentScans] = useState([])
+  const [collapsingScanKey, setCollapsingScanKey] = useState(null)
+  const recentScanRemovalTimerRef = useRef(null)
   const [confirmError, setConfirmError] = useState(null)
   const [confirmingKey, setConfirmingKey] = useState(null)
   // Visible diagnostic readout, not devtools-only — this app has no console
@@ -213,6 +371,32 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // tie up the connection/backend for a result nobody wants anymore.
   const abortControllerRef = useRef(null)
 
+  // Phase 3's Path B (docs/plans/live-card-scanner.md) — a throttled,
+  // number-only OCR pass independent of the tick loop above. Strictly
+  // serial (Decision 6): numberOcrInFlightRef guards this loop the same
+  // way tickInFlightRef guards the 90ms one, but is kept separate — a
+  // several-hundred-ms Tesseract call inside the 90ms tick would stall
+  // quad detection entirely, defeating the point of throttling OCR apart
+  // from it. highConfidenceStreakRef counts consecutive passes at/above
+  // NUMBER_CONFIDENCE_THRESHOLD (Decision 7); passesSinceValidReadRef
+  // counts consecutive passes with no regex-valid number read at all, so
+  // numberBand.js can widen its guess (see the throttled effect below).
+  const numberOcrInFlightRef = useRef(false)
+  const highConfidenceStreakRef = useRef(0)
+  const passesSinceValidReadRef = useRef(0)
+  const numberCropCanvasRef = useRef(null)
+  const [liveNumberConfidence, setLiveNumberConfidence] = useState(null)
+  const [liveNumberText, setLiveNumberText] = useState(null)
+  const [liveNamePreview, setLiveNamePreview] = useState(null)
+
+  const resetNumberOcrState = () => {
+    highConfidenceStreakRef.current = 0
+    passesSinceValidReadRef.current = 0
+    setLiveNumberConfidence(null)
+    setLiveNumberText(null)
+    setLiveNamePreview(null)
+  }
+
   const cameraActive = isOpen && phase !== 'cameraDenied'
   const { videoRef, status: cameraStatus } = useCameraStream({ active: cameraActive })
 
@@ -234,7 +418,13 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     setError(null)
     setConfirmError(null)
     stabilityTrackerRef.current.reset()
+    resetNumberOcrState()
     setPhase('hunting')
+    // recentScans is deliberately NOT reset here — real-device feedback
+    // was that closing the scanner and coming straight back (e.g. to check
+    // something else in the app) shouldn't wipe the scan history the user
+    // was just looking at. It only ever grows via addRecentScan and trims
+    // itself at RECENT_SCANS_LIMIT, so there's nothing stale to clear.
   }, [isOpen])
 
   // Preload OpenCV.js/jscanify as soon as the scanner opens, so the first
@@ -254,6 +444,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     clearTimers()
     clearInterval(processingTimerRef.current)
     abortControllerRef.current?.abort()
+    clearTimeout(recentScanRemovalTimerRef.current)
   }, [])
 
   // deckScanStatus (see backend services/deck_progress.py's SCAN_* constants,
@@ -275,6 +466,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     timersRef.current.push(setTimeout(() => setShowCheckmark(false), holdDuration))
     timersRef.current.push(setTimeout(() => {
       stabilityTrackerRef.current.reset()
+      resetNumberOcrState()
       setPhase('hunting')
     }, holdDuration + COOLDOWN_AFTER_CHECKMARK_MS))
   }
@@ -286,6 +478,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     setConfirmError(null)
     setConfirmingKey(null)
     stabilityTrackerRef.current.reset()
+    resetNumberOcrState()
     setPhase(cameraFallbackLockedRef.current ? 'cameraDenied' : 'hunting')
   }
 
@@ -298,12 +491,46 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     clearTimers()
     setShowCheckmark(false)
     stabilityTrackerRef.current.reset()
+    resetNumberOcrState()
     setPhase(cameraFallbackLockedRef.current ? 'cameraDenied' : 'hunting')
   }
 
   const handleClose = () => {
     clearTimers()
     onClose?.()
+  }
+
+  // Appends a just-confirmed card to the recent-scans stack, trimming the
+  // oldest entry once it grows past RECENT_SCANS_LIMIT. The trim doesn't
+  // remove that entry immediately — it's flagged via collapsingScanKey so
+  // RecentScanThumb can animate it away first, and only actually dropped
+  // from recentScans once that animation's timeout fires. Keyed by
+  // id+timestamp (not just candidate.id) so scanning the same card twice
+  // in a row — an energy card, say — still gets two distinct stack
+  // entries instead of React treating the second as an update to the
+  // first.
+  const addRecentScan = (candidate) => {
+    const entry = {
+      key: `${candidate.id || 'card'}-${Date.now()}-${Math.random()}`,
+      image: resolveCardImageUrl(candidate, 'small'),
+      name: candidate.name,
+      // Kept so a stack entry can be quick-added again later (see
+      // quickAddRecentScan) without re-deriving it from image/name alone.
+      candidate,
+    }
+    setRecentScans((current) => {
+      const next = [...current, entry]
+      if (next.length > RECENT_SCANS_LIMIT) {
+        const oldestKey = next[0].key
+        setCollapsingScanKey(oldestKey)
+        clearTimeout(recentScanRemovalTimerRef.current)
+        recentScanRemovalTimerRef.current = setTimeout(() => {
+          setRecentScans((scans) => scans.filter((scan) => scan.key !== oldestKey))
+          setCollapsingScanKey(null)
+        }, RECENT_SCAN_COLLAPSE_MS)
+      }
+      return next
+    })
   }
 
   // Shared by every confirm path — auto-save on a confident live detection,
@@ -324,6 +551,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     setConfirmError(null)
     try {
       const response = await onConfirm(candidate, { isAutoSave, traceId })
+      addRecentScan(candidate)
       // The fallback path skips the checkmark theater — just clear back to
       // the ready-to-scan-next state (resetForNextCard already routes to
       // 'cameraDenied' vs 'hunting' correctly based on the same lock).
@@ -342,6 +570,20 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     } finally {
       setConfirmingKey(null)
     }
+  }
+
+  // Quick-add: tapping a recent-scans thumbnail saves another copy of that
+  // same card without re-presenting it to the camera — the energy-card
+  // duplicate use case. Deliberately routes through the exact same
+  // confirmCard() path a real capture uses (not a lighter-weight direct
+  // onConfirm call) so it gets the same checkmark/warning feedback and the
+  // same already-wired error toast (see DeckDetail.jsx's scanMutation
+  // onError) for free, instead of a second, easier-to-drift-out-of-sync
+  // save path. Only while actively hunting — tapping mid-capture would
+  // race enterSuccessCooldown's own phase/timer changes against this one's.
+  const quickAddRecentScan = (scan) => {
+    if (phase !== 'hunting' || confirmingKey != null || !scan.candidate) return
+    confirmCard(scan.candidate, scan.key, false, null)
   }
 
   // Free tiers, tried before the paid recognizeCard() call below: OCR
@@ -478,6 +720,54 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     }
   }
 
+  // Phase 3's Path B (docs/plans/live-card-scanner.md) — fires once the
+  // throttled number-only loop below sustains high confidence for
+  // REQUIRED_HIGH_CONFIDENCE_PASSES. Unlike captureAndRecognize, this never
+  // falls through to the paid recognizeCard API or the 'ambiguous' picker:
+  // Path B only ever has a number (and, from missingCards, at most a
+  // preview name), never a full-card photo worth showing a picker for — a
+  // non-confident or failed-save result just resumes scanning. skip_phash
+  // (the 6th matchDeckImage arg) is required here per the plan's "pHash
+  // false-positive risk" Risk: cropCanvas is a number-only fragment, not a
+  // full card, and pHash on a fragment could land closer to the wrong
+  // candidate than to none at all.
+  const attemptZoomMatch = async (cropCanvas, ocrFields) => {
+    setPhase('processing')
+    setProcessingSeconds(0)
+    processingTimerRef.current = setInterval(() => setProcessingSeconds((s) => s + 1), 1000)
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+    try {
+      const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
+      if (!blob || !deckInstanceId) {
+        resetForNextCard()
+        return
+      }
+      const data = await matchDeckImage(
+        deckInstanceId, blob,
+        { numberLocal: ocrFields.number_local, name: null },
+        'live_zoom_scan', controller.signal, true,
+      )
+      const topCandidate = data?.matches?.[0]
+      if (data?._identity_confident && topCandidate) {
+        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true, data.trace_id)
+        if (!saved) resetForNextCard()
+      } else {
+        resetForNextCard()
+      }
+    } catch (err) {
+      if (controller.signal.aborted) {
+        resetForNextCard()
+        return
+      }
+      setDebugInfo((d) => ({ ...d, tickError: `zoom-match: ${describeError(err)}` }))
+      resetForNextCard()
+    } finally {
+      clearInterval(processingTimerRef.current)
+      if (abortControllerRef.current === controller) abortControllerRef.current = null
+    }
+  }
+
   // Aborts whichever processing-phase request is currently in flight (the
   // free deck-match tier, or the paid recognizeCard fallback) — see
   // abortControllerRef's own comment for why this is a real
@@ -601,6 +891,85 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [phase, cameraStatus])
 
+  // ---- Phase 3's Path B: throttled, number-only OCR loop ----
+  // Independent of the 90ms detection loop above — runs whether or not a
+  // quad is currently detected, so zooming in past the card's edges (where
+  // detectCardQuad returns null and the loop above never captures) still
+  // gets a live reading. Gated on the same phase/cameraStatus condition, so
+  // this pauses automatically the instant either loop's own
+  // captureAndRecognize/attemptZoomMatch sets phase to 'processing'.
+  useEffect(() => {
+    if (phase !== 'hunting' || cameraStatus !== 'streaming') return undefined
+
+    const intervalId = setInterval(async () => {
+      if (numberOcrInFlightRef.current) return
+      const video = videoRef.current
+      const cropCanvas = numberCropCanvasRef.current
+      if (!video || !cropCanvas || video.readyState < 2 || !video.videoWidth) return
+
+      numberOcrInFlightRef.current = true
+      try {
+        const quadInfo = latestQuadRef.current
+        const fallbackLevel = Math.min(2, Math.floor(passesSinceValidReadRef.current / NUMBER_BAND_FALLBACK_PASSES))
+        const sourceCanvas = quadInfo ? detectionCanvasRef.current : video
+        const sourceWidth = quadInfo ? quadInfo.detectionWidth : video.videoWidth
+        const sourceHeight = quadInfo ? quadInfo.detectionHeight : video.videoHeight
+        if (!sourceCanvas) return
+
+        const rect = computeNumberBandRect(sourceWidth, sourceHeight, quadInfo?.quad, fallbackLevel)
+        const cropWidth = Math.max(1, Math.round(rect.width))
+        const cropHeight = Math.max(1, Math.round(rect.height))
+        cropCanvas.width = cropWidth
+        cropCanvas.height = cropHeight
+        cropCanvas.getContext('2d').drawImage(
+          sourceCanvas, rect.x, rect.y, rect.width, rect.height, 0, 0, cropWidth, cropHeight,
+        )
+
+        const { number_local, number_total, confidence } = await recognizeNumberRegion(cropCanvas)
+        const numberText = number_local && number_total ? `${number_local}/${number_total}` : null
+        passesSinceValidReadRef.current = numberText ? 0 : passesSinceValidReadRef.current + 1
+
+        setLiveNumberConfidence(confidence)
+        setLiveNumberText(numberText)
+        setLiveNamePreview(numberText ? findUniqueMissingCardName(missingCards, number_local) : null)
+
+        // Gates *when* to attempt the deck-scoped match (Decision 7) — not
+        // proof the match is correct. The uniqueness check inside
+        // attemptZoomMatch's matchDeckImage call is what actually protects
+        // against a confidently-read misread colliding with a different
+        // missing card.
+        const meetsThreshold = Boolean(numberText) && confidence >= NUMBER_CONFIDENCE_THRESHOLD
+        highConfidenceStreakRef.current = meetsThreshold ? highConfidenceStreakRef.current + 1 : 0
+
+        if (highConfidenceStreakRef.current >= REQUIRED_HIGH_CONFIDENCE_PASSES) {
+          highConfidenceStreakRef.current = 0
+          await attemptZoomMatch(cropCanvas, { number_local })
+        }
+      } catch (err) {
+        setDebugInfo((d) => ({ ...d, tickError: `number-ocr: ${describeError(err)}` }))
+      } finally {
+        numberOcrInFlightRef.current = false
+      }
+    }, NUMBER_OCR_INTERVAL_MS)
+
+    return () => clearInterval(intervalId)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [phase, cameraStatus])
+
+  // The detection outline is only ever (re)drawn by the hunting-phase tick
+  // loop above, which stops running the instant a capture fires (phase
+  // leaves 'hunting') — so without this, the last frame's outline just sits
+  // there, frozen, for the entire processing/checkmark/warning sequence
+  // that follows, and only clears once hunting resumes and redraws it.
+  // Real-device feedback: the box should disappear as soon as the card
+  // stops being actively detected, not linger until the result banner
+  // itself goes away.
+  useEffect(() => {
+    if (phase === 'hunting') return
+    const canvas = overlayCanvasRef.current
+    canvas?.getContext('2d')?.clearRect(0, 0, canvas.width, canvas.height)
+  }, [phase])
+
   // Freeze the visible frame instead of letting it keep playing behind the
   // spinner/candidate list/checkmark — matches the plan's "freeze + crop"
   // flow rather than a live feed still moving under a result the user is
@@ -715,6 +1084,34 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
               <canvas ref={overlayCanvasRef} className="absolute inset-0 h-full w-full pointer-events-none" />
               <canvas ref={detectionCanvasRef} className="hidden" aria-hidden="true" />
               <canvas ref={captureCanvasRef} className="hidden" aria-hidden="true" />
+              <canvas ref={numberCropCanvasRef} className="hidden" aria-hidden="true" />
+
+              <RecentScansStack
+                scans={recentScans}
+                collapsingKey={collapsingScanKey}
+                label={t('decks.scan.recentScans')}
+                onQuickAdd={quickAddRecentScan}
+                quickAddDisabled={phase !== 'hunting' || confirmingKey != null}
+                confirmingKey={confirmingKey}
+                quickAddLabel={t('decks.scan.quickAdd')}
+              />
+
+              {/* Phase 3's Path B live readout — its own pill, not the hint
+                  slot below, so it doesn't compete with the single-line
+                  hint's own text (see the dynamic hint below). Placed
+                  opposite the "Scan now" button (bottom-3) and clear of
+                  RecentScansStack (right-2 bottom-2). */}
+              {phase === 'hunting' && liveNumberConfidence != null && (
+                <div
+                  className={`absolute top-3 left-3 rounded-lg px-2.5 py-1.5 font-mono text-xs font-semibold shadow-lg ${confidenceBadgeClass(liveNumberConfidence)}`}
+                  aria-label={`${t('decks.scan.numberReadLabel')}: ${liveNumberConfidence}%`}
+                >
+                  <div>{liveNumberConfidence}%{liveNumberText ? ` — ${liveNumberText}` : ''}</div>
+                  {liveNamePreview && (
+                    <div className="mt-0.5 text-[10px] font-normal opacity-80">{liveNamePreview}</div>
+                  )}
+                </div>
+              )}
 
               {/* Floats over the bottom of the video frame rather than
                   sitting below it in normal flow — on a phone, a
@@ -801,7 +1198,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
             </div>
 
             {phase === 'hunting' && (
-              <p className="text-xs text-text-muted text-center max-w-xs">{t('decks.scan.liveHint')}</p>
+              <p className="text-xs text-text-muted text-center max-w-xs">
+                {liveNumberConfidence != null && liveNumberConfidence < NUMBER_CONFIDENCE_THRESHOLD
+                  ? t('decks.scan.liveHintLowConfidence')
+                  : t('decks.scan.liveHint')}
+              </p>
             )}
 
             {phase === 'error' && (
