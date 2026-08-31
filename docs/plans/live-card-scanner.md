@@ -40,6 +40,23 @@ values genuinely depend on the phone's own camera and CPU, not just taste.
 
 # Phase 1: live capture, one paid API call per card
 
+### At a glance
+
+- **What:** Replace the point-and-shoot deck scanner with a live camera
+  stream that auto-detects a card, auto-captures once it's held steady,
+  and auto-saves it when the match is confident — no manual photo tap.
+  Includes an undo toast so a single bad auto-save doesn't require
+  resetting the whole deck's progress.
+- **Why:** Today's scanner needs a manual "Take Photo" tap per card. This
+  removes that friction while keeping cost bounded — exactly one paid
+  vision-API call per physically-presented card, not per video frame.
+- **Code changes:** New client-side card detection (`cardDetection.js`,
+  OpenCV.js/jscanify) and a camera-stream hook; `DeckCardScanner.jsx`
+  rewritten as a full-viewport portal with a new state machine (reusing
+  the existing `confirmCard`/candidate-picker, not a new save path); a
+  new undo endpoint plus a small backend matching-row helper; a shared
+  image cache extracted for pHash to reuse.
+
 ## Why this shape
 
 The backend's `/api/cards/recognize` endpoint calls a paid vision API
@@ -544,6 +561,23 @@ here — both are pulled together as build-order steps 5-6.
 
 # Phase 2: OCR-first tier, to cut the paid API call for the common case (optional follow-up)
 
+### At a glance
+
+- **What:** Recognize a card's printed collector number and name
+  client-side (Tesseract OCR) and match them against only this deck
+  instance's still-missing cards — before ever calling the paid vision
+  API.
+- **Why:** Phase 1 already calls the paid API once per card, but most
+  cards' identity can be resolved for free from OCR plus a deck-scoped
+  match (perceptual-hash comparison, or a unique number/name hit). The
+  paid call becomes a fallback for the minority OCR can't confidently
+  resolve, not something every card pays for.
+- **Code changes:** New `cardOcr.js` (lazy-loaded Tesseract.js, parses
+  OCR text into number/name fields); new deck-scoped
+  `POST /instances/{id}/match-image` backend route (pHash, then a unique
+  number match, then a unique name match); `DeckCardScanner.jsx` tries
+  OCR + this match before falling back to the existing paid call.
+
 Phase 1 still calls the paid vision API once per card — far cheaper than a
 naive continuous-frame scanner, but not free. Explored whether that call
 can be skipped for the common case by doing recognition client-side instead
@@ -909,6 +943,28 @@ hasn't had a real-device pass yet.
 
 # Phase 3: continuous OCR confidence feedback
 
+### At a glance
+
+- **What:** Turn OCR from a one-shot step into a continuous, throttled
+  background readout — a live "N%" confidence badge on the collector
+  number while the user is still positioning the card, updating every
+  ~500-800ms instead of only after a full capture.
+- **Why:** Today OCR only runs once a whole card has already been held
+  steady, so a bad reading gives the user nothing to react to. A live
+  percentage lets someone see low confidence and physically zoom in on
+  the number to fix it — which the current design can't support at all,
+  since it requires the whole card's outline in frame before it does
+  anything.
+- **Code changes:** A new continuous background text-reading scan — it
+  reads the number roughly every half-second while you're still framing
+  the card, running as its own separate OCR process so it doesn't
+  compete with or interfere with the existing one-shot scan that already
+  runs once a card is fully captured; a new crop that finds just the
+  number on screen; a second auto-save trigger alongside today's
+  whole-card one (still gated by the same match-uniqueness check, not a
+  new save authority on its own); and a small backend flag so this path
+  can skip pHash on a non-full-card image.
+
 ## The problem with today's shape
 
 Verified by reading the current `DeckCardScanner.jsx`: OCR does not run
@@ -991,48 +1047,148 @@ for this phase:
    own. Like `cardOcr.js`'s existing `NAME_BAND_FRACTION`/
    `MIN_NAME_CONFIDENCE`, these are reasoned starting points to tune
    against real devices, not empirically validated numbers.
+8. **Added per real user feedback on the badge design (artifact comment,
+   2026-08-31): show a name preview once the number uniquely resolves,
+   separate from the percentage itself.** The percentage staying
+   number-read-confidence (Decision 1) is still correct — it's the only
+   signal that survives the zoom scenario — but that doesn't mean the
+   badge has to be silent about identity. This deck instance's own
+   still-missing cards (number → name pairs) are cheap, already-loaded
+   data: `DeckDetail.jsx` fetches this list today to render the missing-
+   card checklist, it just isn't currently threaded down into
+   `DeckCardScanner.jsx`. The moment the OCR-read number matches exactly
+   one entry in that list — a plain client-side lookup, no network call,
+   no dependency on crossing the 80%/3-passes auto-trigger threshold — the
+   badge can show that candidate's name as a preview: the percentage and
+   number on one line ("72% — 025/198"), the bare name on a second,
+   visually secondary line ("Pikachu") — no hedging phrase like "looks
+   like" prefixed to it (dropped per your comment); the smaller/secondary
+   styling itself is what signals "preview, not confirmed," not the
+   wording. If the number is still ambiguous or
+   matches nothing missing, no name shows, same as today's design. This
+   is additive and low-risk: it never changes when Path B actually
+   fires or saves (still gated by Decision 7's real match+uniqueness
+   check, not this preview lookup), it just answers "is this heading
+   somewhere useful" earlier and more concretely than a bare percentage
+   can.
 
 ## Revised flow
 
+Redrawn per your comments — Path A included in full this time, tree only
+with no annotations inline; every detail that used to live inside a box
+is explained below it instead.
+
 ```
-[live video] --(every ~90ms, main thread)--> quad detection (unchanged, Phase 1)
-                    |                                    |
-         quad steady N frames?                 numberBand.js picks a crop:
-                    |                          bottom-left of the detected
-        [Path A: existing Phase 1/2            quad if one exists, else the
-         flow, completely unchanged]           raw frame (zoomed past edges)
-                                                           |
-                                              [~every 500-800ms, own throttle,
-                                               strictly serial — never starts
-                                               a new pass while one is still
-                                               in flight]
-                                                           |
-                                  Tesseract OCR on the number crop, on its
-                                  OWN dedicated worker (not the capture-time
-                                  worker), char-whitelisted for speed
-                                                           |
-                                          live "N% — 052/198" readout
-                                                           |
-                              confidence >= 80%, sustained 3 consecutive
-                              passes, regex-valid? (gates WHEN to attempt,
-                              not authority to save — see Decision 7)
-                                                           |
-                          FIRES ONCE, then the throttled OCR loop pauses
-                          (mirrors Path A's own capture-then-pause
-                          behavior — see A-1/R-1 in Review findings) until
-                          this attempt resolves or the user backs out
-                                                           |
-                          [Path B] POST match-image (skip_phash=true,
-                          the OCR crop itself as the required file) using
-                          number+name alone, scoped to this deck's missing
-                          cards only
-                                                           |
-                                 unique match? --------- ambiguous/none?
-                                       |                        |
-                             auto-save (same confirmCard   resume the throttled
-                             path both A and B already     OCR loop and keep
-                             use — no new save path)        trying
+quad detected & held steady?
+  |
+  ├─ yes ──► Path A (Phase 1/2, unchanged)
+  |            |
+  |            capture the card
+  |            |
+  |            OCR + deck-scoped match
+  |            |
+  |            confident? ──yes──► auto-save
+  |              |
+  |              no
+  |              |
+  |            paid vision API (fallback)
+  |              |
+  |              confident? ──yes──► auto-save
+  |              |
+  |              no ──► candidate picker (manual)
+  |
+  └─ no / zoomed in ──► Path B (new, this phase)
+               |
+               crop the number region
+               |
+               throttled OCR pass
+               |
+               live badge: confidence % + number
+               (+ name, once it uniquely matches
+                a missing card — see below)
+               |
+               sustained high confidence?
+               |
+              yes
+               |
+               deck-scoped match
+               (number + name only, no photo)
+               |
+               ├─ unique match ──► auto-save
+               |
+               └─ ambiguous/none ──► keep scanning
 ```
+
+**Quad detection** is Phase 1's existing 90ms loop, untouched.
+
+**Path A** is the existing whole-card flow (Phase 1/2), unaffected by
+anything in this phase: capture once the card's held steady, run OCR and
+the deck-scoped match (pHash, then number, then name — see Phase 2), and
+call the paid vision API only if none of those resolve confidently.
+Either confident outcome auto-saves the same way; a fully unresolved card
+falls back to the manual candidate picker.
+
+**Path B** is what this phase actually adds, for when the card's edges
+are out of frame (zoomed in on just the number) and Path A's quad
+detection has nothing to hold onto.
+
+**Throttled OCR pass**: runs roughly every 500-800ms, not on every video
+frame. Strictly serial — never starts a new pass while one is still
+running — on its own dedicated Tesseract worker, separate from the
+one-shot scan Path A uses at capture time (see Phase 3's "At a glance"
+for why they're kept apart).
+
+**Live badge**: the percentage is the number's OCR read-confidence, not
+"confidence this is your card" (see Decision 1 — a match-based score
+would go blank in exactly this zoomed-in scenario). The name preview is
+independent of the confidence threshold below it — it appears the
+instant the number uniquely matches one of this deck's still-missing
+cards, computed locally with no network call (Decision 8).
+
+**Sustained high confidence** means ≥80% for 3 consecutive passes, not
+one lucky frame (Decision 7) — this gates *when* to attempt a match, not
+whether to trust it. Once it fires, the throttled pass pauses (mirrors
+Path A's own capture-then-pause) until that attempt resolves.
+
+**Path B's match** hits the same deck-scoped matcher Path A uses, but
+skips the image-comparison step (pHash) since there's no full-card photo
+here to compare — just the number and name, checked for a unique match
+against this deck's missing cards. An ambiguous or no match resumes
+scanning; a unique match auto-saves through the same save path Path A
+already uses, not a second one.
+
+## Observability: what's actually in the logs
+
+Checked directly against the current code, per your comment — the
+answer today is **only the final outcome, not each step**:
+
+- **Client-side steps (quad detection, both OCR passes) never reach
+  server logs at all** — they run entirely in the browser. The only
+  visibility into them is the on-screen debug overlay (raw OCR text,
+  per-word confidence, tick counts — see Phase 4's diagnostics toggle),
+  which is on-device and ephemeral, not searchable or persisted anywhere.
+  That's an inherent boundary of where those steps run, not a gap this
+  phase can close without adding client-to-server telemetry — a real
+  scope increase this plan isn't proposing.
+- **The deck-scoped match** (`match_deck_image`, `decks.py:459`) already
+  has one plain, always-on `logger.info(...)` line — visible in plain
+  `docker logs`, no opt-in required — but verified it logs only the
+  *final* decision (`confident`, `decision`, `winner`), not which tier
+  was tried and rejected along the way. That per-tier detail (e.g. exact
+  pHash distances) only exists in the opt-in `ScanTrace` system.
+- **Real, fixable gap this phase introduces**: that same log line doesn't
+  include `source` or `skip_phash` — so today, a Path A call and a future
+  Path B call would be indistinguishable in plain logs, and there'd be no
+  way to tell from the log alone whether pHash even ran for a given
+  attempt. Fixing this: Path B's calls pass a distinct `source` (e.g.
+  `"live_zoom_scan"`, vs. Path A's existing value), and both fields get
+  added to the existing log line — so "was this Path A or Path B, and did
+  pHash run" is visible in plain logs for every attempt, not just
+  something you can reconstruct from the opt-in trace after the fact.
+- **The paid vision API call** is already well logged (success with
+  model/duration, and — a recent fix — the actual response body on a
+  transient failure, not just its status code), so nothing new needed
+  there.
 
 ## New/changed files
 
@@ -1040,10 +1196,11 @@ for this phase:
 |---|---|
 | `frontend/src/utils/cardOcr.js` | **New export**, e.g. `recognizeNumberRegion(canvas)` — a second, narrower Tesseract call restricted to a digit/slash/letter character whitelist (Tesseract's `tessedit_char_whitelist`, unused today) for speed, distinct from the existing full-card `recognizeCardText` used at capture time. **Decided (resolves M-1 in Review findings): runs on its own dedicated worker**, not `ensureWorker()`'s existing singleton — see Decision 5 above for why sharing it was rejected (stateful whitelist, serialized jobs). |
 | `frontend/src/utils/numberBand.js` | **New.** Given either a detected quad+source or, when no quad exists (zoomed past the edges), the raw video frame, returns the crop to feed the throttled OCR pass. Bottom-left band heuristic when a quad exists (mirrors `cardOcr.js`'s existing top-band heuristic for the name); a periodic wider/full-frame fallback (see Risks) when nothing has been read for several passes in a row, so a nonstandard layout doesn't get stuck at 0% forever. |
-| `frontend/src/components/DeckCardScanner.jsx` | New continuous-loop state (`liveNumberConfidence`, `liveNumberText`, consecutive-high-confidence-pass count) and **its own strictly-serial in-flight ref for the throttled OCR pass, separate from the existing `tickInFlightRef`** — see S-1 in Review findings: `tickInFlightRef` guards the 90ms detection tick itself, and awaiting a several-hundred-ms Tesseract call inside it would stall quad detection, defeating the whole point of throttling OCR separately. Strictly-serial (never start a new pass while one is in flight — Decision 6) resolves S-2's stale-result race by construction, no separate generation counter needed. New Path B branch alongside the existing stability branch, firing **once** when confidence sustains ≥80% for 3 consecutive passes (Decision 7), then pausing until resolved (A-1/R-1) — both branches call the same `confirmCard`, not a second save path. |
-| `backend/api/decks.py` | `match_deck_image` gets a new optional `skip_phash: bool = Form(default=False)`. When true, skip straight to the number/name-unique tiers — see "pHash false-positive risk" below for why this is needed, not optional polish. |
+| `frontend/src/pages/DeckDetail.jsx` | **New prop threaded through**, e.g. `missingCards` — this page already fetches the deck instance's full missing-card list (number/name pairs) to render the checklist; pass that same array into `DeckCardScanner` so the name-preview lookup (Decision 8) can run client-side with no new fetch. |
+| `frontend/src/components/DeckCardScanner.jsx` | New continuous-loop state (`liveNumberConfidence`, `liveNumberText`, consecutive-high-confidence-pass count) and **its own strictly-serial in-flight ref for the throttled OCR pass, separate from the existing `tickInFlightRef`** — see S-1 in Review findings: `tickInFlightRef` guards the 90ms detection tick itself, and awaiting a several-hundred-ms Tesseract call inside it would stall quad detection, defeating the whole point of throttling OCR separately. Strictly-serial (never start a new pass while one is in flight — Decision 6) resolves S-2's stale-result race by construction, no separate generation counter needed. New Path B branch alongside the existing stability branch, firing **once** when confidence sustains ≥80% for 3 consecutive passes (Decision 7), then pausing until resolved (A-1/R-1) — both branches call the same `confirmCard`, not a second save path. Also derives a **name preview** (Decision 8) from the new `missingCards` prop: a plain array lookup on every OCR pass, independent of the auto-trigger threshold — a UI-only concern, not part of the trigger/save logic above. |
+| `backend/api/decks.py` | `match_deck_image` gets a new optional `skip_phash: bool = Form(default=False)`. When true, skip straight to the number/name-unique tiers — see "pHash false-positive risk" below for why this is needed, not optional polish. **Also**: its existing plain `logger.info(...)` line (`decks.py:459`) gets `source` and `skip_phash` added as logged fields, so Path A vs. Path B and whether pHash ran are visible in plain logs per attempt — see Observability above. |
 | `frontend/src/api/client.js` | `matchDeckImage` gets the new optional flag threaded through. |
-| `frontend/src/i18n/en.js` | New copy: the live confidence readout's label, and a hint text (e.g. "Low confidence — try zooming in on the number"). |
+| `frontend/src/i18n/en.js` | New copy: the live confidence readout's label — pairs the number with "read quality," not "match confidence" (P3-6, avoids the framing M-2 already warns against) — the dynamic hint text that swaps in during low confidence (e.g. "Low confidence — try zooming in on the number"), replacing rather than joining the existing `liveHint` string (P3-1); and the name-preview string — the bare matched name, no hedging phrase like "looks like" (Decision 8). |
 | `backend/tests/test_deck_image_match.py` | **Existing file needs updating, not just new coverage added.** Verified: every one of its ~10 direct calls to `match_deck_image(...)` already spells out every `Form(...)` parameter explicitly (e.g. `number_local=None, name=None, source=None`) because this file's own docstring warns that a direct call omitting a `Form(...)` param gets FastAPI's sentinel object, not its Python default. Adding `skip_phash` means every one of those call sites needs `skip_phash=False` added too, or they break on the first run after the param lands — see Q-3/D-1 in Review findings. |
 
 ## Risks (devil's advocate pass)
@@ -1293,6 +1450,24 @@ above required an explicit choice between named alternatives.
 
 # Phase 4: user-configurable scanner tuning
 
+### At a glance
+
+- **What:** Turn the hardcoded detection/OCR tuning constants (how long a
+  card must hold steady, Phase 3's auto-trigger confidence threshold)
+  into user-editable settings — a Fast/Balanced/Careful preset plus an
+  Advanced section with the raw values, alongside two related toggles
+  (diagnostics visibility, auto-save vs. always-confirm).
+- **Why:** The right tuning genuinely depends on the phone's own camera
+  and CPU, not just taste — a value tuned for a fast phone can make an
+  older one's scanner worse, not better. Needed per-device, but with an
+  account-level default so a freshly-opened device isn't starting blind.
+- **Code changes:** Two new `UserSetting` keys (account-level default)
+  plus a `localStorage`-backed per-device override with its own
+  resolution/precedence logic; a new sibling settings card (not appended
+  to the existing, already-dense one); `DeckCardScanner.jsx`'s hardcoded
+  constants become resolved runtime values, and the always-on debug block
+  gets gated behind the new diagnostics toggle.
+
 Gated on Phase 3, since it exposes Phase 3's auto-trigger threshold as well
 as Phase 1's existing quad-stability constants.
 
@@ -1392,7 +1567,7 @@ gate.
 | `backend/api/settings.py` | New GET/PUT for the two keys above — kept separate from `getScannerConfiguration`/`updateScannerConfiguration` (provider/model/key) rather than folded in, since that endpoint's "Test and save" capability-probe flow is specific to providers and has nothing to do with these fields. |
 | `frontend/src/api/client.js` | New `getScannerTuning()`/`updateScannerTuning()` thin wrappers over the new endpoints. |
 | `frontend/src/utils/scannerTuning.js` | **New.** Plain `localStorage.getItem`/`setItem` under one JSON key (matches this app's existing convention — see `useTheme.js`'s direct `localStorage` use, no wrapper abstraction elsewhere in this codebase) for the per-device override, plus the resolve-with-precedence function both `DeckCardScanner.jsx` and the new settings UI call. |
-| `frontend/src/components/ScannerSettingsCard.jsx` (or a new sibling card) | New "Scanner tuning" section: preset picker, Advanced raw-value fields, a "this device" indicator when a local override is active, and a "Reset to account default" action. Separate section from provider/model, not folded into the same form — different save semantics (no "Test and save" capability probe applies here). |
+| `frontend/src/components/ScannerTuningCard.jsx` | **New, separate sibling card** to `ScannerSettingsCard.jsx` (decided per P4-1 in Review findings — that card is already this app's densest, phone-first settings surface). Preset `<select>`, an Advanced `<details>` section with the 4 raw-value fields (mirroring the existing Advanced-model pattern), a plain-checkbox convention for the two toggles, and an inline caption + text-link reset action for the device/account-override state (P4-2/P4-3/P4-4). |
 | `frontend/src/components/DeckCardScanner.jsx` | Module-level constants (`DETECTION_INTERVAL_MS`, `REQUIRED_STABLE_FRAMES`, `STABILITY_TOLERANCE_PROPORTION`, and Phase 3's auto-trigger threshold/pass-count) become values resolved at scanner-open time via `scannerTuning.js`, not hardcoded. The always-on debug block gets gated behind the new diagnostics toggle. |
 | `frontend/src/i18n/en.js` | New copy: preset names/descriptions, Advanced field labels, the diagnostics and auto-save toggles. |
 
@@ -1460,3 +1635,170 @@ gate.
 21. Settings UI: preset picker + Advanced section + the two independently-
     homed toggles, wired to the endpoints/localStorage from steps 18-19.
 22. Real-device test per the Testing section above.
+
+## Review findings — Phase 3 & 4 second pass (multi-persona + OCR-model-expert)
+
+A follow-up seven-lens pass (tag suffix `2` distinguishes these from Phase
+3's earlier table) plus the same added OCR/vision-model-domain lens, run
+after Phase 4 was written — covering both phases together since Phase 4
+now reaches into values Phase 3 defined. A UI-craft pass (`ui-review`
+agent) is running separately and will be added as its own table once it
+completes, matching how this document has layered review passes before.
+
+| Tag | Sev | Finding | Addressed in |
+|---|---|---|---|
+| A2-1 | HIGH | `stabilityTrackerRef` is built via `useRef(createStabilityTracker({...}))` — verified (`DeckCardScanner.jsx:144-147`) this runs synchronously exactly once, at first render, using whatever values are in scope at that instant. If Phase 4's account-level tuning default loads asynchronously (as R2-1 below says it must, to avoid delaying scanner startup), the tracker gets built from the device-override-or-hardcoded fallback *before* the account fetch resolves, and nothing in the plan says to rebuild it once the real value arrives — a user's account-level custom preset could silently not apply on a session that opens before the fetch settles, with no visible sign anything's wrong | New Risks bullet below; build-order step 20 updated |
+| R2-1 | HIGH | The new account-tuning GET adds a network round-trip to scanner-open that the plan never says must run in parallel with (not block) the existing camera-permission request and `preloadCardDetection()` — if it blocks, scanner-open gets slower; if it doesn't (the right choice), A2-1's race becomes a real risk unless explicitly handled | New Risks bullet below; build-order step 20 updated |
+| M2-1 | MED | Raising "Careful"'s confidence threshold (88% vs. Balanced's 80%) and pass-count (4 vs. 3) doesn't protect against the specific failure mode Phase 3's own Decision 7 names — a confidently-read wrong digit (`052`→`057`). Both knobs filter random per-frame noise; neither helps against a *systematic* misread the engine reads the same wrong way every single pass (a font rendering or lighting pattern that consistently reads as a different digit). "Careful" mode risks reading as more protective against exactly this risk than it actually is — the uniqueness check is the only real protection here, unrelated to which preset is active | New Risks bullet below |
+| X2-1 | MED | Validation section covers numeric bounds (dwell/tolerance/confidence/passes) but not enum validation — `preset` and `scanner_auto_save_mode` should be restricted to their known value sets and reject anything else, not just clamp numbers | New Risks bullet below |
+| A2-2 | MED | Doesn't state whether `scanner_auto_save_mode` gates both Path A and Path B's auto-save decision, or just one — both already share the `confirmCard` call site, so a single shared check is the natural implementation, but this should be explicit now that there are two call sites, not one | New Risks bullet below |
+| S2-1 | MED | `DETECTION_INTERVAL_MS` is read directly inside the tick-loop `useEffect`'s `setInterval(...)`, whose dependency array is `[phase, cameraStatus]` (verified, `DeckCardScanner.jsx:598-602`) — fine today since it's a true constant. Once it's a resolved runtime value, it either needs to join the dependency array (restarting the interval on a tuning change — acceptable) or be read via a ref to avoid that restart; the file table doesn't say which, and guessing wrong risks a stale closure locking in an outdated interval forever | New Risks bullet below |
+| Q2-1 | MED | Testing section's auto-save-toggle check doesn't specify testing it against Path A and Path B independently — ties to A2-2 | New Testing bullet |
+| Q2-2 | MED | No test specified for the account-tuning-fetch failing outright (vs. "hasn't loaded yet") — should assert the scanner still opens on hardcoded factory defaults rather than blocking or crashing | New Testing bullet |
+| Q2-3 | LOW | Phase 3's own real-device test scenarios (zoom-in, misread-collision) were written before presets existed — should be re-run under Fast and Careful once Phase 4 ships, not just Balanced | New Testing bullet |
+| M2-2 | LOW | Ties to Phase 3's M-3 (whitelisting can inflate confidence on a bad read) — if that inflation is severe, Careful's 88% may not filter meaningfully more bad reads than Balanced's 80%, since both could sit above an inflated floor. A preset's *felt* difference is itself unvalidated, not just the base threshold | New Risks bullet below |
+| B2 | LOW | No schema change (reuses `UserSetting`), but `scanner_tuning`'s JSON in a `Text` column needs defensive parsing (malformed/legacy JSON → fall back to factory defaults), not just write-time validation | New Risks bullet below |
+| D2 | — | No migration needed (table already exists), no new env vars | Clean, no finding |
+| X2-2 | LOW | File table doesn't restate that the new `settings.py` routes need `Depends(get_current_user)` — this document has flagged this exact omission category before (Phase 2's Security-1, Phase 1's Security-3) | New Risks bullet below |
+
+### New Risks (from the second pass above)
+
+- **Async account-default fetch must not block scanner startup, and must
+  not race the synchronous mount-time construction it feeds.** (A2-1,
+  R2-1) The account-tuning GET has to run in parallel with the existing
+  camera-permission request and `preloadCardDetection()` call — blocking
+  on it would slow down opening the scanner. But `stabilityTrackerRef` is
+  built via `useRef(createStabilityTracker({...}))`, verified to run
+  synchronously exactly once at first render (`DeckCardScanner.jsx:144-147`)
+  — if the account fetch is still in flight at that moment, the tracker
+  locks in the device-override-or-hardcoded values, and the plan needs to
+  say explicitly whether/how it gets rebuilt once the account value
+  arrives, or a custom account preset can silently fail to apply on a
+  freshly-opened session.
+- **Confidence threshold and pass-count don't protect against a systematic
+  misread, only a noisy one.** (M2-1, M2-2) "Careful" raising both knobs
+  filters out low-confidence or inconsistent reads, but a misread the
+  engine produces the same wrong way every pass — consistent lighting, a
+  font Tesseract consistently confuses — sustains across passes exactly
+  like a correct read would. The uniqueness check remains the only real
+  guard against Decision 7's named risk (a confident misread colliding
+  with a different missing card), independent of preset; Phase 4's UI
+  copy shouldn't imply "Careful" meaningfully reduces that specific risk.
+  Compounding this: if character-whitelisting inflates confidence on bad
+  reads (Phase 3's M-3), a preset's felt difference is itself unvalidated
+  until measured, not just the base 80%/88% numbers.
+- **Validate enums, not just numeric ranges.** (X2-1) `preset` and
+  `scanner_auto_save_mode` need an explicit allowed-values check, rejecting
+  anything outside their known sets — the numeric-bounds validation
+  already specified doesn't cover this.
+- **State explicitly which call sites `scanner_auto_save_mode` gates.**
+  (A2-2) Both Path A and Path B call the same `confirmCard` — the natural
+  implementation is one shared check before either path calls it
+  programmatically, but this should be said outright now that a second
+  call site exists.
+- **`DETECTION_INTERVAL_MS` becoming a runtime value needs an explicit
+  dependency-array or ref decision.** (S2-1) It's read inside a
+  `useEffect` whose deps are currently `[phase, cameraStatus]` — verified
+  the interval literal isn't a dependency today because it's a true
+  constant; once it isn't, the file table's implementation needs to pick
+  one of the two options above rather than leaving it implicit.
+- **`scanner_tuning`'s stored JSON needs defensive parsing.** (B2) A
+  malformed or legacy-shaped value in the `Text` column should fall back
+  to factory defaults, not throw, mirroring the same fail-safe the account-
+  fetch-failure case above needs.
+- **Restate the auth-dependency requirement on the new routes.** (X2-2)
+  Same discipline this document has already applied twice before (Phase 1
+  and Phase 2's own Security findings) — the new `settings.py` GET/PUT
+  need `Depends(get_current_user)` like every sibling route, stated
+  explicitly in the file table, not assumed.
+
+### New Testing (from the second pass above)
+
+- Assert `scanner_auto_save_mode = "always_confirm"` routes to the
+  candidate picker from **both** Path A (quad-stability) and Path B
+  (Phase 3's zoom-trigger) independently, not just one (Q2-1).
+- Assert an account-tuning GET failure (not just "hasn't loaded yet")
+  still lets the scanner open on hardcoded factory defaults, rather than
+  blocking or crashing (Q2-2).
+- Re-run Phase 3's own real-device manual test list under the Fast and
+  Careful presets once Phase 4 ships, not just Balanced/default (Q2-3).
+
+## Review findings — Phase 3 & 4, UI-craft pass (`ui-review` agent)
+
+Run against the actual current `DeckCardScanner.jsx` render tree,
+`ScannerSettingsCard.jsx`'s full existing layout, and `index.css`'s theme
+system — not the plan prose in isolation, matching how Phase 1's own
+"Fourth pass" UI review worked.
+
+| Tag | Sev | Finding | Addressed in |
+|---|---|---|---|
+| P3-1 | HIGH | The live "N% — 052/198" readout has no layout spec, and competes for screen space with two things that already exist during `hunting`: the floating "Scan now" button and a single one-line hint slot (`liveHint`) below the video. Phase 3's own file table adds a *second* hint string ("try zooming in") with no statement of how the two share that one line | New "UI placement" subsection below: percentage lives in its own badge on the video frame, not the hint slot; the hint slot becomes dynamic (swaps text based on confidence) instead of gaining a second string |
+| P3-2 | HIGH | Path A already has an established "getting close" visual language in this exact file (`drawOverlay` ramps the quad outline from dim white to the active theme's brand color as the stability streak builds) — plan never says whether Path B's readout reuses that convention or invents a new one | New "UI placement" subsection: explicitly reuses the same dim-to-accent progression |
+| P3-3 | HIGH | Verified: `--color-brand-red` is not fixed red — it's remapped per theme (yellow in `electric`, green in `grass`, blue in `water`). A naive red/yellow/green confidence scheme would collide with the quad-outline's own use of the theme accent color for "about to capture" in at least two themes | New "UI placement" subsection: readout uses the app's fixed, non-theme-swapped `badge-red`/`badge-yellow`/`badge-green` tokens instead of the theme-variable accent |
+| P3-4 | MED | Phase 4 (which gates the always-on debug block) is gated *on* Phase 3 — so for the entire window Phase 3 ships alone, the new percentage readout sits directly above its own unstyled twin (the debug block already prints `ocrNumber` and per-word confidences in monospace in the same area) | New Risks bullet: accepted as a temporary, known overlap until Phase 4 lands, not a defect to design around |
+| P3-5 | MED | No UI state specified for Path B's `match-image` call actually being in flight — unclear whether the percentage just freezes with no loading feedback while that network call runs | New Risks bullet: Path B transitions `phase` to `'processing'` for the call's duration, reusing Path A's existing spinner state verbatim, not a new one |
+| P3-6 | LOW | Risks section (M-2) already warns against copy like "78% sure this is your card," but the file table's exemplar copy is bare "N%" with no label | `en.js` file-table row updated: label pairs the number with "read quality," not "match confidence" |
+| P4-1 | HIGH | `ScannerSettingsCard.jsx` is already this app's densest, phone-first settings card (provider/model/key/test/admin sections) — Phase 4 proposed adding a 3-option preset picker, a 4-field Advanced section, a device/account indicator, and two more toggles to "the same screen," which is too much for a card this size already | New Decision below: separate sibling card, not appended to `ScannerSettingsCard.jsx` |
+| P4-2 | MED | The "this device" indicator and "Reset to account default" action have zero precedent anywhere in this codebase (verified: no device/session UI, no "synced" language anywhere) — Decision 2's "mirrors an existing pattern" claim doesn't cover this specific piece | New Decision below: a plain inline caption + text-link reset action, not a new badge/icon system — deliberately the smallest possible net-new UI, since nothing existing can be reused here |
+| P4-3 | MED | Every boolean control in this card today is a plain `<input type="checkbox">` with an inline label (verified: zero `role="switch"` anywhere in the frontend) — plan calls the two new booleans "toggles" without confirming which convention they use | New Decision below: both new booleans use the existing checkbox convention, not a new switch component |
+| P4-4 | LOW | Preset picker's control type is unspecified — this card's only existing choice-of-N pattern is a `<select>` (provider/model), which may undersell presets as "the primary control" (Decision 2), but a new segmented-tab control would itself be a new pattern | New Decision below: reuses the existing `<select>` convention — consistency with this card over novelty, until real usage shows presets need more visual weight |
+
+### UI placement (Phase 3, resolves P3-1/P3-2/P3-3)
+
+- The percentage lives in its own small badge/pill overlaid on the video
+  frame (near the existing overlay canvas), not inside the single-line
+  hint slot below it — that slot stays exactly what it is today.
+- **Added per Decision 8**: the same badge grows a second line the moment
+  the OCR-read number uniquely matches a missing card — e.g. "72% —
+  025/198" on the first line, the bare name "Pikachu" on a second,
+  smaller line below it (no "looks like" or other hedging phrase — the
+  smaller/secondary styling is what signals "preview, not confirmed,"
+  the wording doesn't need to). Absent until a unique match exists (no
+  placeholder text, no layout shift from a guess); this is a preview,
+  not a claim of identity, so it should read visually secondary to the
+  percentage, not equal weight with it.
+- The hint slot itself becomes **dynamic, not additive**: it shows the
+  existing "Hold one card steady…" text during ordinary positioning, and
+  swaps (not stacks) to "Low confidence — try zooming in on the number"
+  specifically while Path B is tracking a sub-threshold reading. One
+  string in the slot at a time, matching its existing one-line design.
+- The badge's color ramps using the **same dim-white-to-theme-accent
+  progression** `drawOverlay` already uses for the stability outline, for
+  visual consistency between "Path A is about to capture" and "Path B is
+  about to attempt" — but using this app's **fixed** `badge-red`/
+  `badge-yellow`/`badge-green` tokens for the confidence-tier coloring
+  itself, not the theme-variable brand accent, since that accent already
+  means something else (and is a different color per theme) via the
+  existing outline.
+- Path B's `match-image` call transitions `phase` to `'processing'` for
+  its duration, reusing Path A's existing spinner/"Identifying card…"
+  state verbatim — no new loading UI (resolves P3-5).
+- The always-on debug block sitting above this new readout until Phase 4
+  gates it is accepted as a known, temporary overlap, not something Phase
+  3 needs to solve on its own (resolves P3-4).
+
+### New Decisions (Phase 4, resolves P4-1/P4-2/P4-3/P4-4)
+
+1. **Separate sibling card, not appended to `ScannerSettingsCard.jsx`.**
+   A new `ScannerTuningCard.jsx` renders below the existing card on the
+   same Settings page — the existing card is already this app's densest,
+   and Phase 4's own content (preset picker, 4-field Advanced section,
+   device/account indicator, two toggles) is too much to add to it without
+   a layout decision, which "New 'Scanner tuning' section" in the original
+   file table didn't actually make.
+2. **The device/account-override indicator is a plain inline caption and
+   text-link reset action** ("Using your account default" /
+   "Custom on this device — Reset"), not a new badge or icon system.
+   Deliberately the smallest possible net-new UI, since nothing in this
+   codebase can be reused for this specific distinction (verified: no
+   existing device/session-management UI anywhere).
+3. **Both new booleans use the existing plain-checkbox convention**
+   (`<input type="checkbox">` with an inline label, matching the
+   custom-model and degraded-acknowledge checkboxes already in
+   `ScannerSettingsCard.jsx`), not a new switch/toggle component — this
+   app has none today.
+4. **The preset picker reuses the existing `<select>` convention**
+   (matching the provider/model dropdowns), not a new segmented-tab
+   control. Consistency with this card's established pattern wins over
+   giving presets more visual prominence, at least until real usage shows
+   a dropdown undersells them.
