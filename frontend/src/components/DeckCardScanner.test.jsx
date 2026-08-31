@@ -873,11 +873,11 @@ describe('DeckCardScanner', () => {
     it('drops the oldest thumbnail once the stack exceeds its cap', async () => {
       render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
-      // One more scan than RECENT_SCANS_LIMIT (5) — same null-quad/
+      // One more scan than RECENT_SCANS_LIMIT (3) — same null-quad/
       // STABLE_QUAD re-arm technique the "does not immediately re-capture"
       // test above uses to get a fresh capture through the state machine
       // each time, rather than a position-based swap.
-      for (let i = 0; i < 6; i++) {
+      for (let i = 0; i < 4; i++) {
         recognizeCard.mockResolvedValueOnce({
           _identity_confident: true,
           matches: [{ id: `p${i}`, name: `Card${i}` }],
@@ -890,12 +890,12 @@ describe('DeckCardScanner', () => {
         detectCardQuad.mockResolvedValue(STABLE_QUAD)
       }
 
-      expect(recognizeCard).toHaveBeenCalledTimes(6)
-      // Card0 (the oldest, first scanned) has been dropped; the other 5
+      expect(recognizeCard).toHaveBeenCalledTimes(4)
+      // Card0 (the oldest, first scanned) has been dropped; the other 3
       // remain.
       expect(screen.queryByAltText('Card0')).not.toBeInTheDocument()
-      expect(screen.getAllByRole('img')).toHaveLength(5)
-      expect(screen.getByAltText('Card5')).toBeInTheDocument()
+      expect(screen.getAllByRole('img')).toHaveLength(3)
+      expect(screen.getByAltText('Card3')).toBeInTheDocument()
     })
 
     it('keeps the recent-scans stack when the scanner is closed and reopened', async () => {
@@ -967,6 +967,33 @@ describe('DeckCardScanner', () => {
       onConfirm.mockClear()
       fireEvent.click(quickAddButton)
       expect(onConfirm).not.toHaveBeenCalled()
+    })
+
+
+    it('shows a visible error, without losing hunting mode, when a quick-add fails to save', async () => {
+      // Regression test: confirmError was previously only ever rendered in
+      // the 'ambiguous' picker view — a failed quick-add (which only ever
+      // fires from 'hunting') set the same state but nothing showed it, so
+      // the thumbnail's spinner just stopped with no explanation.
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-quickaddfail1',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+
+      onConfirm.mockRejectedValueOnce(new Error('network down'))
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('decks.scan.quickAdd: Pikachu'))
+        await Promise.resolve()
+      })
+
+      expect(screen.getByText('decks.scan.confirmFailed')).toBeInTheDocument()
+      // Still hunting, not bounced to an error phase — the failure is
+      // surfaced, not treated as fatal to the whole scanner.
+      expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
     })
   })
 

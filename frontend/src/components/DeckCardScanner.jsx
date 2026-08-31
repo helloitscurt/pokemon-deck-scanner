@@ -65,9 +65,13 @@ const REQUIRED_HIGH_CONFIDENCE_PASSES = 3
 const NUMBER_BAND_FALLBACK_PASSES = 3
 // How many recently-confirmed cards the on-screen stack keeps at once —
 // see RecentScansStack below. Matches the "3 or 5" the feature was
-// requested at; 5 gives a fuller sense of scan history without the stack
-// growing tall enough to crowd the video feed on a phone.
-const RECENT_SCANS_LIMIT = 5
+// requested at. Set to 3, not 5: at the thumbnail's actual h-[120px] size
+// (bumped 3x from an earlier h-10 for legibility, see RecentScanThumb),
+// 5 stacked thumbnails (5*120 + 4*6 gap = 624px) is taller than the video
+// container itself at this component's own default 3:4 aspect and max
+// width (384/0.75 = 512px) — the oldest one or two would render clipped
+// off above the video's top edge. 3 (372px) fits comfortably instead.
+const RECENT_SCANS_LIMIT = 3
 // How long the oldest thumbnail's collapse animation runs before it's
 // actually dropped from state (see addRecentScan) — must match the
 // duration in RecentScansStack's own transition classes below.
@@ -149,17 +153,25 @@ function findUniqueMissingCardName(missingCards, numberLocal) {
 }
 
 // Background only — the reading itself is always black text (see the badge
-// JSX below), so this just tints the pill by confidence tier.
+// JSX below), so this just tints the pill by confidence tier. Near-opaque
+// (/90), not a light translucent tint: this badge sits directly over the
+// live camera feed, not a fixed app surface, and a translucent tint over a
+// dark/dim scene (indoor lighting, a shadowed tabletop — exactly when a
+// user is squinting at this reading) composites toward black, at which
+// point black text has no contrast left at all. Matches this same file's
+// own precedent for text over unpredictable video content — the
+// processing overlay (bg-black/60) and warning toast (bg-black/85) both
+// go near-opaque for the same reason.
 function confidenceBadgeClass(confidence) {
-  if (confidence >= NUMBER_CONFIDENCE_THRESHOLD) return 'bg-green/20'
-  if (confidence >= NUMBER_CONFIDENCE_MEDIUM_THRESHOLD) return 'bg-yellow/20'
+  if (confidence >= NUMBER_CONFIDENCE_THRESHOLD) return 'bg-green/90'
+  if (confidence >= NUMBER_CONFIDENCE_MEDIUM_THRESHOLD) return 'bg-yellow/90'
   // NOT the .badge-red/bg-brand-red class — --color-brand-red is
   // theme-swapped (yellow in "electric", green in "grass", etc., see
   // index.css and currentBrandRed() above), which would collide with
   // drawOverlay's unrelated use of that same variable in at least two
   // themes. pokemon-red (tailwind.config.js) is a fixed, non-theme-swapped
   // literal (#e3000b) — the actually-fixed token this needs.
-  return 'bg-pokemon-red/20'
+  return 'bg-pokemon-red/90'
 }
 
 // One thumbnail in the recent-scans stack. Mounts at opacity-0/translated
@@ -194,9 +206,15 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confi
           onClick={() => onQuickAdd(scan)}
           disabled={quickAddDisabled}
           aria-label={label}
-          className="pointer-events-auto relative block transition-all duration-300 ease-out disabled:cursor-not-allowed"
+          className="pointer-events-auto relative block transition-all duration-300 ease-out disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
           style={{
-            opacity: entered && !collapsing ? 1 : 0,
+            // Combines the mount/collapse animation's own opacity with the
+            // disabled dimming every other control in this app uses
+            // (disabled:opacity-50, see .btn-primary/.btn-ghost in
+            // index.css) — a Tailwind class alone can't win here since
+            // this same opacity is already driven inline for the
+            // animation, and inline styles always beat a class.
+            opacity: entered && !collapsing ? (quickAddDisabled ? 0.5 : 1) : 0,
             transform: entered && !collapsing ? 'translateY(0)' : 'translateY(8px)',
           }}
         >
@@ -236,7 +254,7 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confi
 // "Scan now" button below: a portrait video can fill most of the
 // viewport, so anything meant to stay visible during hunting has to
 // overlay it, not follow it.
-function RecentScansStack({ scans, collapsingKey, label, onQuickAdd, quickAddDisabled, confirmingKey, quickAddLabel }) {
+function RecentScansStack({ scans, collapsingKeys, label, onQuickAdd, quickAddDisabled, confirmingKey, quickAddLabel }) {
   if (!scans.length) return null
   return (
     <div
@@ -247,7 +265,7 @@ function RecentScansStack({ scans, collapsingKey, label, onQuickAdd, quickAddDis
         <RecentScanThumb
           key={scan.key}
           scan={scan}
-          collapsing={scan.key === collapsingKey}
+          collapsing={collapsingKeys.has(scan.key)}
           onQuickAdd={onQuickAdd}
           quickAddDisabled={quickAddDisabled}
           confirming={confirmingKey === scan.key}
@@ -345,12 +363,18 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
   // Last RECENT_SCANS_LIMIT confirmed cards (any save through confirmCard,
-  // auto or manual), newest last — see RecentScansStack. collapsingScanKey
-  // names the one entry currently mid collapse-out animation, cleared once
-  // recentScanRemovalTimerRef's timeout actually drops it from the array.
+  // auto or manual), newest last — see RecentScansStack. collapsingScanKeys
+  // names every entry currently mid collapse-out animation — a Set, not a
+  // single key: quick-add (see quickAddRecentScan) can be tapped faster
+  // than RECENT_SCAN_COLLAPSE_MS apart, so more than one overflow entry can
+  // be collapsing at once. recentScanRemovalTimersRef tracks one timeout
+  // per pending key (a single shared ref/timeout here previously meant a
+  // later rapid tap's clearTimeout cancelled an earlier tap's pending
+  // removal, permanently — the stack would grow past RECENT_SCANS_LIMIT
+  // and never re-settle under a burst of quick-adds).
   const [recentScans, setRecentScans] = useState([])
-  const [collapsingScanKey, setCollapsingScanKey] = useState(null)
-  const recentScanRemovalTimerRef = useRef(null)
+  const [collapsingScanKeys, setCollapsingScanKeys] = useState(() => new Set())
+  const recentScanRemovalTimersRef = useRef(new Map())
   const [confirmError, setConfirmError] = useState(null)
   const [confirmingKey, setConfirmingKey] = useState(null)
   // Visible diagnostic readout, not devtools-only — this app has no console
@@ -446,7 +470,8 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     clearTimers()
     clearInterval(processingTimerRef.current)
     abortControllerRef.current?.abort()
-    clearTimeout(recentScanRemovalTimerRef.current)
+    recentScanRemovalTimersRef.current.forEach(clearTimeout)
+    recentScanRemovalTimersRef.current.clear()
   }, [])
 
   // deckScanStatus (see backend services/deck_progress.py's SCAN_* constants,
@@ -504,13 +529,21 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
 
   // Appends a just-confirmed card to the recent-scans stack, trimming the
   // oldest entry once it grows past RECENT_SCANS_LIMIT. The trim doesn't
-  // remove that entry immediately — it's flagged via collapsingScanKey so
+  // remove that entry immediately — it's flagged via collapsingScanKeys so
   // RecentScanThumb can animate it away first, and only actually dropped
-  // from recentScans once that animation's timeout fires. Keyed by
+  // from recentScans once that entry's own timeout fires. Keyed by
   // id+timestamp (not just candidate.id) so scanning the same card twice
   // in a row — an energy card, say — still gets two distinct stack
   // entries instead of React treating the second as an update to the
   // first.
+  //
+  // Each overflow entry gets its OWN timeout, tracked by key in
+  // recentScanRemovalTimersRef, not one shared ref — quick-add lets a user
+  // tap faster than RECENT_SCAN_COLLAPSE_MS apart (the exact "several
+  // duplicate energy cards" case it exists for), and a single shared timer
+  // would have its pending removal cancelled by every subsequent tap's
+  // clearTimeout, so only the last tap in a burst ever actually fired,
+  // permanently growing the stack past its cap.
   const addRecentScan = (candidate) => {
     const entry = {
       key: `${candidate.id || 'card'}-${Date.now()}-${Math.random()}`,
@@ -522,14 +555,27 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     }
     setRecentScans((current) => {
       const next = [...current, entry]
-      if (next.length > RECENT_SCANS_LIMIT) {
-        const oldestKey = next[0].key
-        setCollapsingScanKey(oldestKey)
-        clearTimeout(recentScanRemovalTimerRef.current)
-        recentScanRemovalTimerRef.current = setTimeout(() => {
+      const overflowCount = Math.max(0, next.length - RECENT_SCANS_LIMIT)
+      const newlyCollapsing = []
+      for (let i = 0; i < overflowCount; i++) {
+        const oldestKey = next[i].key
+        // Already has a timer running from an earlier call — don't
+        // reschedule it (that's exactly the bug this replaces).
+        if (recentScanRemovalTimersRef.current.has(oldestKey)) continue
+        newlyCollapsing.push(oldestKey)
+        const timeoutId = setTimeout(() => {
           setRecentScans((scans) => scans.filter((scan) => scan.key !== oldestKey))
-          setCollapsingScanKey(null)
+          setCollapsingScanKeys((keys) => {
+            const nextKeys = new Set(keys)
+            nextKeys.delete(oldestKey)
+            return nextKeys
+          })
+          recentScanRemovalTimersRef.current.delete(oldestKey)
         }, RECENT_SCAN_COLLAPSE_MS)
+        recentScanRemovalTimersRef.current.set(oldestKey, timeoutId)
+      }
+      if (newlyCollapsing.length > 0) {
+        setCollapsingScanKeys((keys) => new Set([...keys, ...newlyCollapsing]))
       }
       return next
     })
@@ -1090,7 +1136,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
 
               <RecentScansStack
                 scans={recentScans}
-                collapsingKey={collapsingScanKey}
+                collapsingKeys={collapsingScanKeys}
                 label={t('decks.scan.recentScans')}
                 onQuickAdd={quickAddRecentScan}
                 quickAddDisabled={phase !== 'hunting' || confirmingKey != null}
@@ -1205,6 +1251,16 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                   ? t('decks.scan.liveHintLowConfidence')
                   : t('decks.scan.liveHint')}
               </p>
+            )}
+
+            {/* confirmError is set by confirmCard's own catch block — a
+                quick-add tap (RecentScanThumb) hits this exact path while
+                still in 'hunting', not just the ambiguous-picker's manual
+                tap below. Without this, a failed quick-add previously had
+                no visible feedback at all: the thumbnail's spinner just
+                stopped, silently, with the copy never actually saved. */}
+            {phase === 'hunting' && confirmError && (
+              <p className="text-sm text-brand-red text-center max-w-xs">{confirmError}</p>
             )}
 
             {phase === 'error' && (
