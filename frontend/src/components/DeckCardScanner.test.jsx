@@ -918,6 +918,56 @@ describe('DeckCardScanner', () => {
 
       expect(screen.getByAltText('Pikachu')).toBeInTheDocument()
     })
+
+    it('lets a tap on a recent-scan thumbnail add another copy of that same card', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-quickadd1',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(onConfirm).toHaveBeenCalledTimes(1)
+
+      // Checkmark + cooldown elapse — quick-add only fires while actively
+      // hunting again (see quickAddRecentScan's own guard), same as the
+      // "does not immediately re-capture" test above.
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('decks.scan.quickAdd: Pikachu'))
+        await Promise.resolve()
+      })
+
+      // Routes through the exact same confirmCard path a manual tap in the
+      // ambiguous list uses (isAutoSave: false), not a new/parallel save —
+      // and produces a second stack entry for the same card.
+      expect(onConfirm).toHaveBeenCalledTimes(2)
+      expect(onConfirm).toHaveBeenLastCalledWith(
+        expect.objectContaining({ id: 'p1' }),
+        { isAutoSave: false, traceId: null },
+      )
+      expect(screen.getAllByRole('img')).toHaveLength(2)
+    })
+
+    it('disables the quick-add button while the scanner is not actively hunting', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-quickadd2',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      // Still mid checkmark/cooldown right after the auto-save — phase is
+      // 'success', not 'hunting'.
+      const quickAddButton = screen.getByLabelText('decks.scan.quickAdd: Pikachu')
+      expect(quickAddButton).toBeDisabled()
+
+      onConfirm.mockClear()
+      fireEvent.click(quickAddButton)
+      expect(onConfirm).not.toHaveBeenCalled()
+    })
   })
 
   it('clears the detection outline the instant a capture starts, not once the result banner disappears', async () => {
