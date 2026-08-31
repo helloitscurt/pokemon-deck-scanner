@@ -148,16 +148,18 @@ function findUniqueMissingCardName(missingCards, numberLocal) {
   return matches.length === 1 ? matches[0].name : null
 }
 
+// Background only — the reading itself is always black text (see the badge
+// JSX below), so this just tints the pill by confidence tier.
 function confidenceBadgeClass(confidence) {
-  if (confidence >= NUMBER_CONFIDENCE_THRESHOLD) return 'bg-green/20 text-green'
-  if (confidence >= NUMBER_CONFIDENCE_MEDIUM_THRESHOLD) return 'bg-yellow/20 text-yellow'
+  if (confidence >= NUMBER_CONFIDENCE_THRESHOLD) return 'bg-green/20'
+  if (confidence >= NUMBER_CONFIDENCE_MEDIUM_THRESHOLD) return 'bg-yellow/20'
   // NOT the .badge-red/bg-brand-red class — --color-brand-red is
   // theme-swapped (yellow in "electric", green in "grass", etc., see
   // index.css and currentBrandRed() above), which would collide with
   // drawOverlay's unrelated use of that same variable in at least two
   // themes. pokemon-red (tailwind.config.js) is a fixed, non-theme-swapped
   // literal (#e3000b) — the actually-fixed token this needs.
-  return 'bg-pokemon-red/20 text-pokemon-red'
+  return 'bg-pokemon-red/20'
 }
 
 // One thumbnail in the recent-scans stack. Mounts at opacity-0/translated
@@ -1103,12 +1105,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                   RecentScansStack (right-2 bottom-2). */}
               {phase === 'hunting' && liveNumberConfidence != null && (
                 <div
-                  className={`absolute top-3 left-3 rounded-lg px-2.5 py-1.5 font-mono text-xs font-semibold shadow-lg ${confidenceBadgeClass(liveNumberConfidence)}`}
+                  className={`absolute top-3 left-3 rounded-lg px-2.5 py-1.5 font-mono font-semibold text-black shadow-lg ${confidenceBadgeClass(liveNumberConfidence)}`}
                   aria-label={`${t('decks.scan.numberReadLabel')}: ${liveNumberConfidence}%`}
                 >
-                  <div>{liveNumberConfidence}%{liveNumberText ? ` — ${liveNumberText}` : ''}</div>
+                  <div className="text-lg leading-tight">{liveNumberConfidence}%{liveNumberText ? ` — ${liveNumberText}` : ''}</div>
                   {liveNamePreview && (
-                    <div className="mt-0.5 text-[10px] font-normal opacity-80">{liveNamePreview}</div>
+                    <div className="mt-0.5 text-xs font-normal opacity-80">{liveNamePreview}</div>
                   )}
                 </div>
               )}
