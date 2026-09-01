@@ -10,6 +10,16 @@ probably deserve their own design pass before starting.
 
 ## 1. Floating match thumbnail + confidence percentage
 
+**Status: partially done.** [Phase 3](live-card-scanner.md) shipped
+(`b40474e`, `8041f31`, `c9d7e6c`) and delivers the confidence-percentage
+half of this — a live badge (number + confidence, with a name preview once
+it uniquely resolves) shown *while framing the card*, before capture. What
+Phase 3 does **not** do is the other half of this item: freezing a card
+thumbnail + percentage together at the moment of auto-save, the way the
+green checkmark does today. Still open if that combined post-save view is
+still wanted now that the pre-capture badge exists — it may cover the same
+need well enough on its own.
+
 **Current state:** on a confident auto-save, the scanner shows only a plain
 green checkmark for `CHECKMARK_DURATION_MS` (900ms) — no card image, no
 score. A warning (not-in-deck / already-complete) shows the card's *name*
@@ -39,6 +49,13 @@ float.
 
 ## 2. Recent-scans stack (last 3-5, sliding/expiring)
 
+**Status: done.** Shipped on `scanner-recent-scans-stack`. Bottom-right
+anchored stack (RECENT_SCANS_LIMIT=3, tuned down from an initial 5 after
+ui-review found 5 stacked 120px thumbnails taller than the video container
+itself), newest enters at the bottom and pushes earlier ones up, oldest
+collapses out at the cap. Persists across the scanner closing/reopening
+(explicitly does *not* reset on `isOpen`, per real-device feedback).
+
 **Current state:** nothing persists across cards — `result`/`checkmarkMeta`
 are cleared by `resetForNextCard`/`enterSuccessCooldown` before the next
 hunt starts. No history of what was just scanned.
@@ -58,6 +75,15 @@ hunt starts. No history of what was just scanned.
   comment) — needs a concrete layout spot, not just "add it somewhere."
 
 ## 3. Quick multi-add of the last (or one of the last 3-5) scanned card
+
+**Status: done, but via a different design than either option below.**
+Rather than a `quantity > 1` backend call or an N/+3/+4 stepper UI, each
+recent-scans thumbnail (item 2) is itself a tap target: tapping it re-runs
+the existing single-copy `confirmCard` save path for that same card.
+Trades a slightly slower N-taps-for-N-copies interaction for reusing the
+exact same save/warning/error plumbing every other confirm already has,
+rather than a second path to keep in sync — and sidesteps the `quantity`
+plumbing question below entirely, since it's never used.
 
 **Use case:** energy cards and other duplicates, to avoid re-scanning each
 physical copy.
@@ -159,16 +185,13 @@ it — only `_identity_confident`, `matches`, and `trace_id` are read.
 
 ## Suggested order
 
-2 (recent-scans stack) has no dependencies and can start anytime; **starting
-here.** 5 (path indicator) is also unblocked and cheap — the data already
-exists server-side, it's pure plumbing — and pairs naturally with 2's stack
-(a tap target for it). 1 is blocked on [Phase 3](live-card-scanner.md)
-shipping, since it reuses that phase's OCR-confidence number — sequence it
-after Phase 3, not before. 3 is small once 1 or 2 exist to hang the "+N"
-control on, but needs the backend `quantity` check noted above first. 4 no
-longer needs a separate scoping conversation (multi-quad detection +
-sequential single-card recognition is decided) but is still the largest
-single item — the multi-quad contour detection work in particular is new
-and worth prototyping/validating on a
-real table of cards before committing to the capture-trigger and queueing
-design above.
+**2 and 3 are done.** Phase 3 shipped separately and covers the percentage
+half of 1 — what's left of 1 is only the "freeze a thumbnail at the moment
+of auto-save" half, and it's worth checking whether that's still wanted
+before building it. Remaining, unstarted: **5** (path indicator — still
+cheap, the backend data already exists, pure frontend plumbing, and pairs
+naturally with item 2's stack as a tap target) and **4** (multi-card table
+scanning — still the largest item; the multi-quad contour detection work
+is new and worth prototyping/validating on a real table of cards before
+committing to the capture-trigger and queueing design already sketched
+above).
