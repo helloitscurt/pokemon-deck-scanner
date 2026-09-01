@@ -220,23 +220,43 @@ function ensureNumberWorker() {
   return numberWorkerPromise
 }
 
+// Starts loading the number-only worker ahead of Path B's first throttled
+// tick (docs/plans/live-card-scanner.md, Phase 3) — unlike preloadCardOcr
+// above, this one IS called upfront, alongside preloadCardDetection, not
+// deferred until a card is detected. Path A's OCR worker can wait because
+// it's only ever needed after a full stable-hold capture; Path B's badge
+// is meant to update live "while still framing" the card, and its first
+// tick fires ~700ms after hunting starts — sooner than a stable hold would
+// even complete — so deferring this further would just make the session's
+// very first reading lag even more visibly behind every one after it.
+export function preloadNumberOcr() {
+  ensureNumberWorker().catch(() => {})
+}
+
+// Pure confidence math, split out of recognizeNumberRegion below so it can
+// be unit-tested directly (same reasoning as numberBand.js's own crop-rect
+// extraction) without needing a mocked Tesseract worker. Per the plan's
+// Decision 1: the average confidence of the words that make up the read
+// number text itself, not a whole-crop average that could be diluted by
+// stray noise elsewhere in the crop — falls back to Tesseract's own
+// page-level confidence only when no words were recognized at all (a
+// blank/garbled crop, where there's nothing number-shaped to average).
+export function computeNumberReadConfidence(blocks, pageConfidence) {
+  const words = flattenWords(blocks)
+  const numberWords = words.filter((w) => /[0-9A-Za-z/]/.test(w.text || ''))
+  if (!numberWords.length) return Math.round(pageConfidence ?? 0)
+  const total = numberWords.reduce((sum, w) => sum + (w.confidence ?? 0), 0)
+  return Math.round(total / numberWords.length)
+}
+
 // A second, narrower OCR call for Phase 3's throttled Path B pass — reads
 // only a small crop already framed on the collector number (see
-// numberBand.js), not a full card. confidence is per the plan's Decision
-// 1: the average confidence of the words that make up the read number
-// text itself, not a whole-crop average that could be diluted by stray
-// noise elsewhere in the crop — falls back to Tesseract's own page-level
-// confidence only when no words were recognized at all (a blank/garbled
-// crop).
+// numberBand.js), not a full card.
 export async function recognizeNumberRegion(canvas) {
   const worker = await ensureNumberWorker()
   const { data } = await worker.recognize(canvas, {}, { text: true, blocks: true })
   const rawText = data?.text || ''
   const { number_local, number_total } = parseCardOcrText(rawText)
-  const words = flattenWords(data?.blocks)
-  const numberWords = words.filter((w) => /[0-9A-Za-z/]/.test(w.text || ''))
-  const confidence = numberWords.length
-    ? Math.round(numberWords.reduce((sum, w) => sum + (w.confidence ?? 0), 0) / numberWords.length)
-    : Math.round(data?.confidence ?? 0)
+  const confidence = computeNumberReadConfidence(data?.blocks, data?.confidence)
   return { number_local, number_total, confidence }
 }

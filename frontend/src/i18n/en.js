@@ -474,6 +474,7 @@ const en = {
       pathOcrName: 'OCR name',
       pathMetadata: 'Metadata match',
       pathVisionApi: 'Vision API',
+      pathQuickAdd: 'Quick add',
       cameraUnavailable: 'Camera unavailable — take a photo instead.',
       captured: 'Captured',
       undo: 'Undo',

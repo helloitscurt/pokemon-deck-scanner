@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { parseCardOcrText, pickCardName } from './cardOcr'
+import { computeNumberReadConfidence, parseCardOcrText, pickCardName } from './cardOcr'
 
 describe('parseCardOcrText', () => {
   it('extracts number from a clean recognition', () => {
@@ -131,5 +131,36 @@ describe('pickCardName', () => {
   it('disables the position filter when cardHeight is not provided, confidence/denylist still apply', () => {
     const blocks = blocksOf(ocrWord('Potion', 88, 900))
     expect(pickCardName(blocks, 0)).toBe('Potion')
+  })
+})
+
+describe('computeNumberReadConfidence', () => {
+  it('averages the confidence of the number-shaped words, not a whole-page figure', () => {
+    const blocks = blocksOf(ocrWord('025/198', 90, 50), ocrWord('025/198', 70, 50, 80))
+    // (90 + 70) / 2 = 80 — the page-level figure (10) must be ignored
+    // entirely once real words were found.
+    expect(computeNumberReadConfidence(blocks, 10)).toBe(80)
+  })
+
+  it('falls back to the page-level confidence when no words were recognized at all', () => {
+    expect(computeNumberReadConfidence([], 42)).toBe(42)
+    expect(computeNumberReadConfidence(null, 42)).toBe(42)
+  })
+
+  it('rounds the averaged confidence', () => {
+    const blocks = blocksOf(ocrWord('025/198', 91, 50), ocrWord('025/198', 90, 50, 80))
+    expect(computeNumberReadConfidence(blocks, 0)).toBe(91) // (91+90)/2 = 90.5 -> 91
+  })
+
+  it('counts a word with no confidence value as 0, not excluding it from the average', () => {
+    const blocks = [{
+      paragraphs: [{ lines: [{ words: [
+        { text: '025/198', confidence: 100, bbox: { x0: 0, y0: 50, x1: 70, y1: 70 } },
+        { text: '/', confidence: undefined, bbox: { x0: 80, y0: 50, x1: 90, y1: 70 } },
+      ] }] }],
+    }]
+    // (100 + 0) / 2 = 50 — excluding the undefined-confidence word instead
+    // would give 100.
+    expect(computeNumberReadConfidence(blocks, 0)).toBe(50)
   })
 })

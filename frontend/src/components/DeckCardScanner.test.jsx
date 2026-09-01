@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DeckCardScanner from './DeckCardScanner'
 import { matchDeckImage, recognizeCard } from '../api/client'
 import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrRawText, lastOcrWords, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
+import { lastOcrRawText, lastOcrWords, preloadNumberOcr, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
 
 vi.mock('../api/client', () => ({
   recognizeCard: vi.fn(),
@@ -30,6 +30,7 @@ vi.mock('../utils/cardOcr', () => ({
   recognizeCardText: vi.fn(),
   recognizeNumberRegion: vi.fn(),
   preloadCardOcr: vi.fn(),
+  preloadNumberOcr: vi.fn(),
   lastOcrRawText: { value: '' },
   lastOcrWords: { value: [] },
 }))
@@ -153,9 +154,14 @@ describe('DeckCardScanner', () => {
     vi.restoreAllMocks()
   })
 
-  it('preloads detection as soon as it opens', () => {
+  it('preloads detection and Path B\'s number-only OCR worker as soon as it opens', () => {
+    // preloadNumberOcr specifically: unlike Path A's own OCR worker
+    // (preloadCardOcr, deliberately deferred until a capture starts),
+    // Path B's first reading fires ~700ms into hunting — before a capture
+    // could even happen — so it can't wait the same way.
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
     expect(preloadCardDetection).toHaveBeenCalled()
+    expect(preloadNumberOcr).toHaveBeenCalled()
   })
 
   it('does not capture before the card has been held steady for the required streak', async () => {
@@ -808,6 +814,26 @@ describe('DeckCardScanner', () => {
       )
     })
 
+    it('shows the recognition-path badge for a Path B (zoom-match) auto-save too, not just Path A', async () => {
+      // Regression coverage: attemptZoomMatch's own confirmCard call
+      // threads data._identity_decision through exactly like
+      // captureAndRecognize's does, but nothing previously asserted on it
+      // — a future edit could drop that one argument with nothing in CI
+      // catching it.
+      recognizeNumberRegion.mockResolvedValue({ number_local: '25', number_total: '198', confidence: 85 })
+      matchDeckImage.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-zoom2',
+        _identity_decision: 'deck_number_unique',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceNumberOcrTicks(REQUIRED_HIGH_CONFIDENCE_PASSES)
+
+      expect(screen.getByText('decks.scan.pathOcrNumber')).toBeInTheDocument()
+    })
+
     it('resumes scanning without a picker when the match is not confident, unlike Path A', async () => {
       recognizeNumberRegion.mockResolvedValue({ number_local: '25', number_total: '198', confidence: 85 })
       matchDeckImage.mockResolvedValue({ _identity_confident: false, matches: [] })
@@ -1028,7 +1054,10 @@ describe('DeckCardScanner', () => {
       expect(screen.getByText('decks.scan.pathImageMatch')).toBeInTheDocument()
     })
 
-    it('carries the original decision forward onto a quick-added copy of the same card', async () => {
+    it('labels a quick-added copy "Quick add", not the original scan\'s recognition path', async () => {
+      // A quick-add never re-runs recognition — inheriting the original's
+      // decision (e.g. "OCR number") would claim a verification that never
+      // happened for this specific copy. See QUICK_ADD_DECISION.
       recognizeCardText.mockResolvedValue({ name: null, number_local: '25' })
       matchDeckImage.mockResolvedValue({
         _identity_confident: true,
@@ -1040,14 +1069,18 @@ describe('DeckCardScanner', () => {
       await advanceTicks(REQUIRED_STABLE_FRAMES)
       await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
 
+      // The original still shows its own, real decision beforehand.
+      expect(screen.getByText('decks.scan.pathOcrNumber')).toBeInTheDocument()
+
       await act(async () => {
         fireEvent.click(screen.getByLabelText('decks.scan.quickAdd: Pikachu'))
         await Promise.resolve()
       })
 
-      // Same card, identified the same way — not a fresh recognition
-      // event, so the quick-added copy's badge should match the original's.
-      expect(screen.getAllByText('decks.scan.pathOcrNumber')).toHaveLength(2)
+      // Both badges now present: the original's real decision, unchanged,
+      // plus the new copy's own honest "Quick add" label.
+      expect(screen.getByText('decks.scan.pathOcrNumber')).toBeInTheDocument()
+      expect(screen.getByText('decks.scan.pathQuickAdd')).toBeInTheDocument()
     })
 
     it('shows no path badge for a card saved from a manual pick in the ambiguous list', async () => {
@@ -1071,6 +1104,7 @@ describe('DeckCardScanner', () => {
       expect(screen.queryByText('decks.scan.pathOcrName')).not.toBeInTheDocument()
       expect(screen.queryByText('decks.scan.pathMetadata')).not.toBeInTheDocument()
       expect(screen.queryByText('decks.scan.pathVisionApi')).not.toBeInTheDocument()
+      expect(screen.queryByText('decks.scan.pathQuickAdd')).not.toBeInTheDocument()
     })
   })
 

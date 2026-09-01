@@ -7,7 +7,7 @@ import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
 import { useCameraStream } from '../hooks/useCameraStream'
 import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrRawText, lastOcrWords, preloadCardOcr, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
+import { lastOcrRawText, lastOcrWords, preloadCardOcr, preloadNumberOcr, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
 import { createStabilityTracker, quadsAreStable } from '../utils/quadStability'
 import { computeNumberBandRect } from '../utils/numberBand'
 
@@ -174,17 +174,28 @@ function confidenceBadgeClass(confidence) {
   return 'bg-pokemon-red/90'
 }
 
-// Maps every _identity_decision value the backend can send to one small,
-// shared set of translation keys. Two different routes compute this today
+// Not a real backend _identity_decision value — a local sentinel for a
+// quick-added copy (see quickAddRecentScan), which never re-runs
+// recognition at all. Deliberately its own label rather than inheriting
+// the original scan's decision: showing e.g. "Vision API" on a copy that
+// was never actually run through the vision API would overclaim
+// verification that never happened for that specific save.
+const QUICK_ADD_DECISION = 'quick_add'
+
+// Maps every _identity_decision value the backend can send, plus the
+// local QUICK_ADD_DECISION sentinel above, to one small, shared set of
+// translation keys. Two different routes compute the backend values today
 // — match_deck_image (backend/api/decks.py, the free deck-scoped tier) and
 // recognize_card (backend/api/recognize.py, the paid fallback) — with two
 // different raw vocabularies for the same underlying ideas ("deck_phash"
 // vs "phash" both mean an image match), so this is one shared mapping
 // rather than per-route logic. Returns null for anything without a real
 // decision — an ambiguous match a human picked from the candidate list
-// never has one; only an auto-resolved save does.
+// never has one; only an auto-resolved save (or a quick-add) does.
 function decisionLabelKey(decision) {
   switch (decision) {
+    case QUICK_ADD_DECISION:
+      return 'decks.scan.pathQuickAdd'
     case 'deck_phash':
     case 'phash':
       return 'decks.scan.pathImageMatch'
@@ -230,13 +241,18 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confi
         transitionDuration: `${RECENT_SCAN_COLLAPSE_MS}ms`,
       }}
     >
-      <div className="overflow-hidden">
+      {/* overflow-hidden only while actually collapsing (needed so the
+          image doesn't visibly poke out as its grid row shrinks to 0) —
+          applying it unconditionally clipped the quick-add "+" badge
+          below, which is deliberately positioned outside the image's own
+          box to read as a corner bubble. */}
+      <div className={collapsing ? 'overflow-hidden' : ''}>
         <button
           type="button"
           onClick={() => onQuickAdd(scan)}
           disabled={quickAddDisabled}
           aria-label={label}
-          className="pointer-events-auto relative block transition-all duration-300 ease-out disabled:cursor-not-allowed focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+          className="pointer-events-auto relative block transition-all duration-300 ease-out hover:brightness-110 disabled:cursor-not-allowed disabled:hover:brightness-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
           style={{
             // Combines the mount/collapse animation's own opacity with the
             // disabled dimming every other control in this app uses
@@ -258,7 +274,7 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confi
           />
           {confirming ? (
             <span className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/60">
-              <Loader2 size={20} className="animate-spin text-white" />
+              <Loader2 size={20} className="animate-spin text-brand-red" />
             </span>
           ) : (
             <>
@@ -273,9 +289,13 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confi
                   signal, not something every scan needs read out loud, so
                   it's a quiet corner badge rather than part of the main
                   capture flow. Opposite corner from the quick-add "+" so
-                  neither crowds the other. */}
+                  neither crowds the other. left-1/right-1 (not a fixed
+                  width) plus truncate bounds it to the thumbnail's own
+                  width and ellipsizes rather than overflowing — "Metadata
+                  match" at this font size is close to the full thumbnail
+                  width on its own. */}
               {pathLabel && (
-                <span className="absolute bottom-1 left-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-white">
+                <span className="absolute bottom-1 left-1 right-1 truncate rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-white">
                   {pathLabel}
                 </span>
               )}
@@ -501,9 +521,17 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   }, [isOpen])
 
   // Preload OpenCV.js/jscanify as soon as the scanner opens, so the first
-  // stable hold doesn't stall on a ~10MB download.
+  // stable hold doesn't stall on a ~10MB download. Path B's number-only OCR
+  // worker (see cardOcr.js's preloadNumberOcr) is bundled into this same
+  // upfront load, unlike Path A's own OCR worker (preloadCardOcr, still
+  // deferred until a card is actually captured) — Path B's first read
+  // fires ~700ms into hunting, sooner than a stable hold would even
+  // complete, so it can't wait for a capture the way Path A's can.
   useEffect(() => {
-    if (isOpen) preloadCardDetection()
+    if (isOpen) {
+      preloadCardDetection()
+      preloadNumberOcr()
+    }
   }, [isOpen])
 
   useEffect(() => {
@@ -686,9 +714,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // race enterSuccessCooldown's own phase/timer changes against this one's.
   const quickAddRecentScan = (scan) => {
     if (phase !== 'hunting' || confirmingKey != null || !scan.candidate) return
-    // Propagates the original scan's own decision forward — this is the
-    // same card, identified the same way, not a fresh recognition event.
-    confirmCard(scan.candidate, scan.key, false, null, scan.decision)
+    // QUICK_ADD_DECISION, not scan.decision — this re-save never re-runs
+    // recognition, so inheriting the original's decision (e.g. "Vision
+    // API") would claim a verification that never happened for this
+    // specific copy.
+    confirmCard(scan.candidate, scan.key, false, null, QUICK_ADD_DECISION)
   }
 
   // Free tiers, tried before the paid recognizeCard() call below: OCR
@@ -774,18 +804,34 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
     }
   }
 
-  const captureAndRecognize = async (nativeFrameSource, quad) => {
+  // Shared "processing" phase setup/teardown between captureAndRecognize
+  // (Path A) and attemptZoomMatch (Path B) — both used to hand-roll the
+  // identical setPhase/setProcessingSeconds/timer/AbortController sequence,
+  // which meant a future fix to one (e.g. cancel-handling) could easily
+  // land in only one of the two. cancelProcessing below still just aborts
+  // whichever controller is currently live, unchanged.
+  const beginProcessing = () => {
     setPhase('processing')
     setProcessingSeconds(0)
     processingTimerRef.current = setInterval(() => setProcessingSeconds((s) => s + 1), 1000)
+    const controller = new AbortController()
+    abortControllerRef.current = controller
+    return controller
+  }
+
+  const endProcessing = (controller) => {
+    clearInterval(processingTimerRef.current)
+    if (abortControllerRef.current === controller) abortControllerRef.current = null
+  }
+
+  const captureAndRecognize = async (nativeFrameSource, quad) => {
+    const controller = beginProcessing()
     // Deliberately not preloaded upfront alongside OpenCV.js (see
     // cardOcr.js / frontend/public/tesseract/VENDORED.md) — only starts
     // downloading once a card is actually being captured, so it doesn't
     // double the initial scanner-open payload for a feature that only
     // pays off after detection already succeeded.
     preloadCardOcr()
-    const controller = new AbortController()
-    abortControllerRef.current = controller
     try {
       const cropCanvas = await extractCard(nativeFrameSource, CARD_CROP_WIDTH, CARD_CROP_HEIGHT, quad)
       if (!cropCanvas) throw new Error('extract-failed')
@@ -820,8 +866,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
       setDebugInfo((d) => ({ ...d, tickError: `capture: ${err?.message || err}` }))
       setPhase('error')
     } finally {
-      clearInterval(processingTimerRef.current)
-      if (abortControllerRef.current === controller) abortControllerRef.current = null
+      endProcessing(controller)
     }
   }
 
@@ -837,11 +882,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // full card, and pHash on a fragment could land closer to the wrong
   // candidate than to none at all.
   const attemptZoomMatch = async (cropCanvas, ocrFields) => {
-    setPhase('processing')
-    setProcessingSeconds(0)
-    processingTimerRef.current = setInterval(() => setProcessingSeconds((s) => s + 1), 1000)
-    const controller = new AbortController()
-    abortControllerRef.current = controller
+    const controller = beginProcessing()
     try {
       const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
       if (!blob || !deckInstanceId) {
@@ -868,8 +909,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
       setDebugInfo((d) => ({ ...d, tickError: `zoom-match: ${describeError(err)}` }))
       resetForNextCard()
     } finally {
-      clearInterval(processingTimerRef.current)
-      if (abortControllerRef.current === controller) abortControllerRef.current = null
+      endProcessing(controller)
     }
   }
 
