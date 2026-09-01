@@ -995,6 +995,83 @@ describe('DeckCardScanner', () => {
       // surfaced, not treated as fatal to the whole scanner.
       expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
     })
+
+    it('shows which path resolved an auto-save as a badge on its recent-scans thumbnail', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-path1',
+        _identity_decision: 'gemini_visual',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      expect(screen.getByText('decks.scan.pathVisionApi')).toBeInTheDocument()
+    })
+
+    it('maps the free deck-scoped tier\'s own decision vocabulary to the same shared labels', async () => {
+      // deck_phash (matchDeckImage's own vocabulary) and phash (the paid
+      // route's) both mean "image match" — proves decisionLabelKey handles
+      // both routes' different raw strings for the same underlying idea.
+      recognizeCardText.mockResolvedValue({ name: null, number_local: '25' })
+      matchDeckImage.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-path2',
+        _identity_decision: 'deck_phash',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      expect(screen.getByText('decks.scan.pathImageMatch')).toBeInTheDocument()
+    })
+
+    it('carries the original decision forward onto a quick-added copy of the same card', async () => {
+      recognizeCardText.mockResolvedValue({ name: null, number_local: '25' })
+      matchDeckImage.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-path3',
+        _identity_decision: 'deck_number_unique',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('decks.scan.quickAdd: Pikachu'))
+        await Promise.resolve()
+      })
+
+      // Same card, identified the same way — not a fresh recognition
+      // event, so the quick-added copy's badge should match the original's.
+      expect(screen.getAllByText('decks.scan.pathOcrNumber')).toHaveLength(2)
+    })
+
+    it('shows no path badge for a card saved from a manual pick in the ambiguous list', async () => {
+      // An ambiguous match is never auto-resolved (that's what "ambiguous"
+      // means) — the backend never sets a decision for one, so there's
+      // nothing honest to label here.
+      recognizeCard.mockResolvedValue({
+        _identity_confident: false,
+        matches: [{ id: 'a', name: 'Card A' }, { id: 'b', name: 'Card B' }],
+        trace_id: 'trace-path4',
+        _identity_decision: null,
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      fireEvent.click(screen.getByText('Card A'))
+      await act(async () => { await Promise.resolve() })
+
+      expect(screen.queryByText('decks.scan.pathImageMatch')).not.toBeInTheDocument()
+      expect(screen.queryByText('decks.scan.pathOcrNumber')).not.toBeInTheDocument()
+      expect(screen.queryByText('decks.scan.pathOcrName')).not.toBeInTheDocument()
+      expect(screen.queryByText('decks.scan.pathMetadata')).not.toBeInTheDocument()
+      expect(screen.queryByText('decks.scan.pathVisionApi')).not.toBeInTheDocument()
+    })
   })
 
   it('clears the detection outline the instant a capture starts, not once the result banner disappears', async () => {

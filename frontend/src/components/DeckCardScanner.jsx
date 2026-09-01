@@ -174,6 +174,36 @@ function confidenceBadgeClass(confidence) {
   return 'bg-pokemon-red/90'
 }
 
+// Maps every _identity_decision value the backend can send to one small,
+// shared set of translation keys. Two different routes compute this today
+// — match_deck_image (backend/api/decks.py, the free deck-scoped tier) and
+// recognize_card (backend/api/recognize.py, the paid fallback) — with two
+// different raw vocabularies for the same underlying ideas ("deck_phash"
+// vs "phash" both mean an image match), so this is one shared mapping
+// rather than per-route logic. Returns null for anything without a real
+// decision — an ambiguous match a human picked from the candidate list
+// never has one; only an auto-resolved save does.
+function decisionLabelKey(decision) {
+  switch (decision) {
+    case 'deck_phash':
+    case 'phash':
+      return 'decks.scan.pathImageMatch'
+    case 'deck_number_unique':
+    case 'number_unique':
+      return 'decks.scan.pathOcrNumber'
+    case 'deck_name_unique':
+      return 'decks.scan.pathOcrName'
+    case 'number_metadata':
+    case 'artist_hp':
+      return 'decks.scan.pathMetadata'
+    default:
+      // Covers "gemini_visual" and every other provider's own
+      // "{provider}_visual" (see recognize.py) without needing to name
+      // each provider here.
+      return decision?.endsWith('_visual') ? 'decks.scan.pathVisionApi' : null
+  }
+}
+
 // One thumbnail in the recent-scans stack. Mounts at opacity-0/translated
 // down, then flips to its resting state a frame later — a plain mount
 // effect, not a library, so the newest card visibly slides/fades in at the
@@ -184,7 +214,7 @@ function confidenceBadgeClass(confidence) {
 // without needing to physically re-present it to the camera, for
 // duplicates (energy cards especially) where scanning each physical copy
 // individually is pure friction.
-function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confirming, label }) {
+function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confirming, label, pathLabel }) {
   const [entered, setEntered] = useState(false)
 
   useEffect(() => {
@@ -231,12 +261,25 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confi
               <Loader2 size={20} className="animate-spin text-white" />
             </span>
           ) : (
-            // A plain image doesn't read as tappable on its own — this
-            // marks it as "tap for another" without needing a label
-            // visible at all times.
-            <span className="absolute -right-1.5 -top-1.5 grid h-6 w-6 place-items-center rounded-full border border-white/40 bg-brand-red text-white shadow">
-              <Plus size={14} strokeWidth={3} />
-            </span>
+            <>
+              {/* A plain image doesn't read as tappable on its own — this
+                  marks it as "tap for another" without needing a label
+                  visible at all times. */}
+              <span className="absolute -right-1.5 -top-1.5 grid h-6 w-6 place-items-center rounded-full border border-white/40 bg-brand-red text-white shadow">
+                <Plus size={14} strokeWidth={3} />
+              </span>
+              {/* Which recognition path resolved this save (item 5,
+                  docs/plans/scanner-ux-todos.md) — a trust/diagnostic
+                  signal, not something every scan needs read out loud, so
+                  it's a quiet corner badge rather than part of the main
+                  capture flow. Opposite corner from the quick-add "+" so
+                  neither crowds the other. */}
+              {pathLabel && (
+                <span className="absolute bottom-1 left-1 rounded bg-black/75 px-1.5 py-0.5 text-[9px] font-bold text-white">
+                  {pathLabel}
+                </span>
+              )}
+            </>
           )}
         </button>
       </div>
@@ -254,24 +297,28 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, quickAddDisabled, confi
 // "Scan now" button below: a portrait video can fill most of the
 // viewport, so anything meant to stay visible during hunting has to
 // overlay it, not follow it.
-function RecentScansStack({ scans, collapsingKeys, label, onQuickAdd, quickAddDisabled, confirmingKey, quickAddLabel }) {
+function RecentScansStack({ scans, collapsingKeys, label, onQuickAdd, quickAddDisabled, confirmingKey, quickAddLabel, t }) {
   if (!scans.length) return null
   return (
     <div
       className="absolute right-2 bottom-2 z-10 flex flex-col gap-1.5"
       aria-label={label}
     >
-      {scans.map((scan) => (
-        <RecentScanThumb
-          key={scan.key}
-          scan={scan}
-          collapsing={collapsingKeys.has(scan.key)}
-          onQuickAdd={onQuickAdd}
-          quickAddDisabled={quickAddDisabled}
-          confirming={confirmingKey === scan.key}
-          label={`${quickAddLabel}: ${scan.name}`}
-        />
-      ))}
+      {scans.map((scan) => {
+        const pathLabelKey = decisionLabelKey(scan.decision)
+        return (
+          <RecentScanThumb
+            key={scan.key}
+            scan={scan}
+            collapsing={collapsingKeys.has(scan.key)}
+            onQuickAdd={onQuickAdd}
+            quickAddDisabled={quickAddDisabled}
+            confirming={confirmingKey === scan.key}
+            label={`${quickAddLabel}: ${scan.name}`}
+            pathLabel={pathLabelKey ? t(pathLabelKey) : null}
+          />
+        )
+      })}
     </div>
   )
 }
@@ -544,7 +591,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // would have its pending removal cancelled by every subsequent tap's
   // clearTimeout, so only the last tap in a burst ever actually fired,
   // permanently growing the stack past its cap.
-  const addRecentScan = (candidate) => {
+  const addRecentScan = (candidate, decision = null) => {
     const entry = {
       key: `${candidate.id || 'card'}-${Date.now()}-${Math.random()}`,
       image: resolveCardImageUrl(candidate, 'small'),
@@ -552,6 +599,10 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
       // Kept so a stack entry can be quick-added again later (see
       // quickAddRecentScan) without re-deriving it from image/name alone.
       candidate,
+      // Which tier resolved this save (see decisionLabelKey) — null for a
+      // manual pick from the ambiguous list or a quick-add re-save with no
+      // decision of its own to inherit.
+      decision,
     }
     setRecentScans((current) => {
       const next = [...current, entry]
@@ -593,13 +644,17 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // of stacking it on top of the existing plain one (see DeckDetail.jsx).
   // traceId (from recognizeCard()'s response, only present when the user
   // has scan diagnostics enabled) rides along the same way, so an eventual
-  // undo can be correlated back to the scan trace it's reversing.
-  const confirmCard = async (candidate, key, isAutoSave = false, traceId = null) => {
+  // undo can be correlated back to the scan trace it's reversing. decision
+  // is the raw _identity_decision string (see decisionLabelKey) from
+  // whichever tier auto-resolved this save, stored on the resulting
+  // recent-scans entry — null for a manual ambiguous-list pick or a
+  // quick-add re-save with no decision of its own.
+  const confirmCard = async (candidate, key, isAutoSave = false, traceId = null, decision = null) => {
     setConfirmingKey(key)
     setConfirmError(null)
     try {
       const response = await onConfirm(candidate, { isAutoSave, traceId })
-      addRecentScan(candidate)
+      addRecentScan(candidate, decision)
       // The fallback path skips the checkmark theater — just clear back to
       // the ready-to-scan-next state (resetForNextCard already routes to
       // 'cameraDenied' vs 'hunting' correctly based on the same lock).
@@ -631,7 +686,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
   // race enterSuccessCooldown's own phase/timer changes against this one's.
   const quickAddRecentScan = (scan) => {
     if (phase !== 'hunting' || confirmingKey != null || !scan.candidate) return
-    confirmCard(scan.candidate, scan.key, false, null)
+    // Propagates the original scan's own decision forward — this is the
+    // same card, identified the same way, not a fresh recognition event.
+    confirmCard(scan.candidate, scan.key, false, null, scan.decision)
   }
 
   // Free tiers, tried before the paid recognizeCard() call below: OCR
@@ -742,7 +799,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
       const topCandidate = data?.matches?.[0]
 
       if (data?._identity_confident && topCandidate) {
-        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true, data.trace_id)
+        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true, data.trace_id, data._identity_decision)
         if (!saved) {
           setResult(data)
           setPhase('ambiguous')
@@ -798,7 +855,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
       )
       const topCandidate = data?.matches?.[0]
       if (data?._identity_confident && topCandidate) {
-        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true, data.trace_id)
+        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true, data.trace_id, data._identity_decision)
         if (!saved) resetForNextCard()
       } else {
         resetForNextCard()
@@ -1142,6 +1199,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                 quickAddDisabled={phase !== 'hunting' || confirmingKey != null}
                 confirmingKey={confirmingKey}
                 quickAddLabel={t('decks.scan.quickAdd')}
+                t={t}
               />
 
               {/* Phase 3's Path B live readout — its own pill, not the hint
@@ -1330,7 +1388,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, deckInstan
                   key={key}
                   type="button"
                   disabled={confirmingKey != null}
-                  onClick={() => confirmCard(candidate, key, false, result.trace_id)}
+                  onClick={() => confirmCard(candidate, key, false, result.trace_id, result._identity_decision)}
                   className="w-full flex items-center gap-3 rounded-xl border border-border bg-bg-card p-3 text-left hover:border-brand-red/40 hover:bg-brand-red/10 transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand-red/70 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   <img
