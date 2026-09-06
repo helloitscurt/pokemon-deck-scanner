@@ -292,7 +292,7 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, onDecrement, quickAddDi
                 <Loader2 size={20} className="animate-spin text-brand-red" />
               </span>
             )}
-            {/* Which recognition path resolved this save (item 5,
+            {/* Which recognition path resolved this save (item 4,
                 docs/plans/scanner-ux-todos.md) — a trust/diagnostic
                 signal, not something every scan needs read out loud, so
                 it's a quiet corner badge rather than part of the main
