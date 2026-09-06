@@ -65,7 +65,10 @@ const STABLE_QUAD = {
 }
 
 function fakeCropCanvas() {
-  return { toBlob: (cb) => cb(new Blob(['fake'], { type: 'image/jpeg' })) }
+  return {
+    toBlob: (cb) => cb(new Blob(['fake'], { type: 'image/jpeg' })),
+    toDataURL: () => 'data:image/jpeg;base64,fake',
+  }
 }
 
 // jsdom has no real <canvas>/<video> implementation — stub just enough for
@@ -484,6 +487,43 @@ describe('DeckCardScanner', () => {
       })
     })
 
+    it('does not re-capture a card that stays held but whose detected outline slowly drifts', async () => {
+      // Regression test: capturedRegionsRef used to anchor a region to the
+      // exact quad it was captured at, forever. Once detection runs
+      // continuously through a job's whole lifetime (Phase 1, rather than
+      // pausing while a capture is recognized), a real hand-held card
+      // drifts a few px a tick from ordinary jitter — each step well under
+      // the frame-to-frame stability tolerance the tracker itself uses,
+      // but the cumulative drift from a FROZEN first-capture anchor
+      // eventually exceeded STABILITY_TOLERANCE_PROPORTION anyway, reading
+      // the same physical card as a new one and firing a duplicate
+      // recognizeCard call.
+      let tick = 0
+      detectCardQuad.mockImplementation(() => Promise.resolve({
+        topLeftCorner: { x: STABLE_QUAD.topLeftCorner.x + tick * 5, y: STABLE_QUAD.topLeftCorner.y },
+        topRightCorner: { x: STABLE_QUAD.topRightCorner.x + tick * 5, y: STABLE_QUAD.topRightCorner.y },
+        bottomLeftCorner: { x: STABLE_QUAD.bottomLeftCorner.x + tick * 5, y: STABLE_QUAD.bottomLeftCorner.y },
+        bottomRightCorner: { x: STABLE_QUAD.bottomRightCorner.x + (tick++) * 5, y: STABLE_QUAD.bottomRightCorner.y },
+      }))
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-drift',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+      // The same card, never removed from frame, drifting 5px/tick — well
+      // under the tolerance frame-to-frame, but 20 more ticks accumulates
+      // 100px of drift from wherever the first capture happened, more than
+      // enough to have crossed the old frozen-anchor's tolerance.
+      await advanceTicks(20)
+
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+    })
+
     it('queues a capture once MAX_CONCURRENT_JOBS slots are full, and sends it the moment one frees up', async () => {
       let resolveA
       recognizeCard.mockImplementationOnce(() => new Promise((resolve) => { resolveA = resolve }))
@@ -565,6 +605,39 @@ describe('DeckCardScanner', () => {
 
       expect(screen.getByText(/decks\.scan\.scanning/)).toHaveTextContent('0')
       expect(screen.getByText(/decks\.scan\.scanning/).parentElement).toHaveClass('invisible')
+    })
+
+    it('shows the failed card\'s own thumbnail, and flags that another job is still processing, on a capture error', async () => {
+      // Regression: the full-screen error banner used to show only a
+      // generic "failed" message — no image, no sign that a SECOND card
+      // (captured moments earlier, at a different spot) was still resolving
+      // in the background. A user with several cards queued up had no way
+      // to tell which one had actually failed, or whether the others were
+      // lost too.
+      let resolveFirst
+      recognizeCard.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve }))
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      // Card A: still resolving, never settled in this test — stands in for
+      // a real slow paid-API round trip.
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+      // Card B, at a different position, fails outright.
+      detectCardQuad.mockResolvedValue(QUAD_B)
+      recognizeCard.mockRejectedValueOnce(new Error('network down'))
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      expect(screen.getByText('decks.scan.failed')).toBeInTheDocument()
+      expect(screen.getByAltText('')).toHaveAttribute('src', 'data:image/jpeg;base64,fake')
+      // Card A is still in flight — the error screen should say so rather
+      // than reading as if scanning had stopped entirely.
+      expect(screen.getByText('decks.scan.errorOthersStillScanning')).toBeInTheDocument()
+
+      await act(async () => {
+        resolveFirst({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }], trace_id: 'trace-first' })
+        for (let i = 0; i < 10; i++) await Promise.resolve()
+      })
     })
   })
 
@@ -654,9 +727,14 @@ describe('DeckCardScanner', () => {
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
     expect(screen.getByText('decks.scan.failed')).toBeInTheDocument()
+    expect(screen.getByAltText('')).toHaveAttribute('src', 'data:image/jpeg;base64,fake')
+    // Nothing else was ever captured in this test — no false "others still
+    // scanning" hint when there's really only the one, now-failed job.
+    expect(screen.queryByText('decks.scan.errorOthersStillScanning')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByText('decks.scan.tryAgain'))
     expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
+    expect(screen.queryByAltText('')).not.toBeInTheDocument()
   })
 
   it('auto-saves via the free deck-scoped match without ever calling the paid recognizeCard', async () => {

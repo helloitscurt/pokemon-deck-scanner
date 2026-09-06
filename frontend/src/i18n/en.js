@@ -455,6 +455,7 @@ const en = {
       takePhoto: 'Take photo',
       identifying: 'Identifying card…',
       failed: 'Could not identify this card. Try again.',
+      errorOthersStillScanning: 'Other captures are still being recognized in the background.',
       tryAgain: 'Try again',
       cancel: 'Cancel',
       noMatch: 'No match found for this card.',

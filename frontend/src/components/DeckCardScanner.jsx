@@ -487,6 +487,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   const [videoAspect, setVideoAspect] = useState(3 / 4)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+  // The failed capture's own crop, so the full-screen error can show which
+  // of possibly several in-flight/queued cards it's actually talking about
+  // — see captureAndRecognize's catch block. null when extractCard itself
+  // failed (nothing was ever cropped to show).
+  const [errorCardImage, setErrorCardImage] = useState(null)
   // Last RECENT_SCANS_LIMIT confirmed cards (any save through confirmCard,
   // auto or manual — never a quick-add re-save, see bumpRecentScanQuantity),
   // newest last — see RecentScansStack. collapsingScanKeys names every
@@ -597,6 +602,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
     latestQuadRef.current = null
     setResult(null)
     setError(null)
+    setErrorCardImage(null)
     setConfirmError(null)
     stabilityTrackerRef.current.reset()
     resetNumberOcrState()
@@ -644,6 +650,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   const resetForNextCard = () => {
     setResult(null)
     setError(null)
+    setErrorCardImage(null)
     setConfirmError(null)
     stabilityTrackerRef.current.reset()
     resetNumberOcrState()
@@ -1075,8 +1082,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
     // double the initial scanner-open payload for a feature that only
     // pays off after detection already succeeded.
     preloadCardOcr()
+    // Hoisted so the catch block below can show it on the error screen —
+    // still null there if extractCard itself is what failed.
+    let cropCanvas = null
     try {
-      const cropCanvas = await extractCard(snapshotCanvas, CARD_CROP_WIDTH, CARD_CROP_HEIGHT, quad)
+      cropCanvas = await extractCard(snapshotCanvas, CARD_CROP_WIDTH, CARD_CROP_HEIGHT, quad)
       if (!cropCanvas) throw new Error('extract-failed')
       const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
       if (!blob) throw new Error('capture-failed')
@@ -1103,6 +1113,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       // abort; the component is going away regardless.
       if (controller.signal.aborted) return
       setError(t('decks.scan.failed'))
+      setErrorCardImage(cropCanvas ? cropCanvas.toDataURL('image/jpeg', 0.7) : null)
       setDebugInfo((d) => ({ ...d, tickError: `capture: ${err?.message || err}` }))
       setPhase('error')
     } finally {
@@ -1264,9 +1275,22 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           consecutiveStableFrames / REQUIRED_STABLE_FRAMES,
         )
 
-        const isAwaitingRemoval = quad && capturedRegionsRef.current.some((region) => (
+        // Matched against the region's quad, then immediately updated to
+        // follow it (below) rather than left frozen at the position it was
+        // captured at — a held card drifts a little every tick even while
+        // reading as "stable" (real hand jitter, not movement), and once
+        // detection runs continuously through a job's whole lifetime
+        // (Phase 1) that drift accumulates against a fixed anchor until it
+        // exceeds STABILITY_TOLERANCE_PROPORTION, reading the same physical
+        // card as a new one and firing a duplicate capture. Following the
+        // drift, the same way the stability tracker's own lastQuad already
+        // does, keeps the comparison against the last-seen position instead
+        // of a stale one.
+        const matchedRegion = quad && capturedRegionsRef.current.find((region) => (
           quadsAreStable(region.quad, quad, detectionWidth, detectionHeight, STABILITY_TOLERANCE_PROPORTION)
         ))
+        if (matchedRegion) matchedRegion.quad = quad
+        const isAwaitingRemoval = Boolean(matchedRegion)
 
         if (readyToCapture && quad && !isAwaitingRemoval) {
           const captureCanvas = captureCanvasRef.current
@@ -1645,7 +1669,25 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
 
             {phase === 'error' && (
               <div className={`${ERROR_BANNER_CLASS} w-full max-w-sm`}>
+                {errorCardImage && (
+                  <img
+                    src={errorCardImage}
+                    alt=""
+                    className="h-20 w-auto rounded-md mx-auto mb-3"
+                  />
+                )}
                 <p className="text-sm text-brand-red">{error}</p>
+                {/* totalScanning (defined above, before this return) already
+                    excludes this failed job — finishJob runs it out of
+                    activeJobs before this catch block's setPhase('error')
+                    is ever seen. Without this, a card that failed while a
+                    couple of others were still queued/in flight looked like
+                    the ENTIRE scanner had stopped, with no sign the rest
+                    were still going to land in the recent-scans stack on
+                    their own. */}
+                {totalScanning > 0 && (
+                  <p className="text-xs text-text-muted mt-2">{t('decks.scan.errorOthersStillScanning')}</p>
+                )}
                 <button onClick={resetForNextCard} className="btn-primary mt-3 mx-auto text-sm">
                   {t('decks.scan.tryAgain')}
                 </button>
