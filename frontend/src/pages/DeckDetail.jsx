@@ -3,7 +3,7 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ArrowLeft, Camera, RotateCcw, Trash2 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection, undoLastScan } from '../api/client'
+import { getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection, undoLastScan, undoLastScanCollectionOnly } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { useConfirmDialog } from '../contexts/ConfirmDialogContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
@@ -180,12 +180,21 @@ export default function DeckDetail() {
   })
 
   // Backs the "-" on a recent-scans thumbnail (DeckCardScanner.jsx's
-  // decrementRecentScan) — same undo_scan route the success toast's own
-  // Undo link already uses, just triggered from the thumbnail instead of a
-  // toast. No success toast of its own: the thumbnail's count dropping (or
-  // the thumbnail disappearing) is already the confirmation.
+  // decrementRecentScan). No success toast of its own: the thumbnail's
+  // count dropping (or the thumbnail disappearing) is already the
+  // confirmation. Routes to whichever backend call can safely reverse the
+  // add: undo_scan (collection + deck progress together) for 'counted',
+  // the collection-only route for 'not_in_deck'/'already_complete', which
+  // undo_scan can't safely reverse (see its own docstring and
+  // docs/plans/scanner-ux-todos.md item 5) — DeckCardScanner.jsx always
+  // lets the user try to remove either way, so this is the one place that
+  // has to pick the right route rather than gating the button on it.
   const decrementMutation = useMutation({
-    mutationFn: ({ cardId, traceId }) => undoLastScan(instanceId, cardId, traceId),
+    mutationFn: ({ cardId, traceId, deckScanStatus }) => (
+      deckScanStatus === 'counted'
+        ? undoLastScan(instanceId, cardId, traceId)
+        : undoLastScanCollectionOnly(instanceId, cardId, traceId)
+    ),
     onSuccess: () => invalidate(),
     onError: () => toast.error(t('decks.scan.removeFailed')),
   })
@@ -353,7 +362,7 @@ export default function DeckDetail() {
         isOpen={scannerOpen}
         onClose={() => setScannerOpen(false)}
         onConfirm={(candidate, meta) => scanMutation.mutateAsync({ candidate, ...meta })}
-        onDecrement={(cardId, traceId) => decrementMutation.mutateAsync({ cardId, traceId })}
+        onDecrement={(cardId, traceId, deckScanStatus) => decrementMutation.mutateAsync({ cardId, traceId, deckScanStatus })}
         deckInstanceId={instanceId}
         missingCards={missingCards}
       />

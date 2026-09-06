@@ -3,13 +3,15 @@ import { createPortal } from 'react-dom'
 import { AlertTriangle, Camera, Check, Loader2, Minus, Plus, X } from 'lucide-react'
 import { matchDeckImage, recognizeCard } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
+import { useConfirmDialog } from '../contexts/ConfirmDialogContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
 import { SCANNER_IMAGE_ACCEPT } from '../utils/scannerImages'
 import { useCameraStream } from '../hooks/useCameraStream'
-import { detectCardQuad, detectionStatus, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrRawText, lastOcrWords, preloadCardOcr, preloadNumberOcr, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
+import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
+import { preloadCardOcr, preloadNumberOcr, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
 import { createStabilityTracker, quadsAreStable } from '../utils/quadStability'
 import { computeNumberBandRect } from '../utils/numberBand'
+import { computeSharpnessVariance, sharpnessVarianceToPercent } from '../utils/imageSharpness'
 
 // Real-device tuning, three passes: first (5 frames @ 2% tolerance @
 // 180ms = 900ms dwell) felt slow and twitchy — ordinary jitter from
@@ -28,6 +30,16 @@ import { computeNumberBandRect } from '../utils/numberBand'
 const DETECTION_INTERVAL_MS = 90
 const REQUIRED_STABLE_FRAMES = 8
 const STABILITY_TOLERANCE_PROPORTION = 0.07
+// A resolved job's capturedRegionsRef entry used to clear on the very next
+// empty-frame tick — but a single glitchy tick (motion blur, a lighting
+// flicker, a momentary autofocus hunt) can report an empty frame even
+// though the physical card never actually left. When that lands right
+// after a job resolves, the already-saved card reads as newly arrived
+// once detection recovers, producing a genuine duplicate save. Requiring
+// a short run of consecutive empty ticks — the removal-side mirror of
+// REQUIRED_STABLE_FRAMES on the capture side — treats a single blip as
+// noise instead of a real removal.
+const EMPTY_FRAME_DEBOUNCE_TICKS = 3
 // A warning (not in this deck / already have enough) needs real reading
 // time, hence the generous duration — dismissible early with a tap (see
 // dismissWarningById) so a user who's already read it isn't stuck waiting
@@ -56,19 +68,26 @@ const OCR_CROP_HEIGHT = CARD_CROP_HEIGHT * 2
 // empirically calibrated against real devices yet — same caveat every
 // other tuning constant on this page carries.
 const NUMBER_OCR_INTERVAL_MS = 700
+// Gates the auto-trigger streak below — never itself displayed any more
+// (docs/plans/scanner-ux-todos.md item 7 replaced the live badge with an
+// image-quality reading; this OCR-confidence threshold still exists
+// purely to decide when a number read is trustworthy enough to attempt a
+// deck match, same as before).
 const NUMBER_CONFIDENCE_THRESHOLD = 80
-const NUMBER_CONFIDENCE_MEDIUM_THRESHOLD = 50
 const REQUIRED_HIGH_CONFIDENCE_PASSES = 3
 const NUMBER_BAND_FALLBACK_PASSES = 3
 // How many recently-confirmed cards the on-screen stack keeps at once —
 // see RecentScansStack below. Matches the "3 or 5" the feature was
-// requested at. Set to 3, not 5: at the thumbnail's actual h-[120px] size
-// (bumped 3x from an earlier h-10 for legibility, see RecentScanThumb),
-// 5 stacked thumbnails (5*120 + 4*6 gap = 624px) is taller than the video
-// container itself at this component's own default 3:4 aspect and max
-// width (384/0.75 = 512px) — the oldest one or two would render clipped
-// off above the video's top edge. 3 (372px) fits comfortably instead.
-const RECENT_SCANS_LIMIT = 3
+// requested at. Set to 4, not 5: at the thumbnail's actual h-[120px] size
+// (bumped 3x from an earlier h-10 for legibility, see RecentScanThumb), 5
+// stacked thumbnails (5*120 + 4*6 gap = 624px) is still taller than the
+// video container itself at this component's own default 3:4 aspect and
+// max width (384/0.75 = 512px) — the oldest would render clipped off
+// above the video's top edge. 4 (498px) fits with margin to spare.
+// Originally 3 (item 2, docs/plans/scanner-ux-todos.md) — raised to 4
+// once removing the debug/OCR readout and low-confidence hint (item 6)
+// freed enough of the screen that a fourth slot was worth the space.
+const RECENT_SCANS_LIMIT = 4
 // How long the oldest thumbnail's collapse animation runs before it's
 // actually dropped from state (see addRecentScan) — must match the
 // duration in RecentScansStack's own transition classes below.
@@ -82,22 +101,6 @@ const MAX_CONCURRENT_JOBS = 2
 
 const ERROR_BANNER_CLASS = 'card border-brand-red/30 bg-brand-red/5 text-center py-4'
 
-// err?.message || err renders the literal string "undefined" when err
-// itself is undefined/null (a caught rejection with no reason — observed
-// for real from a Tesseract.js worker.recognize() failure on a real
-// device) instead of anything diagnostic. Not specific to OCR, so kept
-// generic rather than folded into one call site.
-function describeError(err) {
-  if (err instanceof Error) return err.message || err.name || 'Error'
-  if (typeof err === 'string' && err) return err
-  if (err === undefined || err === null) return '(no error details — worker may have crashed)'
-  try {
-    return JSON.stringify(err)
-  } catch {
-    return String(err)
-  }
-}
-
 function scaleQuad(quad, scaleX, scaleY) {
   const scalePoint = ({ x, y }) => ({ x: x * scaleX, y: y * scaleY })
   return {
@@ -105,6 +108,26 @@ function scaleQuad(quad, scaleX, scaleY) {
     topRightCorner: scalePoint(quad.topRightCorner),
     bottomLeftCorner: scalePoint(quad.bottomLeftCorner),
     bottomRightCorner: scalePoint(quad.bottomRightCorner),
+  }
+}
+
+// How much each drawn frame moves toward the latest raw detection, not all
+// the way (docs/plans/scanner-ux-todos.md item 9) — a reasoned starting
+// point, not empirically calibrated against real devices yet, same caveat
+// every other tuning constant on this page carries. Higher tracks the raw
+// quad more closely (less smoothing, more jitter); lower lags further
+// behind a genuine reposition before catching up. History: 0.35 (initial)
+// lagged noticeably behind the actual card → raised to 0.5, which then
+// read as too jumpy again → settled here, between the two.
+const OVERLAY_SMOOTHING_ALPHA = 0.42
+
+function lerpQuad(prev, next, alpha) {
+  const lerpPoint = (p, n) => ({ x: p.x + (n.x - p.x) * alpha, y: p.y + (n.y - p.y) * alpha })
+  return {
+    topLeftCorner: lerpPoint(prev.topLeftCorner, next.topLeftCorner),
+    topRightCorner: lerpPoint(prev.topRightCorner, next.topRightCorner),
+    bottomLeftCorner: lerpPoint(prev.bottomLeftCorner, next.bottomLeftCorner),
+    bottomRightCorner: lerpPoint(prev.bottomRightCorner, next.bottomRightCorner),
   }
 }
 
@@ -155,8 +178,15 @@ function findUniqueMissingCardName(missingCards, numberLocal) {
   return matches.length === 1 ? matches[0].name : null
 }
 
+// Reasoned starting points for the image-quality badge below, not
+// empirically calibrated against real devices/cameras yet — same caveat
+// every other tuning constant on this page carries (docs/plans/
+// scanner-ux-todos.md item 7).
+const IMAGE_QUALITY_GOOD_THRESHOLD = 60
+const IMAGE_QUALITY_MEDIUM_THRESHOLD = 30
+
 // Background only — the reading itself is always black text (see the badge
-// JSX below), so this just tints the pill by confidence tier. Near-opaque
+// JSX below), so this just tints the pill by quality tier. Near-opaque
 // (/90), not a light translucent tint: this badge sits directly over the
 // live camera feed, not a fixed app surface, and a translucent tint over a
 // dark/dim scene (indoor lighting, a shadowed tabletop — exactly when a
@@ -165,9 +195,9 @@ function findUniqueMissingCardName(missingCards, numberLocal) {
 // own precedent for text over unpredictable video content — the
 // processing overlay (bg-black/60) and warning toast (bg-black/85) both
 // go near-opaque for the same reason.
-function confidenceBadgeClass(confidence) {
-  if (confidence >= NUMBER_CONFIDENCE_THRESHOLD) return 'bg-green/90'
-  if (confidence >= NUMBER_CONFIDENCE_MEDIUM_THRESHOLD) return 'bg-yellow/90'
+function imageQualityBadgeClass(quality) {
+  if (quality >= IMAGE_QUALITY_GOOD_THRESHOLD) return 'bg-green/90'
+  if (quality >= IMAGE_QUALITY_MEDIUM_THRESHOLD) return 'bg-yellow/90'
   // NOT the .badge-red/bg-brand-red class — --color-brand-red is
   // theme-swapped (yellow in "electric", green in "grass", etc., see
   // index.css and currentBrandRed() above), which would collide with
@@ -249,7 +279,10 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, onDecrement, quickAddDi
   // scheduleRecentScanRemoval's timeout filters the entry out regardless,
   // silently dropping that add/undo from the visible stack.
   const addDisabled = quickAddDisabled || collapsing
-  const removeDisabled = quickAddDisabled || collapsing || !scan.canRemove
+  // Always enabled otherwise (docs/plans/scanner-ux-todos.md item 5) — a
+  // confirmation dialog, not this disabled state, is what stands between
+  // a tap and an actual removal now; see decrementRecentScan.
+  const removeDisabled = quickAddDisabled || collapsing
 
   useEffect(() => {
     const frame = requestAnimationFrame(() => setEntered(true))
@@ -292,7 +325,7 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, onDecrement, quickAddDi
                 <Loader2 size={20} className="animate-spin text-brand-red" />
               </span>
             )}
-            {/* Which recognition path resolved this save (item 5,
+            {/* Which recognition path resolved this save (item 4,
                 docs/plans/scanner-ux-todos.md) — a trust/diagnostic
                 signal, not something every scan needs read out loud, so
                 it's a quiet corner badge rather than part of the main
@@ -442,6 +475,7 @@ function RecentScansStack({ scans, collapsingKeys, label, onQuickAdd, onDecremen
  */
 export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecrement, deckInstanceId, missingCards = [] }) {
   const { t } = useSettings()
+  const confirmDialog = useConfirmDialog()
 
   const manualFileRef = useRef()
   const detectionCanvasRef = useRef(null)
@@ -472,21 +506,65 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   // genuinely concurrent job for the identical physical card (see the tick
   // loop's own empty-frame handling and submitCapture's isJobPending use).
   const capturedRegionsRef = useRef([])
+  // Consecutive empty-detection ticks in a row — see EMPTY_FRAME_DEBOUNCE_
+  // TICKS's own comment for why a resolved job's region needs a short run
+  // of these, not just one, before it's treated as genuinely removed.
+  const emptyFrameStreakRef = useRef(0)
   // Most recent quad the tick loop actually saw, refreshed every tick and
   // cleared the moment a tick finds nothing — read by handleScanNow so the
   // manual "Scan now" button can fire off the same quad the overlay is
   // currently drawing, without waiting for REQUIRED_STABLE_FRAMES of hold
   // time.
   const latestQuadRef = useRef(null)
+  // The last DRAWN outline, smoothed toward each new raw quad rather than
+  // snapping straight to it (docs/plans/scanner-ux-todos.md item 9) — real
+  // hand jitter moves a held card's detected corners a few pixels every
+  // tick even while it reads as "stable," which looked like the outline
+  // itself was unsteady. Only ever read/written by drawOverlay's own call
+  // in the tick loop below; every other consumer of a quad (the stability
+  // tracker, capture, capturedRegionsRef matching) keeps reading the RAW
+  // per-tick quad unchanged, so smoothing the drawn line can't shift when
+  // a card actually gets captured.
+  const smoothedQuadRef = useRef(null)
 
   // hunting | processing | ambiguous | error | cameraDenied — 'processing'
   // is reachable ONLY through the camera-denied fallback's single-shot
   // handleManualFile now (see the type's own doc comment above); a
   // confident live capture never sets phase at all any more.
   const [phase, setPhase] = useState('hunting')
+  // Mirrors `phase` for the two async job-completion sites below
+  // (captureAndRecognize's ambiguous/error branches) — those read the
+  // LATEST phase to decide whether to render their own result at all, and
+  // a plain closure over the `phase` variable would see whatever it was
+  // when that specific async call started, not "right now" (see
+  // MAX_CONCURRENT_JOBS: two captures can resolve seconds apart, well
+  // after phase has moved on).
+  const phaseRef = useRef(phase)
+  useEffect(() => {
+    phaseRef.current = phase
+  }, [phase])
   const [videoAspect, setVideoAspect] = useState(3 / 4)
   const [result, setResult] = useState(null)
   const [error, setError] = useState(null)
+  // The failed capture's own crop, so the full-screen error can show which
+  // of possibly several in-flight/queued cards it's actually talking about
+  // — see captureAndRecognize's catch block. null when extractCard itself
+  // failed (nothing was ever cropped to show).
+  const [errorCardImage, setErrorCardImage] = useState(null)
+  // Tapping the failed-capture thumbnail opens it enlarged — reset
+  // alongside errorCardImage so a stale "open" doesn't carry over into the
+  // next error.
+  const [showErrorPreview, setShowErrorPreview] = useState(false)
+  // Focused on open (see the effect below) so the lightbox's own close
+  // button — not the scanner modal's header close button sitting inert
+  // underneath it — is what a keyboard/screen-reader user lands on. The
+  // two buttons share a similar look, and without an explicit focus move,
+  // a Tab press could just as easily reach the header one and close the
+  // whole scanner instead of the preview it's covering.
+  const errorPreviewCloseRef = useRef(null)
+  useEffect(() => {
+    if (showErrorPreview) errorPreviewCloseRef.current?.focus()
+  }, [showErrorPreview])
   // Last RECENT_SCANS_LIMIT confirmed cards (any save through confirmCard,
   // auto or manual — never a quick-add re-save, see bumpRecentScanQuantity),
   // newest last — see RecentScansStack. collapsingScanKeys names every
@@ -508,13 +586,6 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   // quick-add landing during one) don't block each other. See
   // RecentScansStack's own comment for the UI half of this.
   const [confirmingKeys, setConfirmingKeys] = useState(() => new Set())
-  // Visible diagnostic readout, not devtools-only — this app has no console
-  // access on a phone. Mirrors detectionStatus (opencv.js/jscanify load
-  // state) plus the last error from the detection loop itself, which
-  // previously ran unhandled: a rejected detectCardQuad() call (e.g. a CSP
-  // block on WASM compilation) just silently retried forever with the
-  // camera visibly live and nothing else ever happening.
-  const [debugInfo, setDebugInfo] = useState({ tickCount: 0, tickError: null, ocrName: undefined, ocrNumber: undefined })
   // Recognition (Gemini identify + visual-match, see recognize.py) can take
   // well over a minute under real API load with the backend's own retries —
   // measured 89s in practice. A static "Identifying card..." spinner is
@@ -571,14 +642,18 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   const highConfidenceStreakRef = useRef(0)
   const passesSinceValidReadRef = useRef(0)
   const numberCropCanvasRef = useRef(null)
-  const [liveNumberConfidence, setLiveNumberConfidence] = useState(null)
+  // Sharpness-based "is this a good picture of the card" reading (see the
+  // throttled effect below) — distinct from the OCR confidence used
+  // internally for the auto-trigger threshold just above, which is never
+  // itself displayed (docs/plans/scanner-ux-todos.md item 7).
+  const [liveImageQuality, setLiveImageQuality] = useState(null)
   const [liveNumberText, setLiveNumberText] = useState(null)
   const [liveNamePreview, setLiveNamePreview] = useState(null)
 
   const resetNumberOcrState = () => {
     highConfidenceStreakRef.current = 0
     passesSinceValidReadRef.current = 0
-    setLiveNumberConfidence(null)
+    setLiveImageQuality(null)
     setLiveNumberText(null)
     setLiveNamePreview(null)
   }
@@ -594,9 +669,13 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
     if (!isOpen) return
     cameraFallbackLockedRef.current = false
     capturedRegionsRef.current = []
+    emptyFrameStreakRef.current = 0
     latestQuadRef.current = null
+    smoothedQuadRef.current = null
     setResult(null)
     setError(null)
+    setErrorCardImage(null)
+    setShowErrorPreview(false)
     setConfirmError(null)
     stabilityTrackerRef.current.reset()
     resetNumberOcrState()
@@ -644,6 +723,8 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   const resetForNextCard = () => {
     setResult(null)
     setError(null)
+    setErrorCardImage(null)
+    setShowErrorPreview(false)
     setConfirmError(null)
     stabilityTrackerRef.current.reset()
     resetNumberOcrState()
@@ -710,7 +791,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   // an energy card, say — still gets two distinct stack entries instead of
   // React treating the second as an update to the first; only the "+"
   // button folds repeats into one thumbnail's count.
-  const addRecentScan = (candidate, decision, resolvedCardId, canRemove, traceId) => {
+  const addRecentScan = (candidate, decision, resolvedCardId, deckScanStatus, traceId) => {
     const entry = {
       key: `${candidate.id || 'card'}-${Date.now()}-${Math.random()}`,
       image: resolveCardImageUrl(candidate, 'small'),
@@ -734,12 +815,14 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       // when scan diagnostics are enabled) — round-tripped to undo_scan
       // the same way the success toast's own Undo link does.
       traceId,
-      // Whether undo_scan can safely reverse the MOST RECENT add to this
-      // entry — false for 'not_in_deck'/'already_complete' outcomes, which
-      // (per undo_scan's own docstring) either 404 or wrongly decrement an
-      // unrelated earlier scan, exactly the reason DeckDetail.jsx's own
-      // Undo toast already withholds itself in those two cases.
-      canRemove,
+      // The MOST RECENT add's deck_scan_status — decrementRecentScan reads
+      // this to pick which backend route can safely reverse it: 'counted'
+      // goes through undo_scan (collection + deck progress together);
+      // 'not_in_deck'/'already_complete' go through the collection-only
+      // route instead, since undo_scan can't safely reverse those (see its
+      // own docstring and docs/plans/scanner-ux-todos.md item 5) — either
+      // is still always removable, just via a different route.
+      deckScanStatus,
     }
     setRecentScans((current) => {
       const next = [...current, entry]
@@ -755,9 +838,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   // pushing a new one (see confirmCard's quickAddTarget param) — a card
   // image only ever appears here because it was actually scanned; tapping
   // "+" again just raises the digit beside it.
-  const bumpRecentScanQuantity = (key, resolvedCardId, canRemove, traceId) => {
+  const bumpRecentScanQuantity = (key, resolvedCardId, deckScanStatus, traceId) => {
     setRecentScans((current) => current.map((scan) => (
-      scan.key === key ? { ...scan, quantity: scan.quantity + 1, resolvedCardId, canRemove, traceId } : scan
+      scan.key === key ? { ...scan, quantity: scan.quantity + 1, resolvedCardId, deckScanStatus, traceId } : scan
     )))
   }
 
@@ -805,23 +888,20 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
     try {
       const response = await onConfirm(candidate, { isAutoSave, traceId, hasLiveWarningOverlay })
       const resolvedCardId = response?.data?.card_id ?? candidate.id
-      // Whether this specific add can later be undone by decrementRecentScan
-      // — see addRecentScan's canRemove comment.
-      const canRemove = response?.data?.deck_scan_status === 'counted'
+      // See addRecentScan's deckScanStatus comment — decrementRecentScan
+      // reads this back to pick the right undo route.
+      const deckScanStatus = response?.data?.deck_scan_status
       if (quickAddTarget) {
-        bumpRecentScanQuantity(quickAddTarget.key, resolvedCardId, canRemove, traceId)
+        bumpRecentScanQuantity(quickAddTarget.key, resolvedCardId, deckScanStatus, traceId)
       } else {
-        addRecentScan(candidate, decision, resolvedCardId, canRemove, traceId)
+        addRecentScan(candidate, decision, resolvedCardId, deckScanStatus, traceId)
       }
       if (!hasLiveWarningOverlay) {
         // The fallback flow has no live video to float a warning toast
         // over — just clear back to its own ready-to-scan-next state.
         resetForNextCard()
-      } else {
-        const deckScanStatus = response?.data?.deck_scan_status
-        if (deckScanStatus && deckScanStatus !== 'counted') {
-          addWarning(deckScanStatus, { name: candidate.name, quantity: response?.data?.deck_scan_quantity })
-        }
+      } else if (deckScanStatus && deckScanStatus !== 'counted') {
+        addWarning(deckScanStatus, { name: candidate.name, quantity: response?.data?.deck_scan_quantity })
       }
       return true
     } catch {
@@ -854,21 +934,28 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   }
 
   // The "-" beside a recent-scans thumbnail: reverses the single most
-  // recent add to this entry via the same undo route the success toast's
-  // own "Undo" link uses (undo_scan decrements-or-deletes the CollectionItem
-  // row and the deck-progress row it incremented, in one transaction).
-  // Gated on scan.canRemove — set false whenever that last add's
-  // deck_scan_status wasn't 'counted' (see addRecentScan) — RecentScanThumb
-  // already disables the button in that case, but this guards against a
-  // stale tap racing a status change. At quantity 1, undoing removes the
-  // whole thumbnail (the image only exists because that one add happened);
-  // above 1, it just lowers the count.
+  // recent add to this entry. Always allowed regardless of that add's
+  // deck_scan_status (docs/plans/scanner-ux-todos.md item 5) — onDecrement
+  // picks the route that can safely reverse it: undo_scan (collection +
+  // deck progress together) for 'counted', the collection-only route for
+  // 'not_in_deck'/'already_complete', which undo_scan itself can't reverse
+  // (see its own docstring). A destructive, one-way action with no
+  // undo-of-the-undo, so it's confirmed first — same confirm-before-act
+  // pattern this app already uses for deck reset/delete. At quantity 1,
+  // confirming removes the whole thumbnail (the image only exists because
+  // that one add happened); above 1, it just lowers the count.
   const decrementRecentScan = async (scan) => {
-    if (phase !== 'hunting' || confirmingKeys.has(scan.key) || !scan.canRemove) return
+    if (phase !== 'hunting' || confirmingKeys.has(scan.key)) return
+    const confirmed = await confirmDialog({
+      message: t('decks.scan.removeCardConfirm'),
+      confirmLabel: t('common.remove'),
+      destructive: true,
+    })
+    if (!confirmed) return
     setConfirmingKeys((current) => new Set(current).add(scan.key))
     setConfirmError(null)
     try {
-      await onDecrement(scan.resolvedCardId, scan.traceId)
+      await onDecrement(scan.resolvedCardId, scan.traceId, scan.deckScanStatus)
       if (scan.quantity <= 1) {
         scheduleRecentScanRemoval(scan.key)
       } else {
@@ -922,34 +1009,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       // not a blind repeat — before falling through to a pure image match
       // with no OCR hints at all (still worth trying: pHash alone can
       // resolve a card with zero OCR input, see matchDeckImage below).
-      setDebugInfo((d) => ({ ...d, tickError: `ocr(large): ${describeError(err)}` }))
       try {
         ocrFields = await runOcr(nativeFrameSource, quad, CARD_CROP_WIDTH, CARD_CROP_HEIGHT)
       } catch (err2) {
         if (signal.aborted) throw err2
-        setDebugInfo((d) => ({
-          ...d, ocrName: null, ocrNumber: null, ocrRawText: '', ocrWords: [],
-          tickError: `ocr: ${describeError(err2)}`,
-        }))
       }
-    }
-
-    if (ocrFields) {
-      // Visible, not just inferred from "the paid call ran anyway" — the
-      // only way to tell "OCR found nothing" apart from "OCR found
-      // something but the deck match wasn't confident" without this was
-      // reading server logs by hand (see the real-device Wattrel case).
-      setDebugInfo((d) => ({
-        ...d,
-        ocrName: ocrFields.name,
-        ocrNumber: ocrFields.number_local,
-        ocrRawText: lastOcrRawText.value,
-        // Shows every recognized word's own confidence/position, including
-        // ones pickCardName rejected — the only way to tell "nothing scored
-        // high enough" apart from "the name band/confidence floor need
-        // retuning" (see cardOcr.js's NAME_BAND_FRACTION/MIN_NAME_CONFIDENCE).
-        ocrWords: lastOcrWords.value,
-      }))
     }
 
     // deckInstanceId missing shouldn't happen (DeckDetail.jsx always
@@ -965,7 +1029,6 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       )
     } catch (err) {
       if (signal.aborted) throw err
-      setDebugInfo((d) => ({ ...d, tickError: `deck-match: ${describeError(err)}` }))
       return null
     }
   }
@@ -1075,8 +1138,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
     // double the initial scanner-open payload for a feature that only
     // pays off after detection already succeeded.
     preloadCardOcr()
+    // Hoisted so the catch block below can show it on the error screen —
+    // still null there if extractCard itself is what failed.
+    let cropCanvas = null
     try {
-      const cropCanvas = await extractCard(snapshotCanvas, CARD_CROP_WIDTH, CARD_CROP_HEIGHT, quad)
+      cropCanvas = await extractCard(snapshotCanvas, CARD_CROP_WIDTH, CARD_CROP_HEIGHT, quad)
       if (!cropCanvas) throw new Error('extract-failed')
       const blob = await new Promise((resolve) => cropCanvas.toBlob(resolve, 'image/jpeg', 0.92))
       if (!blob) throw new Error('capture-failed')
@@ -1087,13 +1153,22 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       }
       const topCandidate = data?.matches?.[0]
 
+      // phaseRef guard (both branches below, and the catch block): with
+      // MAX_CONCURRENT_JOBS concurrent captures, a DIFFERENT job's own
+      // ambiguous/error outcome can already be on screen awaiting the user
+      // (pick a candidate / tap Try Again) by the time this one resolves.
+      // Without this check, that outcome silently replaced whatever the
+      // user was already looking at before they could act on it — this
+      // job's own (also-unconfident/failed) outcome is dropped instead,
+      // same "one interactive result visible at a time" rule already
+      // covered for successes by errorOthersStillScanning below.
       if (data?._identity_confident && topCandidate) {
         const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true, data.trace_id, data._identity_decision)
-        if (!saved) {
+        if (!saved && phaseRef.current !== 'error' && phaseRef.current !== 'ambiguous') {
           setResult(data)
           setPhase('ambiguous')
         }
-      } else {
+      } else if (phaseRef.current !== 'error' && phaseRef.current !== 'ambiguous') {
         setResult(data)
         setPhase('ambiguous')
       }
@@ -1102,9 +1177,11 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       // per-job cancel button in Phase 1 — so there's nothing to reset on
       // abort; the component is going away regardless.
       if (controller.signal.aborted) return
-      setError(t('decks.scan.failed'))
-      setDebugInfo((d) => ({ ...d, tickError: `capture: ${err?.message || err}` }))
-      setPhase('error')
+      if (phaseRef.current !== 'error' && phaseRef.current !== 'ambiguous') {
+        setError(t('decks.scan.failed'))
+        setErrorCardImage(cropCanvas ? cropCanvas.toDataURL('image/jpeg', 0.7) : null)
+        setPhase('error')
+      }
     } finally {
       finishJob(jobId)
     }
@@ -1140,9 +1217,10 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       // Not confident: nothing to do — Path A/B are already continuously
       // scanning, there's no "resume" step left now that neither ever
       // stopped for this attempt.
-    } catch (err) {
-      if (controller.signal.aborted) return
-      setDebugInfo((d) => ({ ...d, tickError: `zoom-match: ${describeError(err)}` }))
+    } catch {
+      // Fire-and-forget (see this function's own doc comment) — a failed
+      // zoom-match attempt just resumes scanning silently, same as a
+      // not-confident one.
     } finally {
       finishJob(jobId)
     }
@@ -1216,12 +1294,6 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
 
       tickInFlightRef.current = true
       try {
-        setDebugInfo((d) => ({
-          tickCount: d.tickCount + 1,
-          tickError: null,
-          libState: detectionStatus.state,
-          libError: detectionStatus.error,
-        }))
         const scale = Math.min(1, DETECTION_MAX_WIDTH / video.videoWidth)
         const detectionWidth = Math.round(video.videoWidth * scale)
         const detectionHeight = Math.round(video.videoHeight * scale)
@@ -1249,24 +1321,53 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           // as a "new" card, submitting a genuinely concurrent second job
           // for the identical physical card (see submitCapture's own
           // comment). Entries whose job HAS already resolved still get
-          // dropped on the very next empty frame, same as before.
-          capturedRegionsRef.current = capturedRegionsRef.current.filter((region) => isJobPending(region.jobId))
+          // dropped, but only once EMPTY_FRAME_DEBOUNCE_TICKS empty frames
+          // have landed in a row — see that constant's own comment for why
+          // a single one isn't enough to trust.
+          emptyFrameStreakRef.current += 1
+          if (emptyFrameStreakRef.current >= EMPTY_FRAME_DEBOUNCE_TICKS) {
+            capturedRegionsRef.current = capturedRegionsRef.current.filter((region) => isJobPending(region.jobId))
+          }
+        } else {
+          emptyFrameStreakRef.current = 0
         }
         const { consecutiveStableFrames, readyToCapture } = stabilityTrackerRef.current.observe(
           quad, detectionWidth, detectionHeight,
         )
 
+        // Smoothed toward the raw quad rather than snapped to it (see
+        // smoothedQuadRef's own comment) — resets instantly on an empty
+        // frame (nothing to lag toward) rather than smoothing out to
+        // nothing, which would leave a stale outline lingering after a
+        // card is actually removed.
+        smoothedQuadRef.current = quad
+          ? (smoothedQuadRef.current ? lerpQuad(smoothedQuadRef.current, quad, OVERLAY_SMOOTHING_ALPHA) : quad)
+          : null
+
         const overlayScaleX = overlayCanvas.width / detectionWidth
         const overlayScaleY = overlayCanvas.height / detectionHeight
         drawOverlay(
           overlayCanvas,
-          quad && scaleQuad(quad, overlayScaleX, overlayScaleY),
+          smoothedQuadRef.current && scaleQuad(smoothedQuadRef.current, overlayScaleX, overlayScaleY),
           consecutiveStableFrames / REQUIRED_STABLE_FRAMES,
         )
 
-        const isAwaitingRemoval = quad && capturedRegionsRef.current.some((region) => (
+        // Matched against the region's quad, then immediately updated to
+        // follow it (below) rather than left frozen at the position it was
+        // captured at — a held card drifts a little every tick even while
+        // reading as "stable" (real hand jitter, not movement), and once
+        // detection runs continuously through a job's whole lifetime
+        // (Phase 1) that drift accumulates against a fixed anchor until it
+        // exceeds STABILITY_TOLERANCE_PROPORTION, reading the same physical
+        // card as a new one and firing a duplicate capture. Following the
+        // drift, the same way the stability tracker's own lastQuad already
+        // does, keeps the comparison against the last-seen position instead
+        // of a stale one.
+        const matchedRegion = quad && capturedRegionsRef.current.find((region) => (
           quadsAreStable(region.quad, quad, detectionWidth, detectionHeight, STABILITY_TOLERANCE_PROPORTION)
         ))
+        if (matchedRegion) matchedRegion.quad = quad
+        const isAwaitingRemoval = Boolean(matchedRegion)
 
         if (readyToCapture && quad && !isAwaitingRemoval) {
           const captureCanvas = captureCanvasRef.current
@@ -1276,8 +1377,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           const nativeQuad = scaleQuad(quad, video.videoWidth / detectionWidth, video.videoHeight / detectionHeight)
           submitCapture(captureCanvas, nativeQuad, quad)
         }
-      } catch (err) {
-        setDebugInfo((d) => ({ ...d, tickError: err?.message || String(err), libState: detectionStatus.state, libError: detectionStatus.error }))
+      } catch {
+        // A rejected detection tick just retries on the next one — nothing
+        // to surface (see docs/plans/scanner-ux-todos.md item 6).
       } finally {
         tickInFlightRef.current = false
       }
@@ -1315,6 +1417,37 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       numberOcrInFlightRef.current = true
       try {
         const quadInfo = latestQuadRef.current
+
+        // Image-quality badge (docs/plans/scanner-ux-todos.md item 7) —
+        // independent of the OCR read below (a blurry photo can still OCR
+        // a number fine, and a sharp one can OCR poorly if the number's
+        // small or worn, so this can't be derived from OCR confidence).
+        // No quad, no reading: a quality score for the whole video frame
+        // (background included) wouldn't mean "is THIS card in focus."
+        if (quadInfo) {
+          const corners = [
+            quadInfo.quad.topLeftCorner, quadInfo.quad.topRightCorner,
+            quadInfo.quad.bottomLeftCorner, quadInfo.quad.bottomRightCorner,
+          ]
+          const minX = Math.max(0, Math.floor(Math.min(...corners.map((c) => c.x))))
+          const maxX = Math.min(quadInfo.detectionWidth, Math.ceil(Math.max(...corners.map((c) => c.x))))
+          const minY = Math.max(0, Math.floor(Math.min(...corners.map((c) => c.y))))
+          const maxY = Math.min(quadInfo.detectionHeight, Math.ceil(Math.max(...corners.map((c) => c.y))))
+          const boxWidth = maxX - minX
+          const boxHeight = maxY - minY
+          if (boxWidth >= 3 && boxHeight >= 3) {
+            // detectionCanvasRef, not a fresh crop — Path A (the 90ms tick
+            // loop) already redraws it every tick, so this reads whatever
+            // frame is currently sitting there rather than re-drawing one.
+            const regionData = detectionCanvasRef.current.getContext('2d').getImageData(minX, minY, boxWidth, boxHeight)
+            setLiveImageQuality(sharpnessVarianceToPercent(computeSharpnessVariance(regionData)))
+          } else {
+            setLiveImageQuality(null)
+          }
+        } else {
+          setLiveImageQuality(null)
+        }
+
         const fallbackLevel = Math.min(2, Math.floor(passesSinceValidReadRef.current / NUMBER_BAND_FALLBACK_PASSES))
         const sourceCanvas = quadInfo ? detectionCanvasRef.current : video
         const sourceWidth = quadInfo ? quadInfo.detectionWidth : video.videoWidth
@@ -1334,7 +1467,6 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
         const numberText = number_local && number_total ? `${number_local}/${number_total}` : null
         passesSinceValidReadRef.current = numberText ? 0 : passesSinceValidReadRef.current + 1
 
-        setLiveNumberConfidence(confidence)
         setLiveNumberText(numberText)
         setLiveNamePreview(numberText ? findUniqueMissingCardName(missingCards, number_local) : null)
 
@@ -1362,8 +1494,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
             attemptZoomMatch(snapshot, { number_local })
           }
         }
-      } catch (err) {
-        setDebugInfo((d) => ({ ...d, tickError: `number-ocr: ${describeError(err)}` }))
+      } catch {
+        // A failed number-OCR pass just retries on the next one — nothing
+        // to surface (see docs/plans/scanner-ux-todos.md item 6).
       } finally {
         numberOcrInFlightRef.current = false
       }
@@ -1502,7 +1635,15 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
 
         {(phase === 'hunting' || phase === 'processing' || phase === 'error') && (
           <div className="flex flex-col items-center gap-4 pt-2">
-            <div className="relative w-full max-w-sm overflow-hidden rounded-2xl bg-black" style={{ aspectRatio: videoAspect }}>
+            {/* max-h-[75vh]: aspect-ratio alone only ever derives height
+                from width, so on a tall/narrow phone viewport (width is
+                the binding constraint, not height) the video stayed
+                shorter than the screen had room for — most of that never
+                showed anything but the modal's own near-black backdrop.
+                Capping height too lets the browser grow the box to
+                whichever of the two constraints is tighter, same sizing
+                logic as object-fit: contain. */}
+            <div className="relative w-full max-w-sm max-h-[75vh] overflow-hidden rounded-2xl bg-black" style={{ aspectRatio: videoAspect }}>
               <video ref={videoRef} autoPlay playsInline muted className="absolute inset-0 h-full w-full object-contain" />
               <canvas ref={overlayCanvasRef} className="absolute inset-0 h-full w-full pointer-events-none" />
               <canvas ref={detectionCanvasRef} className="hidden" aria-hidden="true" />
@@ -1527,16 +1668,49 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
                   hint's own text (see the dynamic hint below). Placed
                   opposite the "Scan now" button (bottom-3) and clear of
                   RecentScansStack (right-2 bottom-2). */}
-              {phase === 'hunting' && liveNumberConfidence != null && (
+              {phase === 'hunting' && (liveImageQuality != null || liveNumberText != null) && (
                 <div
-                  className={`absolute top-3 left-3 rounded-lg px-2.5 py-1.5 font-mono font-semibold text-black shadow-lg ${confidenceBadgeClass(liveNumberConfidence)}`}
-                  aria-label={`${t('decks.scan.numberReadLabel')}: ${liveNumberConfidence}%`}
+                  // No quad in frame (e.g. zoomed in past the card's
+                  // edges — Path B still reads a number there, just has
+                  // nothing to score the image quality of): a neutral
+                  // background instead of a quality tier color, since
+                  // there's no quality reading to tint by.
+                  className={`absolute top-3 left-3 rounded-lg px-2.5 py-1.5 font-mono font-semibold text-black shadow-lg ${liveImageQuality != null ? imageQualityBadgeClass(liveImageQuality) : 'bg-white/90'}`}
+                  aria-label={liveImageQuality != null ? `${t('decks.scan.imageQualityLabel')}: ${liveImageQuality}%` : (liveNumberText ?? '')}
                 >
-                  <div className="text-lg leading-tight">{liveNumberConfidence}%{liveNumberText ? ` — ${liveNumberText}` : ''}</div>
+                  <div className="text-lg leading-tight">
+                    {liveImageQuality != null && `${liveImageQuality}%`}
+                    {liveNumberText && `${liveImageQuality != null ? ' — ' : ''}${liveNumberText}`}
+                  </div>
                   {liveNamePreview && (
                     <div className="mt-0.5 text-xs font-normal opacity-80">{liveNamePreview}</div>
                   )}
                 </div>
+              )}
+
+              {/* The failed capture's own thumbnail — bottom-left, mirroring
+                  RecentScansStack's bottom-right anchor and matching its
+                  h-[120px] thumbnail size, so a real capture always renders
+                  at the same size regardless of which corner it's in.
+                  Tapping it opens the full-size crop (below, outside this
+                  video box so it isn't clipped by its own rounded/
+                  overflow-hidden corners). Independent of the bottom-3
+                  button row below — sitting in its own corner means it
+                  can't shift Try Again off the exact center Scan Now uses,
+                  or collide with RecentScansStack in the opposite corner. */}
+              {phase === 'error' && errorCardImage && (
+                <button
+                  type="button"
+                  onClick={() => setShowErrorPreview(true)}
+                  aria-label={t('decks.scan.viewFailedCapture')}
+                  className="absolute left-2 bottom-2 z-10 block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+                >
+                  <img
+                    src={errorCardImage}
+                    alt=""
+                    className="h-[120px] w-auto rounded-lg border border-white/25 object-contain shadow-lg"
+                  />
+                </button>
               )}
 
               {/* Floats over the bottom of the video frame rather than
@@ -1544,16 +1718,42 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
                   portrait-aspect video can fill most of the viewport,
                   pushing anything placed after it below the fold until the
                   user scrolls. This stays reachable the instant hunting
-                  starts, no scrolling required. */}
-              {phase === 'hunting' && (
-                <div className="absolute inset-x-0 bottom-3 flex justify-center pointer-events-none">
-                  <button
-                    type="button"
-                    onClick={handleScanNow}
-                    className="btn-primary pointer-events-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
-                  >
-                    {t('decks.scan.scanNow')}
-                  </button>
+                  starts, no scrolling required. Same slot for 'error''s
+                  own primary action (Try Again) — the two phases are
+                  mutually exclusive, so there's never a clash.
+
+                  In 'hunting', right-[152px] (not inset-x-0) reserves the
+                  same corner RecentScansStack occupies before centering
+                  Scan Now in what's left — real-device feedback found the
+                  dead-center button actually overlapping the stack's own
+                  "+"/"-" stepper once a scan existed. That row's real width
+                  is ~136px (a 120px-tall thumbnail is ~86px wide at a
+                  standard card's ~0.716 aspect, +6px gap +44px stepper
+                  pill), plus the stack's own right-2 (8px) inset — 144px,
+                  rounded up with a small buffer. 'error' has no such
+                  neighbor (the failed-capture thumbnail below is narrower,
+                  no stepper, and doesn't reach this far in) so Try Again
+                  stays plain dead-center. */}
+              {(phase === 'hunting' || phase === 'error') && (
+                <div className={`absolute bottom-3 flex items-center justify-center pointer-events-none ${phase === 'hunting' ? 'left-0 right-[152px]' : 'inset-x-0'}`}>
+                  {phase === 'hunting' && (
+                    <button
+                      type="button"
+                      onClick={handleScanNow}
+                      className="btn-primary pointer-events-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+                    >
+                      {t('decks.scan.scanNow')}
+                    </button>
+                  )}
+                  {phase === 'error' && (
+                    <button
+                      type="button"
+                      onClick={resetForNextCard}
+                      className="btn-primary pointer-events-auto focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+                    >
+                      {t('decks.scan.tryAgain')}
+                    </button>
+                  )}
                 </div>
               )}
 
@@ -1626,9 +1826,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
 
             {phase === 'hunting' && (
               <p className="text-xs text-text-muted text-center max-w-xs">
-                {liveNumberConfidence != null && liveNumberConfidence < NUMBER_CONFIDENCE_THRESHOLD
-                  ? t('decks.scan.liveHintLowConfidence')
-                  : t('decks.scan.liveHint')}
+                {t('decks.scan.liveHint')}
               </p>
             )}
 
@@ -1643,49 +1841,26 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
               <p className="text-sm text-brand-red text-center max-w-xs">{confirmError}</p>
             )}
 
+            {/* The failed-capture thumbnail and Try Again now live in the
+                video's own bottom overlay (same slot as "Scan now") —
+                this banner is just the message text. */}
             {phase === 'error' && (
               <div className={`${ERROR_BANNER_CLASS} w-full max-w-sm`}>
                 <p className="text-sm text-brand-red">{error}</p>
-                <button onClick={resetForNextCard} className="btn-primary mt-3 mx-auto text-sm">
-                  {t('decks.scan.tryAgain')}
-                </button>
+                {/* totalScanning (defined above, before this return) already
+                    excludes this failed job — finishJob runs it out of
+                    activeJobs before this catch block's setPhase('error')
+                    is ever seen. Without this, a card that failed while a
+                    couple of others were still queued/in flight looked like
+                    the ENTIRE scanner had stopped, with no sign the rest
+                    were still going to land in the recent-scans stack on
+                    their own. */}
+                {totalScanning > 0 && (
+                  <p className="text-xs text-text-muted mt-2">{t('decks.scan.errorOthersStillScanning')}</p>
+                )}
               </div>
             )}
 
-            {/* Temporary on-device diagnostic readout — no devtools access on
-                a phone, and the detection loop previously failed completely
-                silently (see cardDetection.js's detectionStatus comment).
-                Widened to match the video's own max-w-sm (was max-w-xs) and
-                given longer text/word slices below — freed up by dropping
-                the header subtitle line, and this is the thing the user is
-                actually watching while positioning a card. */}
-            <div className="text-sm font-mono text-white/90 text-center max-w-sm leading-relaxed break-words">
-              cam:{cameraStatus} lib:{debugInfo.libState || 'idle'} ticks:{debugInfo.tickCount}
-              {debugInfo.libError && <><br />lib error: {debugInfo.libError}</>}
-              {debugInfo.tickError && <><br />tick error: {debugInfo.tickError}</>}
-              {debugInfo.ocrName !== undefined && (
-                <><br />ocr name:{debugInfo.ocrName ?? '(none)'} number:{debugInfo.ocrNumber ?? '(none)'}</>
-              )}
-              {debugInfo.ocrRawText !== undefined && (
-                <><br />ocr raw:{debugInfo.ocrRawText.trim()
-                  ? JSON.stringify(debugInfo.ocrRawText.replace(/\s+/g, ' ').trim().slice(0, 220))
-                  : '(empty)'}</>
-              )}
-              {debugInfo.ocrWords !== undefined && (
-                <><br />ocr words:{debugInfo.ocrWords.length === 0
-                  ? '(none)'
-                  : debugInfo.ocrWords
-                    // Highest-confidence first — the ones pickCardName
-                    // would have preferred if position let it through.
-                    // A real card produced more than fit in the earlier
-                    // line-level view's smaller slice, hiding the very
-                    // word that mattered — 16 gives more headroom (wider
-                    // readout now, see the container's own comment above).
-                    .slice().sort((a, b) => b.confidence - a.confidence).slice(0, 16)
-                    .map((w) => `"${w.text.slice(0, 15)}"@y${w.y0}(${w.confidence})`)
-                    .join(' ')}</>
-              )}
-            </div>
           </div>
         )}
 
@@ -1753,6 +1928,35 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           </div>
         )}
       </div>
+
+      {/* Enlarged failed-capture preview — its own top-level overlay, not
+          nested inside the video box, so it isn't clipped by that box's
+          own rounded/overflow-hidden corners. Tapping the backdrop closes
+          it too, same as the ambiguous-list's own dismiss patterns
+          elsewhere in this app. */}
+      {showErrorPreview && errorCardImage && (
+        <div
+          className="fixed inset-0 z-[300] flex items-center justify-center bg-black/90 p-6"
+          onClick={() => setShowErrorPreview(false)}
+        >
+          <button
+            ref={errorPreviewCloseRef}
+            type="button"
+            onClick={() => setShowErrorPreview(false)}
+            aria-label={t('decks.scan.closeFailedCapturePreview')}
+            className="absolute top-4 right-4 w-9 h-9 rounded-full flex items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+            style={{ background: 'rgba(255,255,255,0.08)' }}
+          >
+            <X size={18} className="text-text-muted" />
+          </button>
+          <img
+            src={errorCardImage}
+            alt=""
+            className="max-w-full max-h-full rounded-lg shadow-lg"
+            onClick={(event) => event.stopPropagation()}
+          />
+        </div>
+      )}
     </div>,
     document.body,
   )

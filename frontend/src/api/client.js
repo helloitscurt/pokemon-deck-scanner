@@ -454,6 +454,17 @@ export const undoLastScan = (instanceId, cardId, traceId) =>
     params: traceId ? { trace_id: traceId } : undefined,
   }).then(r => r.data)
 
+// Same shape as undoLastScan, but for a scan whose deck_scan_status wasn't
+// 'counted' (not_in_deck / already_complete) — undo_scan can't safely
+// reverse those (see its own docstring and docs/plans/scanner-ux-todos.md
+// item 5), so this hits the collection-only route instead, which only
+// ever touches the CollectionItem row, never deck progress. traceId is
+// optional, same as undoLastScan's own.
+export const undoLastScanCollectionOnly = (instanceId, cardId, traceId) =>
+  api.post(`/decks/instances/${instanceId}/scans/${encodeURIComponent(cardId)}/undo-collection-only`, null, {
+    params: traceId ? { trace_id: traceId } : undefined,
+  }).then(r => r.data)
+
 // Social
 export const getLeaderboard = (params = {}) => api.get('/social/leaderboard', { params })
 export const compareUsers = (userId, params = {}) => api.get(`/social/compare/${userId}`, { params })

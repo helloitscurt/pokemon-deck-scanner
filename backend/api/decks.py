@@ -500,6 +500,13 @@ def reset_deck_instance(
     return _instance_response(db, instance, detail=True)
 
 
+def _decrement_or_delete_collection_item(db: Session, matching_item) -> None:
+    if matching_item.quantity <= 1:
+        db.delete(matching_item)
+    else:
+        matching_item.quantity -= 1
+
+
 @router.post("/instances/{instance_id}/scans/{card_id}/undo", response_model=DeckInstanceDetailResponse)
 def undo_scan(
     instance_id: int,
@@ -568,10 +575,7 @@ def undo_scan(
     if not reversed_progress:
         raise HTTPException(status_code=404, detail="No matching scan found to undo")
 
-    if matching_item.quantity <= 1:
-        db.delete(matching_item)
-    else:
-        matching_item.quantity -= 1
+    _decrement_or_delete_collection_item(db, matching_item)
 
     db.commit()
 
@@ -579,6 +583,68 @@ def undo_scan(
     # committed above — matches _apply_deck_scan's own rule that a
     # diagnostics side-effect must never make an already-committed action
     # look like it failed.
+    try:
+        record_scan_reversed(current_user.id, trace_id)
+    except Exception:
+        logger.exception("Failed to mark scan trace %s as undone", trace_id)
+
+    return _instance_response(db, instance, detail=True)
+
+
+@router.post("/instances/{instance_id}/scans/{card_id}/undo-collection-only", response_model=DeckInstanceDetailResponse)
+def undo_scan_collection_only(
+    instance_id: int,
+    card_id: str,
+    # Same round-tripped-from-/cards/recognize, best-effort diagnostics
+    # field as undo_scan's own trace_id — see its docstring. Scans that land
+    # here (not_in_deck/already_complete) get a trace the same as any other
+    # scan; without this, undoing one of them would never mark it reversed,
+    # silently skewing auto-save-accuracy analysis for exactly the two
+    # outcomes most worth auditing.
+    trace_id: str | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reverse one scan's COLLECTION side only, deliberately skipping
+    unregister_scan's deck-progress side entirely — for the two cases
+    undo_scan itself can never safely handle (docs/plans/scanner-ux-todos.md
+    item 5): a 'not_in_deck' add (unregister_scan 404s — the card was never
+    part of this deck's template, so there's no deck-progress row to touch
+    at all) or an 'already_complete' add (register_scan capped
+    scanned_quantity at expected_quantity, so THIS specific add never
+    incremented it in the first place — decrementing it now would wrongly
+    take credit away from an earlier add that did count). In both cases the
+    CollectionItem row is the only thing this specific add actually
+    changed, so it's the only thing this route reverses.
+
+    Same instance-ownership check as undo_scan, for consistency and as a
+    defense-in-depth scope limiter — this route never otherwise reads the
+    instance, since it deliberately never touches deck progress.
+    """
+    instance = db.query(DeckInstance).options(joinedload(DeckInstance.deck)).filter(
+        DeckInstance.id == instance_id,
+        DeckInstance.user_id == current_user.id,
+    ).first()
+    if not instance:
+        raise HTTPException(status_code=404, detail="Deck instance not found")
+
+    default_fields = CollectionItemCreate.model_fields
+    matching_item = find_matching_collection_item(
+        db, current_user.id,
+        card_id=card_id,
+        variant=default_fields["variant"].default,
+        lang=default_fields["lang"].default,
+        condition=default_fields["condition"].default,
+        purchase_price=default_fields["purchase_price"].default,
+    )
+    if not matching_item:
+        raise HTTPException(status_code=404, detail="No matching scan found to undo")
+
+    _decrement_or_delete_collection_item(db, matching_item)
+    db.commit()
+
+    # Best-effort, independent of the transaction just committed — same
+    # rule as undo_scan's own identical block.
     try:
         record_scan_reversed(current_user.id, trace_id)
     except Exception:
