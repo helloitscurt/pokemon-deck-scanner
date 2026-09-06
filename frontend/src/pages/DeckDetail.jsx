@@ -95,7 +95,7 @@ export default function DeckDetail() {
   // just carried through to the undo call below, for correlation.
   const scanMutation = useMutation({
     mutationFn: ({ candidate }) => addToCollection({ card_id: candidate.id, quantity: 1, deck_instance_id: Number(instanceId) }),
-    onSuccess: (response, { candidate, isAutoSave, traceId }) => {
+    onSuccess: (response, { candidate, isAutoSave, traceId, hasLiveWarningOverlay }) => {
       invalidate()
       // deck_scan_status (see backend services/deck_progress.py's SCAN_*
       // constants) is only meaningful here — it's set by add_to_collection
@@ -112,19 +112,27 @@ export default function DeckDetail() {
       // an unrelated earlier scan (already_complete).
       const deckScanStatus = response.data.deck_scan_status
       if (deckScanStatus === 'not_in_deck' || deckScanStatus === 'already_complete') {
-        // e.g. "4/4 Pikachu already scanned" — deck_scan_quantity (the
-        // deck's expected_quantity, see register_scan) is only ever set
-        // alongside 'already_complete'; scanned_quantity always equals it
-        // in that state, so one number covers both sides of the fraction.
-        const warningText = deckScanStatus === 'already_complete'
-          ? `${response.data.deck_scan_quantity}/${response.data.deck_scan_quantity} ${candidate.name} ${t('decks.scan.alreadyCompleteDetail')}`
-          : `${candidate.name} ${t('decks.scan.notInDeckDetail')}`
-        toast(() => (
-          <span className="flex items-center gap-2">
-            <AlertTriangle size={16} className="flex-shrink-0 text-yellow" />
-            <span className="min-w-0 flex-1 text-yellow">{warningText}</span>
-          </span>
-        ), { duration: 7000, style: { border: '1px solid #eab308' } })
+        // hasLiveWarningOverlay (set by DeckCardScanner.jsx's confirmCard)
+        // is true for every path except its own camera-denied fallback —
+        // the live scanner already floats its own warning banner over the
+        // video for those, so showing this toast too would double up on
+        // the exact same message. The fallback has no live video to float
+        // one over, so this toast stays its only warning display there.
+        if (!hasLiveWarningOverlay) {
+          // e.g. "4/4 Pikachu already scanned" — deck_scan_quantity (the
+          // deck's expected_quantity, see register_scan) is only ever set
+          // alongside 'already_complete'; scanned_quantity always equals it
+          // in that state, so one number covers both sides of the fraction.
+          const warningText = deckScanStatus === 'already_complete'
+            ? `${response.data.deck_scan_quantity}/${response.data.deck_scan_quantity} ${candidate.name} ${t('decks.scan.alreadyCompleteDetail')}`
+            : `${candidate.name} ${t('decks.scan.notInDeckDetail')}`
+          toast(() => (
+            <span className="flex items-center gap-2">
+              <AlertTriangle size={16} className="flex-shrink-0 text-yellow" />
+              <span className="min-w-0 flex-1 text-yellow">{warningText}</span>
+            </span>
+          ), { duration: 7000, style: { border: '1px solid #eab308' } })
+        }
         return
       }
       if (!isAutoSave) {
@@ -169,6 +177,17 @@ export default function DeckDetail() {
       ), { duration: 5000 })
     },
     onError: () => toast.error(t('decks.scan.addFailed')),
+  })
+
+  // Backs the "-" on a recent-scans thumbnail (DeckCardScanner.jsx's
+  // decrementRecentScan) — same undo_scan route the success toast's own
+  // Undo link already uses, just triggered from the thumbnail instead of a
+  // toast. No success toast of its own: the thumbnail's count dropping (or
+  // the thumbnail disappearing) is already the confirmation.
+  const decrementMutation = useMutation({
+    mutationFn: ({ cardId, traceId }) => undoLastScan(instanceId, cardId, traceId),
+    onSuccess: () => invalidate(),
+    onError: () => toast.error(t('decks.scan.removeFailed')),
   })
 
   if (isLoading) {
@@ -334,6 +353,7 @@ export default function DeckDetail() {
         isOpen={scannerOpen}
         onClose={() => setScannerOpen(false)}
         onConfirm={(candidate, meta) => scanMutation.mutateAsync({ candidate, ...meta })}
+        onDecrement={(cardId, traceId) => decrementMutation.mutateAsync({ cardId, traceId })}
         deckInstanceId={instanceId}
         missingCards={missingCards}
       />

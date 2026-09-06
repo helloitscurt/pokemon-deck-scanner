@@ -124,7 +124,11 @@ describe('DeckDetail scan confirmation toasts', () => {
     expect(screen.getByText('decks.scan.undo')).toBeInTheDocument()
   })
 
-  it('shows a warning toast, not the Undo toast, for an auto-save of a card not in this deck', async () => {
+  it('shows a warning toast, not the Undo toast, for an auto-save with no live warning overlay of its own', async () => {
+    // hasLiveWarningOverlay omitted — the camera-denied fallback's own
+    // shape (DeckCardScanner.jsx's confirmCard never sets it there, since
+    // that flow has no live video to float its own warning banner over),
+    // so this toast has to be the only warning shown.
     addToCollection.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'not_in_deck' } })
     await renderLoaded()
 
@@ -146,7 +150,7 @@ describe('DeckDetail scan confirmation toasts', () => {
     expect(screen.queryByText('decks.scan.undo')).not.toBeInTheDocument()
   })
 
-  it('shows a warning toast with the deck quantity for a manual pick already at its expected quantity', async () => {
+  it('shows a warning toast with the deck quantity for a manual pick already at its expected quantity, with no live overlay', async () => {
     addToCollection.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'already_complete', deck_scan_quantity: 4 } })
     await renderLoaded()
 
@@ -161,6 +165,24 @@ describe('DeckDetail scan confirmation toasts', () => {
     // "4/4 Charmander already scanned" — deck_scan_quantity covers both
     // sides of the fraction (scanned_quantity always equals it here).
     expect(screen.getByText(/4\/4 Charmander decks\.scan\.alreadyCompleteDetail/)).toBeInTheDocument()
+  })
+
+  it('skips its own warning toast when the live scanner already shows one for the same event', async () => {
+    // Regression test: DeckCardScanner.jsx's own confirmCard shows an
+    // in-scanner warning banner (activeWarnings) for every path except the
+    // camera-denied fallback — before hasLiveWarningOverlay existed, this
+    // toast fired unconditionally too, so a live auto-save, quick-add, or
+    // ambiguous-list pick of an off-deck/already-complete card showed the
+    // exact same warning twice: once in the scanner overlay, once here.
+    addToCollection.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'not_in_deck' } })
+    await renderLoaded()
+
+    await act(async () => {
+      await capturedOnConfirm({ id: 'p1', name: 'Mewtwo' }, { isAutoSave: true, traceId: 'trace-1', hasLiveWarningOverlay: true })
+    })
+
+    expect(toast).not.toHaveBeenCalled()
+    expect(toast.success).not.toHaveBeenCalled()
   })
 
   it('still adds the card to the collection even when the scan does not count toward the deck', async () => {

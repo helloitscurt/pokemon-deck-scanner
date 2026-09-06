@@ -118,6 +118,7 @@ async function advanceNumberOcrTicks(n = 1) {
 
 describe('DeckCardScanner', () => {
   let onConfirm
+  let onDecrement
 
   beforeEach(() => {
     vi.useFakeTimers()
@@ -140,6 +141,7 @@ describe('DeckCardScanner', () => {
     lastOcrRawText.value = ''
     lastOcrWords.value = []
     onConfirm = vi.fn().mockResolvedValue(undefined)
+    onDecrement = vi.fn().mockResolvedValue(undefined)
   })
 
   afterEach(() => {
@@ -174,7 +176,7 @@ describe('DeckCardScanner', () => {
     expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
   })
 
-  it('auto-saves a confident match through the existing confirm path, then shows a checkmark and returns to hunting', async () => {
+  it('auto-saves a confident match through the existing confirm path, without ever leaving hunting', async () => {
     recognizeCard.mockResolvedValue({
       _identity_confident: true,
       matches: [{ id: 'p1', name: 'Pikachu' }],
@@ -205,17 +207,17 @@ describe('DeckCardScanner', () => {
     // response's trace_id (for later undo correlation) threaded through.
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true, traceId: 'trace-abc123' },
+      { isAutoSave: true, traceId: 'trace-abc123', hasLiveWarningOverlay: true },
     )
-    expect(screen.getByLabelText('decks.scan.captured')).toBeInTheDocument()
-
-    // Checkmark holds ~900ms, then a further ~600ms cooldown before
-    // returning to hunting — see DeckCardScanner.jsx's CHECKMARK_DURATION_MS
-    // / COOLDOWN_AFTER_CHECKMARK_MS.
-    await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
-
-    expect(screen.queryByLabelText('decks.scan.captured')).not.toBeInTheDocument()
-    expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
+    // Phase 1 (docs/plans/scanner-continuous-scan.md): no blocking
+    // checkmark any more — the recent-scans thumbnail is the only
+    // confirmation, and hunting is never interrupted for a counted save.
+    // "Scan now" (not the exact liveHint copy — Path B's own throttled
+    // loop keeps running too and can legitimately swap in
+    // liveHintLowConfidence by this point) is what actually proves we're
+    // still in the normal hunting view, not bounced anywhere else.
+    expect(screen.getByAltText('Pikachu')).toBeInTheDocument()
+    expect(screen.getByText('decks.scan.scanNow')).toBeInTheDocument()
 
     // The loop re-arms once the card is actually removed from frame — not
     // merely once cooldown elapses (see the next test: a still-sitting card
@@ -278,30 +280,30 @@ describe('DeckCardScanner', () => {
     expect(screen.getByText(/4\/4 Pikachu decks\.scan\.alreadyCompleteDetail/)).toBeInTheDocument()
   })
 
-  it('keeps the video feed live behind a warning, unlike the frozen frame behind the green checkmark', async () => {
+  it('never pauses the video feed for a confident auto-save or a warning (Phase 1: continuous scanning)', async () => {
     recognizeCard.mockResolvedValue({
       _identity_confident: true,
       matches: [{ id: 'p1', name: 'Pikachu' }],
       trace_id: 'trace-abc123',
     })
 
-    // Baseline: the green-checkmark path still freezes the feed — real-device
-    // report was specifically about the warning, not this.
+    // A counted save no longer freezes the feed at all — there's no
+    // checkmark overlay left to freeze it for.
     onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
     await advanceTicks(REQUIRED_STABLE_FRAMES)
-    expect(HTMLMediaElement.prototype.pause).toHaveBeenCalled()
+    expect(HTMLMediaElement.prototype.pause).not.toHaveBeenCalled()
     cleanup()
     vi.clearAllMocks()
 
-    // The warning path: the feed must keep playing underneath it.
+    // A warning: same — the feed must keep playing underneath it.
     onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'not_in_deck' } })
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
     await advanceTicks(REQUIRED_STABLE_FRAMES)
     expect(HTMLMediaElement.prototype.pause).not.toHaveBeenCalled()
   })
 
-  it('dismisses the warning early on tap, returning straight to hunting', async () => {
+  it('dismisses the warning early on tap', async () => {
     onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'not_in_deck' } })
     recognizeCard.mockResolvedValue({
       _identity_confident: true,
@@ -316,9 +318,10 @@ describe('DeckCardScanner', () => {
     await act(async () => { fireEvent.click(warning) })
 
     // Gone well before WARNING_DURATION_MS (4s) would have elapsed on its
-    // own — a tap ends it immediately, not just shortens the wait.
+    // own — a tap ends it immediately, not just shortens the wait. Phase 1:
+    // there's no "returning to hunting" left to prove — phase never left
+    // it — so this only needs to confirm the warning itself is gone.
     expect(screen.queryByText(/Pikachu decks\.scan\.notInDeckDetail/)).not.toBeInTheDocument()
-    expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
   })
 
   it('does not immediately re-capture the same still-visible card right after a successful auto-save', async () => {
@@ -336,8 +339,11 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).toHaveBeenCalledTimes(1)
 
     recognizeCard.mockClear()
-    // Checkmark + cooldown elapse, but detectCardQuad keeps returning the
-    // same STABLE_QUAD throughout — the card was never actually removed.
+    // Time passes (Phase 1 has no checkmark/cooldown to wait out any more —
+    // detection just keeps running), but detectCardQuad keeps returning the
+    // same STABLE_QUAD throughout — the card was never actually removed, so
+    // capturedRegionsRef should still be blocking a re-capture at this
+    // position.
     await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
     await advanceTicks(REQUIRED_STABLE_FRAMES)
 
@@ -362,9 +368,9 @@ describe('DeckCardScanner', () => {
 
     recognizeCard.mockClear()
     onConfirm.mockClear()
-    // Checkmark + cooldown elapse (see CHECKMARK_DURATION_MS /
-    // COOLDOWN_AFTER_CHECKMARK_MS) — detectCardQuad is never made to
-    // return null at any point, matching a fast physical swap.
+    // Time passes (no checkmark/cooldown to wait out under Phase 1) —
+    // detectCardQuad is never made to return null at any point, matching a
+    // fast physical swap.
     await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
 
     const SWAPPED_QUAD = {
@@ -384,8 +390,182 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).toHaveBeenCalledTimes(1)
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p2' }),
-      { isAutoSave: true, traceId: 'trace-def456' },
+      { isAutoSave: true, traceId: 'trace-def456', hasLiveWarningOverlay: true },
     )
+  })
+
+  describe('Phase 1 — continuous capture (docs/plans/scanner-continuous-scan.md)', () => {
+    const QUAD_B = {
+      topLeftCorner: { x: 300, y: 250 },
+      topRightCorner: { x: 400, y: 250 },
+      bottomLeftCorner: { x: 300, y: 400 },
+      bottomRightCorner: { x: 400, y: 400 },
+    }
+    const QUAD_C = {
+      topLeftCorner: { x: 10, y: 250 },
+      topRightCorner: { x: 110, y: 250 },
+      bottomLeftCorner: { x: 10, y: 400 },
+      bottomRightCorner: { x: 110, y: 400 },
+    }
+
+    it('captures a second, different card while the first is still being recognized in the background', async () => {
+      // The first card's recognizeCard call never resolves in this test —
+      // proves detecting and capturing a SECOND, different card isn't
+      // blocked behind it the way a single global `phase` used to block
+      // everything.
+      let resolveFirst
+      recognizeCard.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve }))
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+      // A different card at a different screen position.
+      detectCardQuad.mockResolvedValue(QUAD_B)
+      recognizeCard.mockResolvedValueOnce({
+        _identity_confident: true,
+        matches: [{ id: 'p2', name: 'Charmander' }],
+        trace_id: 'trace-second',
+      })
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      // The second card resolved and saved — while the first still hasn't.
+      expect(recognizeCard).toHaveBeenCalledTimes(2)
+      expect(onConfirm).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'p2' }),
+        { isAutoSave: true, traceId: 'trace-second', hasLiveWarningOverlay: true },
+      )
+      expect(onConfirm).not.toHaveBeenCalledWith(expect.objectContaining({ id: 'p1' }), expect.anything())
+
+      // Let the first settle too, so it doesn't leak an unhandled state
+      // update warning into whatever test runs next.
+      await act(async () => {
+        resolveFirst({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }], trace_id: 'trace-first' })
+        for (let i = 0; i < 10; i++) await Promise.resolve()
+      })
+    })
+
+    it('does not submit a duplicate capture for the same card briefly removed and re-presented while its first capture is still resolving', async () => {
+      // Regression test: capturedRegionsRef used to clear ENTIRELY on any
+      // single empty-frame tick, regardless of whether the region's own
+      // job had actually resolved yet. A quick hand-wobble or re-check —
+      // card pulled back an inch and immediately reset down in the same
+      // spot — produces exactly one empty-frame tick, which used to wipe
+      // the "already captured, don't re-grab" record for a job that's
+      // still mid-recognition, letting the SAME physical card through as
+      // a second, genuinely concurrent capture (and, if both ever
+      // resolved confidently, two collection increments for one card).
+      let resolveFirst
+      recognizeCard.mockImplementationOnce(() => new Promise((resolve) => { resolveFirst = resolve }))
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+      // One empty-frame tick — the card was never actually removed for
+      // more than an instant, but this is enough to have wiped the whole
+      // capturedRegionsRef array under the old, unconditional clear.
+      detectCardQuad.mockResolvedValueOnce(null)
+      await advanceTicks(1)
+      detectCardQuad.mockResolvedValue(STABLE_QUAD)
+
+      // Same position, held steady again — the stability tracker itself
+      // resets on an empty frame, so this needs a fresh full streak, same
+      // as any other re-presentation.
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      // Still just the one call — the first job hasn't resolved yet, so
+      // its region should still be blocking a second capture at this spot.
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+      await act(async () => {
+        resolveFirst({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }], trace_id: 'trace-first' })
+        for (let i = 0; i < 10; i++) await Promise.resolve()
+      })
+    })
+
+    it('queues a capture once MAX_CONCURRENT_JOBS slots are full, and sends it the moment one frees up', async () => {
+      let resolveA
+      recognizeCard.mockImplementationOnce(() => new Promise((resolve) => { resolveA = resolve }))
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      // Card A.
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+      // Card B — the second (and last, MAX_CONCURRENT_JOBS = 2) concurrent
+      // slot. Controllable, not permanently pending (see the deliberate
+      // resolveB at the end of this test) — an unsettled promise left
+      // dangling past the end of a test can still resolve its own
+      // microtask chain during a LATER test, which is exactly what caused
+      // this test to pollute the one after it before this fix.
+      let resolveB
+      detectCardQuad.mockResolvedValue(QUAD_B)
+      recognizeCard.mockImplementationOnce(() => new Promise((resolve) => { resolveB = resolve }))
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(2)
+
+      // Card C arrives at a third position while both slots are still
+      // full — captured (the crop is taken immediately) but queued, not
+      // sent yet.
+      detectCardQuad.mockResolvedValue(QUAD_C)
+      recognizeCard.mockResolvedValueOnce({
+        _identity_confident: true,
+        matches: [{ id: 'c', name: 'Squirtle' }],
+        trace_id: 'trace-c',
+      })
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(2)
+      expect(screen.getByText(/decks\.scan\.scanning/)).toHaveTextContent('3')
+
+      // Resolving A frees a slot — the queued card C should be drained and
+      // sent immediately. Deeper chain than elsewhere in this file (A's
+      // own confirmCard/onConfirm settling, THEN drainQueue kicking off a
+      // whole fresh captureAndRecognize for C), so flush more microtask
+      // turns than the usual handful.
+      await act(async () => {
+        resolveA({ _identity_confident: true, matches: [{ id: 'a', name: 'Bulbasaur' }], trace_id: 'trace-a' })
+        for (let i = 0; i < 50; i++) await Promise.resolve()
+      })
+
+      expect(recognizeCard).toHaveBeenCalledTimes(3)
+      expect(onConfirm).toHaveBeenCalledWith(
+        expect.objectContaining({ id: 'c' }),
+        { isAutoSave: true, traceId: 'trace-c', hasLiveWarningOverlay: true },
+      )
+
+      // Settle B too, so nothing is left pending once this test ends.
+      await act(async () => {
+        resolveB({ _identity_confident: true, matches: [{ id: 'b', name: 'Charmander' }], trace_id: 'trace-b' })
+        for (let i = 0; i < 50; i++) await Promise.resolve()
+      })
+    })
+
+    it('shows a count of jobs currently being recognized, clearing once they resolve', async () => {
+      // The chip stays mounted at a fixed height throughout (toggled with
+      // the `invisible` class, not conditionally rendered) so its
+      // presence/absence never reflows the video above it — see its own
+      // comment. Asserts on the rendered count and the invisible class
+      // rather than DOM presence/absence.
+      let resolveConfirm
+      recognizeCard.mockImplementationOnce(() => new Promise((resolve) => { resolveConfirm = resolve }))
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      expect(screen.getByText(/decks\.scan\.scanning/)).toHaveTextContent('0')
+      expect(screen.getByText(/decks\.scan\.scanning/).parentElement).toHaveClass('invisible')
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(screen.getByText(/decks\.scan\.scanning/)).toHaveTextContent('1')
+      expect(screen.getByText(/decks\.scan\.scanning/).parentElement).not.toHaveClass('invisible')
+
+      await act(async () => {
+        resolveConfirm({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }], trace_id: 'trace-1' })
+        for (let i = 0; i < 10; i++) await Promise.resolve()
+      })
+
+      expect(screen.getByText(/decks\.scan\.scanning/)).toHaveTextContent('0')
+      expect(screen.getByText(/decks\.scan\.scanning/).parentElement).toHaveClass('invisible')
+    })
   })
 
   it('falls back to the tap-to-confirm picker on an ambiguous match, and pauses further auto-capture while it is shown', async () => {
@@ -415,9 +595,14 @@ describe('DeckCardScanner', () => {
     // (for undo correlation), just with isAutoSave: false.
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'a' }),
-      { isAutoSave: false, traceId: 'trace-ambiguous1' },
+      { isAutoSave: false, traceId: 'trace-ambiguous1', hasLiveWarningOverlay: true },
     )
-    expect(screen.getByLabelText('decks.scan.captured')).toBeInTheDocument()
+    // Explicitly returns to hunting (the ambiguous list's own onClick
+    // calls resetForNextCard after a successful confirmCard — see
+    // DeckCardScanner.jsx) — the candidate list is gone, and the
+    // recent-scans thumbnail is the confirmation, no checkmark needed.
+    expect(screen.queryByText('Card A')).not.toBeInTheDocument()
+    expect(screen.getByAltText('Card A')).toBeInTheDocument()
   })
 
   it('shows the manual take-photo fallback when the camera is denied, not the live view', () => {
@@ -452,9 +637,13 @@ describe('DeckCardScanner', () => {
     fireEvent.click(screen.getByText('Card A'))
     await act(async () => { await Promise.resolve() })
 
+    // hasLiveWarningOverlay: false — this IS the camera-denied fallback
+    // (mockCameraStatus = 'denied' above), which has no live video to
+    // float its own warning banner over; DeckDetail.jsx's own toast stays
+    // the only warning display for this path.
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'a' }),
-      { isAutoSave: false, traceId: 'trace-manual1' },
+      { isAutoSave: false, traceId: 'trace-manual1', hasLiveWarningOverlay: false },
     )
   })
 
@@ -491,7 +680,7 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true, traceId: 'trace-deck1' },
+      { isAutoSave: true, traceId: 'trace-deck1', hasLiveWarningOverlay: true },
     )
   })
 
@@ -516,7 +705,7 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true, traceId: 'trace-deck2' },
+      { isAutoSave: true, traceId: 'trace-deck2', hasLiveWarningOverlay: true },
     )
   })
 
@@ -575,7 +764,7 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true, traceId: 'trace-retry1' },
+      { isAutoSave: true, traceId: 'trace-retry1', hasLiveWarningOverlay: true },
     )
   })
 
@@ -599,7 +788,7 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).not.toHaveBeenCalled()
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true, traceId: 'trace-deck3' },
+      { isAutoSave: true, traceId: 'trace-deck3', hasLiveWarningOverlay: true },
     )
   })
 
@@ -682,55 +871,19 @@ describe('DeckCardScanner', () => {
     expect(recognizeCard).toHaveBeenCalledWith(expect.anything(), 'live_auto_scan', expect.anything())
     expect(onConfirm).toHaveBeenCalledWith(
       expect.objectContaining({ id: 'p1' }),
-      { isAutoSave: true, traceId: 'trace-paid1' },
+      { isAutoSave: true, traceId: 'trace-paid1', hasLiveWarningOverlay: true },
     )
   })
 
-  it('shows a cancel option as soon as processing starts, not gated behind the "still working" delay', async () => {
-    matchDeckImage.mockImplementation(() => new Promise(() => {})) // never settles in this test
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
-
-    await advanceTicks(REQUIRED_STABLE_FRAMES)
-    expect(screen.getByText('decks.scan.cancel')).toBeInTheDocument()
-    // The "still working" reassurance is still delayed — only the ability
-    // to back out is immediate.
-    expect(screen.queryByText(/Still working/)).not.toBeInTheDocument()
-
-    await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
-    expect(screen.getByText('decks.scan.cancel')).toBeInTheDocument()
-    expect(screen.getByText(/Still working/)).toBeInTheDocument()
-  })
-
-  it('cancelling a long-running match returns to hunting without ever falling through to the paid call', async () => {
-    // Mirrors what a real cancelled axios request does: rejects once the
-    // AbortSignal fires, rather than resolving/rejecting on its own.
-    matchDeckImage.mockImplementation((instanceId, blob, fields, source, signal) => (
-      new Promise((resolve, reject) => {
-        signal.addEventListener('abort', () => {
-          const err = new Error('canceled')
-          err.name = 'CanceledError'
-          reject(err)
-        })
-      })
-    ))
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
-
-    await advanceTicks(REQUIRED_STABLE_FRAMES)
-    // No delay first — the button is available immediately, not just once
-    // processing has been running a while.
-    await act(async () => {
-      fireEvent.click(screen.getByText('decks.scan.cancel'))
-      await Promise.resolve()
-    })
-
-    // Cancelling is not a failure — straight back to hunting, not the
-    // error banner, and critically not a silent fall-through to the paid
-    // call the user explicitly asked to stop waiting for.
-    expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
-    expect(screen.queryByText('decks.scan.failed')).not.toBeInTheDocument()
-    expect(recognizeCard).not.toHaveBeenCalled()
-    expect(onConfirm).not.toHaveBeenCalled()
-  })
+  // The two tests that used to live here ("shows a cancel option...",
+  // "cancelling a long-running match...") covered the live auto-capture
+  // path's per-job processing spinner/cancel button — removed entirely in
+  // Phase 1 (docs/plans/scanner-continuous-scan.md): a confident capture
+  // no longer has a blocking "processing" state of its own to cancel, only
+  // the small non-blocking "N scanning" chip (see the "shows..." test
+  // near the bottom of this file). The camera-denied fallback's own
+  // 'processing'/cancel (handleManualFile) is untouched by Phase 1 and
+  // still exists, just not covered by a dedicated cancel test here.
 
   describe('Path B — throttled number-only OCR pass', () => {
     // Path B's main case is no quad at all (zoomed in past the card's
@@ -810,7 +963,7 @@ describe('DeckCardScanner', () => {
       // route Path A already uses.
       expect(onConfirm).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'p1' }),
-        { isAutoSave: true, traceId: 'trace-zoom1' },
+        { isAutoSave: true, traceId: 'trace-zoom1', hasLiveWarningOverlay: true },
       )
     })
 
@@ -873,8 +1026,8 @@ describe('DeckCardScanner', () => {
 
       // Same choreography the "captures a new card swapped in" test above
       // uses to get a second real capture through the state machine: let
-      // the checkmark/cooldown elapse, then swap in a card at a position
-      // far enough away to clear awaitingCardRemovalRef.
+      // time pass, then swap in a card at a position far enough away that
+      // it isn't blocked by capturedRegionsRef.
       await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
       const SWAPPED_QUAD = {
         topLeftCorner: { x: 300, y: 250 },
@@ -945,7 +1098,7 @@ describe('DeckCardScanner', () => {
       expect(screen.getByAltText('Pikachu')).toBeInTheDocument()
     })
 
-    it('lets a tap on a recent-scan thumbnail add another copy of that same card', async () => {
+    it('folds a tap on the "+" beside a recent-scan thumbnail into that same thumbnail\'s count, not a new image', async () => {
       recognizeCard.mockResolvedValue({
         _identity_confident: true,
         matches: [{ id: 'p1', name: 'Pikachu' }],
@@ -954,10 +1107,11 @@ describe('DeckCardScanner', () => {
       render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
       await advanceTicks(REQUIRED_STABLE_FRAMES)
       expect(onConfirm).toHaveBeenCalledTimes(1)
+      expect(screen.queryByText('2')).not.toBeInTheDocument()
 
-      // Checkmark + cooldown elapse — quick-add only fires while actively
-      // hunting again (see quickAddRecentScan's own guard), same as the
-      // "does not immediately re-capture" test above.
+      // Time passes — quick-add only fires while actively hunting (see
+      // quickAddRecentScan's own guard), same as the "does not immediately
+      // re-capture" test above.
       await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
 
       await act(async () => {
@@ -967,16 +1121,42 @@ describe('DeckCardScanner', () => {
 
       // Routes through the exact same confirmCard path a manual tap in the
       // ambiguous list uses (isAutoSave: false), not a new/parallel save —
-      // and produces a second stack entry for the same card.
+      // but bumps the existing thumbnail's quantity instead of pushing a
+      // second one. A card image only ever appears because it was
+      // actually scanned; the "+" just raises the count beside it.
       expect(onConfirm).toHaveBeenCalledTimes(2)
       expect(onConfirm).toHaveBeenLastCalledWith(
         expect.objectContaining({ id: 'p1' }),
-        { isAutoSave: false, traceId: null },
+        { isAutoSave: false, traceId: null, hasLiveWarningOverlay: true },
       )
-      expect(screen.getAllByRole('img')).toHaveLength(2)
+      expect(screen.getAllByRole('img')).toHaveLength(1)
+      expect(screen.getByText('2')).toBeInTheDocument()
     })
 
-    it('disables the quick-add button while the scanner is not actively hunting', async () => {
+    it('keeps folding repeated "+" taps into the same thumbnail\'s count', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-quickadd1b',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+
+      for (let i = 0; i < 3; i++) {
+        await act(async () => {
+          fireEvent.click(screen.getByLabelText('decks.scan.quickAdd: Pikachu'))
+          await Promise.resolve()
+        })
+        await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      }
+
+      expect(onConfirm).toHaveBeenCalledTimes(4)
+      expect(screen.getAllByRole('img')).toHaveLength(1)
+      expect(screen.getByText('4')).toBeInTheDocument()
+    })
+
+    it('disables a thumbnail\'s own quick-add button only while its own bump is confirming (Phase 1: concurrent confirms)', async () => {
       recognizeCard.mockResolvedValue({
         _identity_confident: true,
         matches: [{ id: 'p1', name: 'Pikachu' }],
@@ -985,14 +1165,22 @@ describe('DeckCardScanner', () => {
       render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
       await advanceTicks(REQUIRED_STABLE_FRAMES)
 
-      // Still mid checkmark/cooldown right after the auto-save — phase is
-      // 'success', not 'hunting'.
+      // Hold this specific quick-add's own onConfirm call open so its
+      // "confirming" window is observable — confirmingKeys is per-key now
+      // (see confirmCard), not a single scanner-wide flag.
+      let resolveConfirm
+      onConfirm.mockImplementation(() => new Promise((resolve) => { resolveConfirm = resolve }))
+
       const quickAddButton = screen.getByLabelText('decks.scan.quickAdd: Pikachu')
+      fireEvent.click(quickAddButton)
+      await act(async () => { await Promise.resolve() })
+
       expect(quickAddButton).toBeDisabled()
 
-      onConfirm.mockClear()
-      fireEvent.click(quickAddButton)
-      expect(onConfirm).not.toHaveBeenCalled()
+      resolveConfirm({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
+      await act(async () => { await Promise.resolve() })
+
+      expect(quickAddButton).not.toBeDisabled()
     })
 
 
@@ -1008,7 +1196,6 @@ describe('DeckCardScanner', () => {
       })
       render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
       await advanceTicks(REQUIRED_STABLE_FRAMES)
-      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
 
       onConfirm.mockRejectedValueOnce(new Error('network down'))
       await act(async () => {
@@ -1018,8 +1205,11 @@ describe('DeckCardScanner', () => {
 
       expect(screen.getByText('decks.scan.confirmFailed')).toBeInTheDocument()
       // Still hunting, not bounced to an error phase — the failure is
-      // surfaced, not treated as fatal to the whole scanner.
-      expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
+      // surfaced, not treated as fatal to the whole scanner. "Scan now"
+      // (not the exact liveHint copy — Path B's own throttled loop can
+      // legitimately swap in liveHintLowConfidence by this point) is what
+      // actually proves the hunting view, not an error banner, is showing.
+      expect(screen.getByText('decks.scan.scanNow')).toBeInTheDocument()
     })
 
     it('shows which path resolved an auto-save as a badge on its recent-scans thumbnail', async () => {
@@ -1054,10 +1244,12 @@ describe('DeckCardScanner', () => {
       expect(screen.getByText('decks.scan.pathImageMatch')).toBeInTheDocument()
     })
 
-    it('labels a quick-added copy "Quick add", not the original scan\'s recognition path', async () => {
-      // A quick-add never re-runs recognition — inheriting the original's
-      // decision (e.g. "OCR number") would claim a verification that never
-      // happened for this specific copy. See QUICK_ADD_DECISION.
+    it('keeps the original recognition-path badge after a "+" quick-add bump, without claiming a re-verification', async () => {
+      // A quick-add never re-runs recognition — inheriting a fresh label
+      // for the bumped copy (e.g. "Quick add") would suggest something was
+      // re-verified when it wasn't; the badge is describing how the
+      // thumbnail's card was originally identified, and that doesn't
+      // change just because its count went up.
       recognizeCardText.mockResolvedValue({ name: null, number_local: '25' })
       matchDeckImage.mockResolvedValue({
         _identity_confident: true,
@@ -1069,7 +1261,7 @@ describe('DeckCardScanner', () => {
       await advanceTicks(REQUIRED_STABLE_FRAMES)
       await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
 
-      // The original still shows its own, real decision beforehand.
+      // The original shows its own, real decision beforehand.
       expect(screen.getByText('decks.scan.pathOcrNumber')).toBeInTheDocument()
 
       await act(async () => {
@@ -1077,10 +1269,10 @@ describe('DeckCardScanner', () => {
         await Promise.resolve()
       })
 
-      // Both badges now present: the original's real decision, unchanged,
-      // plus the new copy's own honest "Quick add" label.
+      // Still exactly one badge, unchanged, on the one thumbnail — not a
+      // second badge or a relabeled one.
       expect(screen.getByText('decks.scan.pathOcrNumber')).toBeInTheDocument()
-      expect(screen.getByText('decks.scan.pathQuickAdd')).toBeInTheDocument()
+      expect(screen.getAllByRole('img')).toHaveLength(1)
     })
 
     it('shows no path badge for a card saved from a manual pick in the ambiguous list', async () => {
@@ -1104,18 +1296,123 @@ describe('DeckCardScanner', () => {
       expect(screen.queryByText('decks.scan.pathOcrName')).not.toBeInTheDocument()
       expect(screen.queryByText('decks.scan.pathMetadata')).not.toBeInTheDocument()
       expect(screen.queryByText('decks.scan.pathVisionApi')).not.toBeInTheDocument()
-      expect(screen.queryByText('decks.scan.pathQuickAdd')).not.toBeInTheDocument()
+    })
+
+    it('disables "-" on a recent-scan thumbnail when the save it would undo can\'t be safely reversed', async () => {
+      // Default onConfirm mock resolves with no deck_scan_status at all —
+      // undo_scan would either 404 or wrongly decrement an unrelated scan,
+      // the same reason DeckDetail.jsx's own Undo toast withholds itself
+      // for 'not_in_deck'/'already_complete' (see decrementRecentScan's
+      // canRemove guard).
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-remove1',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} onDecrement={onDecrement} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      const removeButton = screen.getByLabelText('decks.scan.removeOne: Pikachu')
+      expect(removeButton).toBeDisabled()
+
+      fireEvent.click(removeButton)
+      expect(onDecrement).not.toHaveBeenCalled()
+    })
+
+    it('lets "-" undo the most recent add to a recent-scan thumbnail once it was safely counted', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-remove2',
+      })
+      onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} onDecrement={onDecrement} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('decks.scan.quickAdd: Pikachu'))
+        await Promise.resolve()
+      })
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(screen.getByText('2')).toBeInTheDocument()
+
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('decks.scan.removeOne: Pikachu'))
+        await Promise.resolve()
+      })
+
+      // Undoes the most recent add — the quick-add bump, which (unlike the
+      // original capture) has no trace_id of its own.
+      expect(onDecrement).toHaveBeenCalledWith('p1', null)
+      expect(screen.queryByText('2')).not.toBeInTheDocument()
+      expect(screen.getAllByRole('img')).toHaveLength(1)
+    })
+
+    it('removes the whole thumbnail, not just its count, when "-" undoes the only copy', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-remove3',
+      })
+      onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} onDecrement={onDecrement} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('decks.scan.removeOne: Pikachu'))
+        await Promise.resolve()
+      })
+      expect(onDecrement).toHaveBeenCalledWith('p1', 'trace-remove3')
+
+      // Same collapse-then-remove animation an overflowed entry uses —
+      // advance past its 300ms transition for it to actually leave the DOM.
+      await act(async () => { await vi.advanceTimersByTimeAsync(300) })
+      expect(screen.queryByAltText('Pikachu')).not.toBeInTheDocument()
+    })
+
+    it('shows a visible error, without losing hunting mode, when "-" fails to save', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-remove4',
+      })
+      onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} onDecrement={onDecrement} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      onDecrement.mockRejectedValueOnce(new Error('network down'))
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('decks.scan.removeOne: Pikachu'))
+        await Promise.resolve()
+      })
+
+      expect(screen.getByText('decks.scan.removeFailed')).toBeInTheDocument()
+      // "Scan now" (not the exact liveHint copy — Path B's own throttled
+      // loop can legitimately swap in liveHintLowConfidence by this point)
+      // is what actually proves the hunting view is showing.
+      expect(screen.getByText('decks.scan.scanNow')).toBeInTheDocument()
+      // The failed attempt didn't optimistically remove anything.
+      expect(screen.getAllByRole('img')).toHaveLength(1)
     })
   })
 
-  it('clears the detection outline the instant a capture starts, not once the result banner disappears', async () => {
-    // handleScanNow (unlike the auto-hold tick loop, which redraws the
-    // outline via drawOverlay every tick) never itself touches the overlay
-    // canvas — so any clearRect on it after this triggers can only be the
-    // phase-change cleanup effect's own doing, not drawOverlay's regular
-    // per-tick redraw. matchDeckImage never resolving keeps phase pinned
-    // at 'processing' so there's no race with the checkmark/cooldown timers.
-    matchDeckImage.mockImplementation(() => new Promise(() => {}))
+  it('clears the detection outline once a capture resolves into an error', async () => {
+    // Phase 1 (docs/plans/scanner-continuous-scan.md): a confident capture
+    // no longer touches phase at all, so the overlay-clear effect (gated
+    // on phase leaving 'hunting') only still fires for states that remain
+    // genuinely full-screen. 'ambiguous' turned out NOT to be one of
+    // these in practice: it unmounts the whole video block (including the
+    // overlay canvas itself, per this component's own render condition),
+    // which nulls overlayCanvasRef before the effect can read it — nothing
+    // left to clear. 'error' is the one that actually keeps the canvas
+    // mounted, so it's the only state this effect still has real work to
+    // do for. handleScanNow (unlike the auto-hold tick loop, which
+    // redraws the outline via drawOverlay every tick) never itself
+    // touches the overlay canvas, so any clearRect on it after this
+    // triggers can only be the effect's own doing.
+    recognizeCard.mockRejectedValue(new Error('network down'))
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
     // One tick so the overlay canvas has real dimensions and latestQuadRef
@@ -1127,9 +1424,18 @@ describe('DeckCardScanner', () => {
 
     await act(async () => {
       fireEvent.click(screen.getByText('decks.scan.scanNow'))
-      await Promise.resolve()
+      // A single microtask isn't enough here (unlike this same pattern
+      // elsewhere in this file) — reaching 'error' now needs the WHOLE
+      // free-tier-then-paid-fallback chain to resolve (extractCard -> OCR
+      // -> matchDeckImage -> the rejected recognizeCard), not just the one
+      // synchronous setPhase('processing') at the very top the old
+      // version of this test only ever needed. Each already-resolved mock
+      // in that chain still needs its own microtask turn, so flush
+      // several rather than guessing exactly how many hops deep it is.
+      for (let i = 0; i < 10; i++) await Promise.resolve()
     })
 
+    expect(screen.getByText('decks.scan.failed')).toBeInTheDocument()
     expect(context2d.clearRect).toHaveBeenCalledWith(0, 0, 640, 480)
   })
 })
