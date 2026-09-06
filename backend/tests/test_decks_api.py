@@ -14,6 +14,7 @@ try:
         list_deck_instances,
         reset_deck_instance,
         undo_scan,
+        undo_scan_collection_only,
     )
     from database import Base
     from models import Card, CollectionItem, Deck, DeckCard, DeckInstance, ScannedCard, User
@@ -514,6 +515,135 @@ class UndoScanTests(unittest.TestCase):
 
         self.assertEqual(result.scanned_count, 0)
         self.assertIsNone(self._collection_item(self.card_a))
+
+
+@unittest.skipUnless(API_TEST_DEPS_AVAILABLE, "FastAPI/SQLAlchemy are not installed in this lightweight test environment")
+class UndoScanCollectionOnlyTests(unittest.TestCase):
+    """docs/plans/scanner-ux-todos.md item 5 — the route DeckDetail.jsx
+    falls back to for the two deck_scan_status outcomes undo_scan itself
+    can't safely reverse: 'not_in_deck' (no deck-progress row exists at
+    all — card_c below is never part of the deck's template) and
+    'already_complete' (the add never moved deck progress in the first
+    place, since register_scan caps at expected_quantity)."""
+
+    def setUp(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        self.db = Session()
+        self.user = User(username="ash", hashed_password="x", role="trainer", is_active=True)
+        self.other_user = User(username="misty", hashed_password="x", role="trainer", is_active=True)
+        self.card_a = Card(id="sv1-1_en", tcg_card_id="sv1-1", name="Sprigatito", set_id="sv1", number="1", lang="en")
+        self.card_c = Card(id="sv1-3_en", tcg_card_id="sv1-3", name="Meowscarada", set_id="sv1", number="3", lang="en")
+        self.db.add_all([self.user, self.other_user, self.card_a, self.card_c])
+        self.db.commit()
+        self.db.refresh(self.user)
+        self.db.refresh(self.other_user)
+
+    def tearDown(self):
+        self.db.close()
+
+    def _create_deck(self, user=None):
+        # card_a only, expected_quantity 1 — card_c (below) is deliberately
+        # never part of this template, so scanning it is the "not_in_deck"
+        # case; a second scan of card_a is "already_complete".
+        return create_deck(
+            DeckCreate(
+                name="Test Deck", product_type="battle_deck",
+                source_url="https://bulbapedia.bulbagarden.net/wiki/Test_Deck",
+                cards=[DeckCardEntry(card_id=self.card_a.id, expected_quantity=1)],
+            ),
+            current_user=user or self.user,
+            db=self.db,
+        )
+
+    def _add(self, instance, card, user=None):
+        return add_to_collection(
+            CollectionItemCreate(card_id=card.id, quantity=1, deck_instance_id=instance.id),
+            current_user=user or self.user,
+            db=self.db,
+        )
+
+    def _collection_item(self, card, user=None):
+        return self.db.query(CollectionItem).filter(
+            CollectionItem.card_id == card.id,
+            CollectionItem.user_id == (user or self.user).id,
+        ).first()
+
+    def test_reverses_a_not_in_deck_add_that_undo_scan_itself_rejects(self):
+        instance = self._create_deck()
+        self._add(instance, self.card_c)
+
+        with self.assertRaises(HTTPException):
+            undo_scan(instance.id, self.card_c.id, current_user=self.user, db=self.db)
+
+        undo_scan_collection_only(instance.id, self.card_c.id, current_user=self.user, db=self.db)
+
+        self.assertIsNone(self._collection_item(self.card_c))
+
+    def test_reverses_an_already_complete_add_without_decrementing_deck_progress(self):
+        instance = self._create_deck()
+        self._add(instance, self.card_a)  # counts: scanned_quantity -> 1/1
+        result = self._add(instance, self.card_a)  # already_complete: capped, doesn't move progress
+        self.assertEqual(result.deck_scan_status, "already_complete")
+        self.assertEqual(self._collection_item(self.card_a).quantity, 2)
+
+        undo_scan_collection_only(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+
+        # Collection side reversed...
+        self.assertEqual(self._collection_item(self.card_a).quantity, 1)
+        # ...but deck progress — still at its capped expected_quantity from
+        # the FIRST add, which the second (already_complete) add never
+        # touched — must not be decremented either; that would wrongly
+        # take credit away from the first, still-valid scan.
+        progress = get_deck_instance(instance.id, current_user=self.user, db=self.db)
+        card_a_row = next(c for c in progress.cards if c.card_id == self.card_a.id)
+        self.assertEqual(card_a_row.scanned_quantity, 1)
+
+    def test_decrements_a_grouped_row_without_deleting_it(self):
+        instance = self._create_deck()
+        self._add(instance, self.card_c)
+        self._add(instance, self.card_c)  # quantity now 2
+
+        undo_scan_collection_only(instance.id, self.card_c.id, current_user=self.user, db=self.db)
+
+        self.assertEqual(self._collection_item(self.card_c).quantity, 1)
+
+    def test_rejects_when_no_matching_scan_exists(self):
+        instance = self._create_deck()
+        with self.assertRaises(HTTPException):
+            undo_scan_collection_only(instance.id, self.card_c.id, current_user=self.user, db=self.db)
+
+    def test_rejects_another_users_instance(self):
+        instance = self._create_deck(user=self.user)
+        self._add(instance, self.card_c)
+        with self.assertRaises(HTTPException):
+            undo_scan_collection_only(instance.id, self.card_c.id, current_user=self.other_user, db=self.db)
+        self.assertEqual(self._collection_item(self.card_c).quantity, 1)  # untouched
+
+    def test_passes_trace_id_through_to_scan_trace_when_given(self):
+        # Same diagnostics bookkeeping as undo_scan's own identical test —
+        # without this, undoing a not_in_deck/already_complete scan would
+        # never mark its trace reversed, since this route is the only way
+        # those two statuses can be undone at all.
+        instance = self._create_deck()
+        self._add(instance, self.card_c)
+
+        with patch("api.decks.record_scan_reversed") as mock_record:
+            undo_scan_collection_only(instance.id, self.card_c.id, trace_id="abc123def456", current_user=self.user, db=self.db)
+
+        mock_record.assert_called_once_with(self.user.id, "abc123def456")
+
+    def test_omitting_trace_id_calls_scan_trace_with_none_not_a_sentinel(self):
+        # Same Query(default=None)-sentinel regression undo_scan's own test
+        # guards against — see its docstring.
+        instance = self._create_deck()
+        self._add(instance, self.card_c)
+
+        with patch("api.decks.record_scan_reversed") as mock_record:
+            undo_scan_collection_only(instance.id, self.card_c.id, current_user=self.user, db=self.db)
+
+        mock_record.assert_called_once_with(self.user.id, None)
 
 
 if __name__ == "__main__":

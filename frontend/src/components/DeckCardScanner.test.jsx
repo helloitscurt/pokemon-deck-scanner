@@ -12,7 +12,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DeckCardScanner from './DeckCardScanner'
 import { matchDeckImage, recognizeCard } from '../api/client'
 import { detectCardQuad, extractCard, preloadCardDetection } from '../utils/cardDetection'
-import { lastOcrRawText, lastOcrWords, preloadNumberOcr, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
+import { preloadNumberOcr, recognizeCardText, recognizeNumberRegion } from '../utils/cardOcr'
 
 vi.mock('../api/client', () => ({
   recognizeCard: vi.fn(),
@@ -31,8 +31,6 @@ vi.mock('../utils/cardOcr', () => ({
   recognizeNumberRegion: vi.fn(),
   preloadCardOcr: vi.fn(),
   preloadNumberOcr: vi.fn(),
-  lastOcrRawText: { value: '' },
-  lastOcrWords: { value: [] },
 }))
 
 let mockCameraStatus = 'streaming'
@@ -52,10 +50,19 @@ vi.mock('../contexts/SettingsContext', () => ({
   useSettings: () => ({ t: (key) => key }),
 }))
 
+// Defaults to "confirmed" — most tests exercising decrementRecentScan care
+// about what happens after confirmation, not the confirm step itself (see
+// the dedicated "-" confirmation tests below, which override this).
+const mockConfirmDialog = vi.fn().mockResolvedValue(true)
+vi.mock('../contexts/ConfirmDialogContext', () => ({
+  useConfirmDialog: () => mockConfirmDialog,
+}))
+
 const DETECTION_INTERVAL_MS = 90 // must match DeckCardScanner.jsx's own constant
 const REQUIRED_STABLE_FRAMES = 8 // must match DeckCardScanner.jsx's own constant
 const NUMBER_OCR_INTERVAL_MS = 700 // must match DeckCardScanner.jsx's own constant
 const REQUIRED_HIGH_CONFIDENCE_PASSES = 3 // must match DeckCardScanner.jsx's own constant
+const EMPTY_FRAME_DEBOUNCE_TICKS = 3 // must match DeckCardScanner.jsx's own constant
 
 const STABLE_QUAD = {
   topLeftCorner: { x: 10, y: 10 },
@@ -64,10 +71,10 @@ const STABLE_QUAD = {
   bottomRightCorner: { x: 110, y: 160 },
 }
 
-function fakeCropCanvas() {
+function fakeCropCanvas(tag = 'fake') {
   return {
     toBlob: (cb) => cb(new Blob(['fake'], { type: 'image/jpeg' })),
-    toDataURL: () => 'data:image/jpeg;base64,fake',
+    toDataURL: () => `data:image/jpeg;base64,${tag}`,
   }
 }
 
@@ -78,6 +85,14 @@ function stubMediaAndCanvas() {
   const context2d = {
     clearRect: vi.fn(), drawImage: vi.fn(), beginPath: vi.fn(),
     moveTo: vi.fn(), lineTo: vi.fn(), closePath: vi.fn(), stroke: vi.fn(),
+    // Read by the image-quality reading (docs/plans/scanner-ux-todos.md
+    // item 7) — a flat, uniform region is fine here; its actual sharpness
+    // value isn't what any test in this file asserts on.
+    getImageData: vi.fn((sx, sy, sw, sh) => ({
+      data: new Uint8ClampedArray(Math.max(0, sw) * Math.max(0, sh) * 4),
+      width: sw,
+      height: sh,
+    })),
   }
   vi.spyOn(HTMLCanvasElement.prototype, 'getContext').mockReturnValue(context2d)
   // jsdom has no real toBlob() without the optional `canvas` npm package —
@@ -138,11 +153,6 @@ describe('DeckCardScanner', () => {
     // about it override this themselves.
     recognizeNumberRegion.mockResolvedValue({ number_local: null, number_total: null, confidence: 0 })
     matchDeckImage.mockResolvedValue({ _identity_confident: false, matches: [] })
-    // Plain mutable objects, not vi.fn() mocks — clearAllMocks in afterEach
-    // doesn't touch these, so reset explicitly to avoid one test's value
-    // leaking into the next.
-    lastOcrRawText.value = ''
-    lastOcrWords.value = []
     onConfirm = vi.fn().mockResolvedValue(undefined)
     onDecrement = vi.fn().mockResolvedValue(undefined)
   })
@@ -221,13 +231,20 @@ describe('DeckCardScanner', () => {
     // still in the normal hunting view, not bounced anywhere else.
     expect(screen.getByAltText('Pikachu')).toBeInTheDocument()
     expect(screen.getByText('decks.scan.scanNow')).toBeInTheDocument()
+    // Regression: dead-center (inset-x-0) overlapped RecentScansStack's own
+    // "+"/"-" stepper on a real device once a scan existed — Scan Now's
+    // wrapper reserves that corner instead of spanning the full width.
+    expect(screen.getByText('decks.scan.scanNow').closest('div')).toHaveClass('left-0', 'right-[152px]')
 
     // The loop re-arms once the card is actually removed from frame — not
     // merely once cooldown elapses (see the next test: a still-sitting card
-    // must NOT re-trigger a capture on its own).
+    // must NOT re-trigger a capture on its own). EMPTY_FRAME_DEBOUNCE_TICKS
+    // consecutive empty ticks, not just one — a single glitchy empty tick
+    // is treated as noise, not a real removal (see the dedicated debounce
+    // test below).
     recognizeCard.mockClear()
-    detectCardQuad.mockResolvedValueOnce(null)
-    await advanceTicks(1)
+    detectCardQuad.mockResolvedValue(null)
+    await advanceTicks(EMPTY_FRAME_DEBOUNCE_TICKS)
     detectCardQuad.mockResolvedValue(STABLE_QUAD)
     await advanceTicks(REQUIRED_STABLE_FRAMES)
     expect(recognizeCard).toHaveBeenCalledTimes(1)
@@ -487,6 +504,46 @@ describe('DeckCardScanner', () => {
       })
     })
 
+    it('does not re-capture an already-saved, still-held card after a single glitchy empty-frame tick', async () => {
+      // Regression test: a resolved job's capturedRegionsRef entry used to
+      // clear on the very FIRST empty-detection tick, trusting it as proof
+      // the card had been removed. Real detection can report an empty
+      // frame for one tick even though the physical card never left
+      // (motion blur, a lighting flicker, autofocus hunting) — when that
+      // lands right after a save, the still-sitting, already-saved card
+      // read as newly arrived once detection recovered, firing a genuine
+      // duplicate save.
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-abc123',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+      recognizeCard.mockClear()
+
+      // A single empty tick, then the same still card reappears — one
+      // glitch, not a real removal.
+      detectCardQuad.mockResolvedValueOnce(null)
+      await advanceTicks(1)
+      detectCardQuad.mockResolvedValue(STABLE_QUAD)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      expect(recognizeCard).not.toHaveBeenCalled()
+
+      // A REAL removal — enough consecutive empty ticks to clear the
+      // debounce — does still let the same spot be captured again once
+      // something reappears there.
+      detectCardQuad.mockResolvedValue(null)
+      await advanceTicks(3)
+      detectCardQuad.mockResolvedValue(STABLE_QUAD)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+    })
+
     it('does not re-capture a card that stays held but whose detected outline slowly drifts', async () => {
       // Regression test: capturedRegionsRef used to anchor a region to the
       // exact quad it was captured at, forever. Once detection runs
@@ -633,11 +690,63 @@ describe('DeckCardScanner', () => {
       // Card A is still in flight — the error screen should say so rather
       // than reading as if scanning had stopped entirely.
       expect(screen.getByText('decks.scan.errorOthersStillScanning')).toBeInTheDocument()
+      // Unlike Scan Now (see the earlier reservation test), Try Again has
+      // no wide neighbor to dodge — the failed-capture thumbnail is
+      // narrower and carries no stepper — so it stays plain dead-center.
+      expect(screen.getByText('decks.scan.tryAgain').closest('div')).toHaveClass('inset-x-0')
 
       await act(async () => {
         resolveFirst({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }], trace_id: 'trace-first' })
         for (let i = 0; i < 10; i++) await Promise.resolve()
       })
+    })
+
+    it('keeps a failed capture on screen when a second, concurrently-captured card fails later', async () => {
+      // Regression test: two cards captured concurrently (same pattern as
+      // "captures a second, different card..." above — A left pending so
+      // phase stays 'hunting' and the tick loop keeps running long enough
+      // to pick up B too) can each fail independently. Whichever job's
+      // catch block runs SECOND used to unconditionally overwrite
+      // phase/error/errorCardImage, replacing whatever failed capture the
+      // user was already looking at, before they ever got a chance to tap
+      // Try Again (see phaseRef's guard in captureAndRecognize). Here B
+      // fails first (while A is still an open network call) and A's own
+      // failure arrives after — A's must be the one that gets dropped.
+      let rejectFirst
+      extractCard.mockResolvedValueOnce(fakeCropCanvas('crop-a'))
+      recognizeCard.mockImplementationOnce(() => new Promise((_resolve, reject) => { rejectFirst = reject }))
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+
+      // Card B, at a different position, captured while A is still
+      // in-flight — phase is still 'hunting' here, so the tick loop (which
+      // tears itself down outside 'hunting') is still running to pick it up.
+      detectCardQuad.mockResolvedValue(QUAD_B)
+      extractCard.mockResolvedValueOnce(fakeCropCanvas('crop-b'))
+      recognizeCard.mockRejectedValueOnce(new Error('network down'))
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(2)
+
+      // B's failure landed first — nothing else was on screen yet, so it's
+      // the one showing.
+      expect(screen.getByText('decks.scan.failed')).toBeInTheDocument()
+      expect(screen.getByAltText('')).toHaveAttribute('src', 'data:image/jpeg;base64,crop-b')
+
+      // A's own (also failed) network call finally comes back, after B's
+      // failure is already on screen, unacknowledged.
+      await act(async () => {
+        rejectFirst(new Error('network down too'))
+        for (let i = 0; i < 10; i++) await Promise.resolve()
+      })
+
+      // Still B's failure on screen — A's was dropped instead of clobbering it.
+      expect(screen.getByAltText('')).toHaveAttribute('src', 'data:image/jpeg;base64,crop-b')
+
+      // Try Again clears it, same as any other single failure.
+      fireEvent.click(screen.getByText('decks.scan.tryAgain'))
+      expect(screen.queryByText('decks.scan.failed')).not.toBeInTheDocument()
     })
   })
 
@@ -734,6 +843,47 @@ describe('DeckCardScanner', () => {
 
     fireEvent.click(screen.getByText('decks.scan.tryAgain'))
     expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
+    expect(screen.queryByAltText('')).not.toBeInTheDocument()
+  })
+
+  it('opens an enlarged preview of the failed capture on tap, closable via the X', async () => {
+    recognizeCard.mockRejectedValue(new Error('network down'))
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    expect(screen.getByText('decks.scan.failed')).toBeInTheDocument()
+
+    // Just the small thumbnail so far.
+    expect(screen.getAllByAltText('')).toHaveLength(1)
+
+    fireEvent.click(screen.getByLabelText('decks.scan.viewFailedCapture'))
+
+    // Now both the thumbnail and the enlarged preview are on screen.
+    expect(screen.getAllByAltText('')).toHaveLength(2)
+    // Own, distinct label from the scanner modal's own header close button
+    // (which stays mounted underneath, just visually covered) — sharing a
+    // label with it would let a keyboard/screen-reader user land on the
+    // wrong one and close the whole scanner instead of just the preview.
+    const closeButton = screen.getByLabelText('decks.scan.closeFailedCapturePreview')
+    // Focus moves to it on open, for the same reason.
+    expect(closeButton).toHaveFocus()
+
+    fireEvent.click(closeButton)
+    expect(screen.getAllByAltText('')).toHaveLength(1)
+  })
+
+  it('clears the failed-capture preview state when trying again', async () => {
+    recognizeCard.mockRejectedValue(new Error('network down'))
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+    fireEvent.click(screen.getByLabelText('decks.scan.viewFailedCapture'))
+    expect(screen.getAllByAltText('')).toHaveLength(2)
+
+    fireEvent.click(screen.getByText('decks.scan.tryAgain'))
+
+    // Both the thumbnail and the (still-open) enlarged preview are gone —
+    // not just hidden behind the next hunting view.
     expect(screen.queryByAltText('')).not.toBeInTheDocument()
   })
 
@@ -868,66 +1018,6 @@ describe('DeckCardScanner', () => {
       expect.objectContaining({ id: 'p1' }),
       { isAutoSave: true, traceId: 'trace-deck3', hasLiveWarningOverlay: true },
     )
-  })
-
-  it('surfaces what OCR actually found in the on-screen debug readout', async () => {
-    // Debug readout only renders in the camera-view phases (hunting/
-    // processing/success/error), not the candidate-picker view — land in
-    // 'error' (paid call also fails) so it's actually on screen to assert
-    // against, while still proving debugInfo captured the OCR result from
-    // the earlier, successful tryOcrMatch step.
-    recognizeCardText.mockResolvedValue({ name: 'Pikachu', number_local: '25' })
-    lastOcrRawText.value = 'Pikachu\nHP 60\n025/198'
-    lastOcrWords.value = [{ text: 'Pikachu', confidence: 91, y0: 90 }]
-    matchDeckImage.mockResolvedValue({ _identity_confident: false, matches: [] })
-    recognizeCard.mockRejectedValue(new Error('network down'))
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
-
-    await advanceTicks(REQUIRED_STABLE_FRAMES)
-
-    expect(document.body.textContent).toContain('ocr name:Pikachu')
-    expect(document.body.textContent).toContain('number:25')
-    expect(document.body.textContent).toContain('ocr raw:')
-    expect(document.body.textContent).toContain('Pikachu HP 60 025/198')
-    // The word-level readout — proves pickCardName's actual input (not
-    // just its output) is visible, so a rejected-but-real candidate can be
-    // told apart from Tesseract finding nothing usable at all.
-    expect(document.body.textContent).toContain('ocr words:')
-    expect(document.body.textContent).toContain('"Pikachu"@y90(91)')
-  })
-
-  it('shows rejected OCR word candidates in the debug readout even when no name was picked', async () => {
-    // The real-device gap this closes: "ocr name:(none)" alone can't say
-    // whether nothing was recognized, or something was recognized but
-    // scored below MIN_NAME_CONFIDENCE / outside NAME_BAND_FRACTION.
-    recognizeCardText.mockResolvedValue({ name: null })
-    lastOcrRawText.value = 'garbled nonsense'
-    lastOcrWords.value = [
-      { text: 'Potion', confidence: 22, y0: 90 }, // real word, too low-confidence
-      { text: 'garbled', confidence: 61, y0: 600 }, // confident but out of band
-    ]
-    recognizeCard.mockRejectedValue(new Error('network down'))
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
-
-    await advanceTicks(REQUIRED_STABLE_FRAMES)
-
-    expect(document.body.textContent).toContain('ocr name:(none)')
-    expect(document.body.textContent).toContain('"garbled"@y600(61)')
-    expect(document.body.textContent).toContain('"Potion"@y90(22)')
-  })
-
-  it('shows "(empty)" for the raw OCR readout when Tesseract found nothing at all', async () => {
-    // The real-device finding this guards: a well-lit, legible card still
-    // produced name:(none) number:(none) — this line is what tells apart
-    // "Tesseract found nothing" from "found text the parser couldn't use."
-    recognizeCardText.mockResolvedValue({ name: null })
-    lastOcrRawText.value = ''
-    recognizeCard.mockRejectedValue(new Error('network down'))
-    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
-
-    await advanceTicks(REQUIRED_STABLE_FRAMES)
-
-    expect(document.body.textContent).toContain('ocr raw:(empty)')
   })
 
   it('falls back to the paid recognizeCard when the deck-scoped match was not confident', async () => {
@@ -1130,11 +1220,11 @@ describe('DeckCardScanner', () => {
     it('drops the oldest thumbnail once the stack exceeds its cap', async () => {
       render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 
-      // One more scan than RECENT_SCANS_LIMIT (3) — same null-quad/
+      // One more scan than RECENT_SCANS_LIMIT (4) — same null-quad/
       // STABLE_QUAD re-arm technique the "does not immediately re-capture"
       // test above uses to get a fresh capture through the state machine
       // each time, rather than a position-based swap.
-      for (let i = 0; i < 4; i++) {
+      for (let i = 0; i < 5; i++) {
         recognizeCard.mockResolvedValueOnce({
           _identity_confident: true,
           matches: [{ id: `p${i}`, name: `Card${i}` }],
@@ -1142,17 +1232,17 @@ describe('DeckCardScanner', () => {
         })
         await advanceTicks(REQUIRED_STABLE_FRAMES)
         await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
-        detectCardQuad.mockResolvedValueOnce(null)
-        await advanceTicks(1)
+        detectCardQuad.mockResolvedValue(null)
+        await advanceTicks(EMPTY_FRAME_DEBOUNCE_TICKS)
         detectCardQuad.mockResolvedValue(STABLE_QUAD)
       }
 
-      expect(recognizeCard).toHaveBeenCalledTimes(4)
-      // Card0 (the oldest, first scanned) has been dropped; the other 3
+      expect(recognizeCard).toHaveBeenCalledTimes(5)
+      // Card0 (the oldest, first scanned) has been dropped; the other 4
       // remain.
       expect(screen.queryByAltText('Card0')).not.toBeInTheDocument()
-      expect(screen.getAllByRole('img')).toHaveLength(3)
-      expect(screen.getByAltText('Card3')).toBeInTheDocument()
+      expect(screen.getAllByRole('img')).toHaveLength(4)
+      expect(screen.getByAltText('Card4')).toBeInTheDocument()
     })
 
     it('keeps the recent-scans stack when the scanner is closed and reopened', async () => {
@@ -1376,25 +1466,57 @@ describe('DeckCardScanner', () => {
       expect(screen.queryByText('decks.scan.pathVisionApi')).not.toBeInTheDocument()
     })
 
-    it('disables "-" on a recent-scan thumbnail when the save it would undo can\'t be safely reversed', async () => {
-      // Default onConfirm mock resolves with no deck_scan_status at all —
-      // undo_scan would either 404 or wrongly decrement an unrelated scan,
-      // the same reason DeckDetail.jsx's own Undo toast withholds itself
-      // for 'not_in_deck'/'already_complete' (see decrementRecentScan's
-      // canRemove guard).
+    it('always allows "-" regardless of deck_scan_status, confirming first and passing the status through so DeckDetail can pick the right undo route', async () => {
+      // docs/plans/scanner-ux-todos.md item 5: "-" used to disable itself
+      // whenever the save it would undo couldn't be safely reversed via
+      // undo_scan (not_in_deck/already_complete) — now it's always
+      // enabled; DeckDetail.jsx picks a different, safe route for those
+      // two statuses instead of the button refusing the tap outright.
       recognizeCard.mockResolvedValue({
         _identity_confident: true,
         matches: [{ id: 'p1', name: 'Pikachu' }],
         trace_id: 'trace-remove1',
       })
+      // Default onConfirm mock resolves with no deck_scan_status at all —
+      // exactly the case that used to disable the button.
       render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} onDecrement={onDecrement} deckInstanceId="3" />)
       await advanceTicks(REQUIRED_STABLE_FRAMES)
 
       const removeButton = screen.getByLabelText('decks.scan.removeOne: Pikachu')
-      expect(removeButton).toBeDisabled()
+      expect(removeButton).not.toBeDisabled()
 
-      fireEvent.click(removeButton)
+      await act(async () => {
+        fireEvent.click(removeButton)
+        await Promise.resolve()
+      })
+
+      expect(mockConfirmDialog).toHaveBeenCalledWith(expect.objectContaining({
+        message: 'decks.scan.removeCardConfirm',
+        destructive: true,
+      }))
+      // Third arg is scan.deckScanStatus (undefined here) — DeckDetail.jsx
+      // uses it to route to undo_scan vs. the collection-only endpoint.
+      expect(onDecrement).toHaveBeenCalledWith('p1', 'trace-remove1', undefined)
+    })
+
+    it('does not remove anything when the confirmation dialog is declined', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-remove1b',
+      })
+      onConfirm.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
+      mockConfirmDialog.mockResolvedValueOnce(false)
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} onDecrement={onDecrement} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      await act(async () => {
+        fireEvent.click(screen.getByLabelText('decks.scan.removeOne: Pikachu'))
+        await Promise.resolve()
+      })
+
       expect(onDecrement).not.toHaveBeenCalled()
+      expect(screen.getByAltText('Pikachu')).toBeInTheDocument()
     })
 
     it('lets "-" undo the most recent add to a recent-scan thumbnail once it was safely counted', async () => {
@@ -1421,8 +1543,9 @@ describe('DeckCardScanner', () => {
       })
 
       // Undoes the most recent add — the quick-add bump, which (unlike the
-      // original capture) has no trace_id of its own.
-      expect(onDecrement).toHaveBeenCalledWith('p1', null)
+      // original capture) has no trace_id of its own, but does carry the
+      // same 'counted' status through.
+      expect(onDecrement).toHaveBeenCalledWith('p1', null, 'counted')
       expect(screen.queryByText('2')).not.toBeInTheDocument()
       expect(screen.getAllByRole('img')).toHaveLength(1)
     })
@@ -1442,7 +1565,7 @@ describe('DeckCardScanner', () => {
         fireEvent.click(screen.getByLabelText('decks.scan.removeOne: Pikachu'))
         await Promise.resolve()
       })
-      expect(onDecrement).toHaveBeenCalledWith('p1', 'trace-remove3')
+      expect(onDecrement).toHaveBeenCalledWith('p1', 'trace-remove3', 'counted')
 
       // Same collapse-then-remove animation an overflowed entry uses —
       // advance past its 300ms transition for it to actually leave the DOM.

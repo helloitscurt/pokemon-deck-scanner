@@ -2,7 +2,8 @@
 
 Requested enhancements to the live deck-tracking scanner
 ([DeckCardScanner.jsx](../../frontend/src/components/DeckCardScanner.jsx)),
-grounded in its current behavior. Todo list only — no implementation yet.
+grounded in its current behavior. See each item's own Status line — most
+are now done; the Suggested order section tracks what's left.
 
 ---
 
@@ -87,106 +88,47 @@ not every copy added since.
 
 ## 5. "-" should always be able to remove a scanned card, with confirmation
 
-**Current state:** each recent-scans thumbnail's "-" (`decrementRecentScan`,
-`DeckCardScanner.jsx`) is gated on `scan.canRemove`, which is only `true`
-when the most recent add's `deck_scan_status` was `'counted'`
-(`DeckCardScanner.jsx`'s `confirmCard`). For `'not_in_deck'` or
-`'already_complete'` — either the card isn't part of this deck's template,
-or the deck already has its full expected quantity of it — `canRemove` is
-`false` and "-" is disabled outright (dimmed icon, no tap). That gate
-exists because the backend's `undo_scan` route
-([decks.py](../../backend/api/decks.py)) can't safely reverse those two
-cases: it either 404s (card isn't in the deck's template at all) or would
-decrement an unrelated earlier scan of the same card that DID count
-(`already_complete`'s `matching_item` lookup is deterministic by
-card/variant/condition, not "the one this specific button represents").
-
-**Ask:** let "-" remove the card regardless — a user who scanned by mistake
-needs a way to undo it even when the safety gate above says it can't be
-cleanly reversed via `undo_scan`.
-
-**Todo:**
-- Needs a design decision, not just "remove the `canRemove` check": for
-  the `not_in_deck`/`already_complete` cases, `undo_scan` isn't the right
-  primitive (see above) — this either needs a different backend call that
-  decrements the matching `CollectionItem` row directly by this card's
-  resolved id (bypassing the deck-progress reconciliation `undo_scan` also
-  does), or `canRemove` needs to become "always true," with the risk of
-  occasionally decrementing the wrong physical copy's count accepted and
-  documented.
-- Add a confirmation step before the removal actually fires — e.g. this
-  app's existing `useConfirmDialog` context (already used in
-  `DeckDetail.jsx` for reset/delete) — with copy along the lines of "Are
-  you sure you want to remove this card from your deck?" A tap-triggered
-  destructive action with no undo-of-the-undo deserves the same
-  confirm-first treatment already used elsewhere in this app, not the
-  bare, immediate tap the "+" side has.
-- On confirm, the thumbnail should disappear from the recent-scans stack
-  immediately (or its quantity should drop by one) — reusing the existing
-  `scheduleRecentScanRemoval`/quantity-decrement paths already in
-  `decrementRecentScan`.
+**Status: done.** Option 1 from the design discussion: a new backend route,
+`POST /decks/instances/{id}/scans/{card_id}/undo-collection-only`
+([decks.py](../../backend/api/decks.py)), reuses `undo_scan`'s own
+deterministic `CollectionItem` lookup (extracted into a shared
+`_decrement_or_delete_collection_item` helper) but skips
+`unregister_scan` entirely — safe for `not_in_deck` (no deck-progress row
+ever existed) and `already_complete` (that add never moved deck progress,
+so there's nothing to wrongly decrement). `DeckCardScanner.jsx`'s "-" is
+now always enabled (`removeDisabled` no longer checks `canRemove`); each
+scan entry carries its `deckScanStatus` through to `onDecrement`, and
+`DeckDetail.jsx`'s `decrementMutation` picks `undo_scan` for `'counted'`
+or the collection-only route otherwise. A `useConfirmDialog` prompt
+("Are you sure you want to remove this card from your deck?") gates the
+call either way, matching this app's existing reset/delete confirm
+pattern.
 
 ## 6. Trim the live view's debug/hint text to make room for a bigger camera + more recent-scan slots
 
-**Current state:** below the video, `DeckCardScanner.jsx` always renders a
-`liveHint`/`liveHintLowConfidence` line, and beneath that an always-visible
-monospace debug block (`cam:{cameraStatus} lib:{debugInfo.libState}
-ticks:{debugInfo.tickCount}`, plus conditional `ocr name:`/`ocr raw:`/`ocr
-words:` lines once OCR has run at least once). This debug readout was
-added because there's no devtools access on a phone and the detection loop
-previously failed silently — genuinely useful during Phase 1-3
-development, but it eats real vertical space below the video on every
-screen size.
-
-**Ask:** drop the low-confidence hint text and the whole debug/OCR readout
-block — none of it is meaningful to a user day-to-day — and use the
-reclaimed height to make the video area itself bigger and/or raise
-`RECENT_SCANS_LIMIT` above its current cap of 3.
-
-**Todo:**
-- Remove the `liveHintLowConfidence`/`liveHint` paragraph and the entire
-  `debugInfo` readout block (`cam:...`/`lib:...`/`ocr ...` lines) from the
-  hunting-phase view.
-- Decide whether the debug readout disappears entirely or moves somewhere
-  opt-in (a settings toggle, a diagnostics mode) — it was load-bearing for
-  diagnosing real-device detection failures during development; removing
-  it outright means a future detection bug has no on-device visibility
-  again unless something replaces it.
-- `RECENT_SCANS_LIMIT`'s current cap of 3 was sized specifically against
-  the video's height at its old, smaller footprint (see the constant's own
-  comment: 5 stacked 120px thumbnails were taller than the video
-  container). Growing the video area and/or the stack limit are coupled —
-  revisit both together, not the stack limit alone, or the same clipping
-  problem the original tuning avoided comes back.
+**Status: done.** The `liveHintLowConfidence` variant and the entire
+`debugInfo` readout block (`cam:`/`lib:`/`ocr ...` lines, plus the
+now-unused `describeError` helper and `detectionStatus`/`lastOcrRawText`/
+`lastOcrWords` imports) were removed outright — no opt-in diagnostics mode
+was added in their place, per the decision to drop this entirely rather
+than relocate it. `RECENT_SCANS_LIMIT` raised from 3 to 4 (498px of
+stacked thumbnails, still under the video container's ~512px height at
+its default aspect) now that the reclaimed space made a fourth slot worth
+it.
 
 ## 7. Rework or remove the confusing live confidence-percentage badge
 
-**Current state:** the top-left badge (`liveNumberConfidence`, Phase 3's
-Path B) shows a number-only OCR confidence score, refreshed every
-`NUMBER_OCR_INTERVAL_MS` (700ms) while framing a card. It's Tesseract's OCR
-confidence on the collector-number crop specifically — not a measure of
-overall image sharpness/focus, framing, or how likely the card is to be
-correctly identified. The code's own comments already acknowledge this gap
-elsewhere ("quad stability and focus sharpness are different things the
-quad alone can't see," `DeckCardScanner.jsx`) — this badge has the same
-limitation: a number can OCR confidently even when the rest of the photo
-is blurry, and can read low-confidence on a perfectly good photo if the
-number itself is small, worn, or at an angle.
-
-**Ask:** the badge is confusing, updates too fast to track, and doesn't
-actually represent "is this a good picture of the card."
-
-**Todo:**
-- Needs a design decision on what (if anything) replaces it: a genuine
-  image-quality signal (blur/sharpness detection on the captured frame)
-  would need new detection work, not a relabeling of the existing OCR
-  score.
-- If kept in some form, consider slowing its update cadence and/or
-  smoothing (e.g. only update on a sustained change) so it reads as a
-  stable signal instead of flickering every ~700ms.
-- Simplest option, if no replacement signal is worth building right now:
-  remove it outright, same as item 6's debug text — it may be doing more
-  to erode trust in the scanner than to help.
+**Status: done.** Replaced the OCR-confidence reading with an actual
+image-quality signal: a new [imageSharpness.js](../../frontend/src/utils/imageSharpness.js)
+computes Laplacian-variance sharpness (a classic no-reference blur metric)
+on the detected card region, read from the same detection-frame canvas
+Path A already draws every tick. The OCR-confidence value that used to
+drive the badge is kept, unexported, purely to gate the existing
+auto-trigger streak (`NUMBER_CONFIDENCE_THRESHOLD`) — it's never displayed
+again. The badge only shows a quality percentage when a card is actually
+in frame; Path B's own number-text/name-preview reading still shows on
+its own (no quality tint) when zoomed in past a card's edges, same as
+before.
 
 ## 8. Tapping a recent-scan thumbnail should show card details + the scan image
 
@@ -213,35 +155,23 @@ completes.
 
 ## 9. Detection outline jumps around too much
 
-**Current state:** `drawOverlay` (`DeckCardScanner.jsx`) redraws the
-detection outline from that tick's raw `detectCardQuad` result every
-`DETECTION_INTERVAL_MS` (90ms), with no smoothing or interpolation between
-ticks — each frame's quad is drawn as-is, however much it moved from the
-last one. `STABILITY_TOLERANCE_PROPORTION` (0.07) governs whether a quad
-counts as "stable enough to capture," but doesn't affect how the outline
-itself is drawn while it's still jittering below that threshold.
-
-**Todo:**
-- Needs real-device tuning, same caveat as this file's other detection
-  constants ("reasoned starting points, not empirically calibrated against
-  real devices yet") — likely a smoothing pass (e.g. an exponential
-  moving average or a small median filter over the last few ticks' corner
-  positions) applied only to the drawn outline, not to the raw quad
-  `stabilityTrackerRef`/capture logic reads, so the capture-trigger
-  behavior itself doesn't change, just how steady the outline looks while
-  it's happening.
+**Status: done.** The drawn outline now lags toward each new raw quad via
+simple exponential smoothing (`OVERLAY_SMOOTHING_ALPHA`, a reasoned
+starting point — same real-device-tuning caveat as this file's other
+detection constants) instead of snapping straight to it, resetting
+instantly on an empty frame rather than smoothing out to nothing. Only the
+drawn line changes — the stability tracker and capture trigger keep
+reading the raw, unsmoothed quad, so the capture-trigger behavior itself
+is unaffected.
 
 ---
 
 ## Suggested order
 
-**1, 2, and 4 are done.** Remaining: **5** (relax/redesign the "-" safety
-gate plus a confirmation step — self-contained, and the most concrete
-correctness/trust fix here), **6** and **7** (both are almost entirely
-subtractive — removing text/badges rather than building new UI — cheap
-relative to their payoff), **9** (a tuning/smoothing pass, no new
-UI/state), **8** (needs a design decision on where a third tap target
-lives before implementation), and **3** (multi-card table scanning —
-still the largest item; the multi-quad contour detection work is new and
-worth prototyping/validating on a real table of cards before committing to
-the capture-trigger and queueing design already sketched above).
+**1, 2, 4, 5, 6, 7, and 9 are done.** Remaining: **8** (tap-for-details —
+needs a design decision on where a third tap target lives now that "+"/"-"
+already own the thumbnail's interactive surface) and **3** (multi-card
+table scanning — still the largest item; the multi-quad contour detection
+work is new and worth prototyping/validating on a real table of cards
+before committing to the capture-trigger and queueing design already
+sketched above).
