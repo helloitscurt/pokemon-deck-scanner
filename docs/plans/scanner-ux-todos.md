@@ -140,18 +140,38 @@ crop/blob (`captureAndRecognize`'s `cropCanvas`/`blob`) is created,
 uploaded, and discarded — nothing keeps it around after the request
 completes.
 
-**Todo:**
-- Wire a tap-for-details affordance on each thumbnail (distinct from the
-  "+"/"-" buttons, which already own the thumbnail's interactive surface —
-  needs a UI decision on where a third tap target fits, e.g. tapping the
-  image itself now that it's no longer also the quick-add button per the
-  side-stepper redesign). Reuse this app's existing card-detail viewer
-  (`CardModal`/`CompactCardArtwork`, already used from `DeckDetail.jsx` for
-  browsing deck cards) rather than building a new one.
-- "The image used to scan it" needs the actual captured crop kept around,
-  not just re-derived from `scan.image` (the catalog artwork) — decide how
-  long to hold onto it (this session only vs. persisted) and whether it's
-  worth the memory/storage cost for what's essentially a diagnostic view.
+**Decided:**
+1. The tap target is the card image itself — the "+"/"-" stepper already
+   sits beside it, not on top of it, so the image is free to be its own
+   tap target again (unlike before the side-stepper redesign, when the
+   image doubled as the quick-add button).
+2. The captured crop's lifetime is tied 1:1 to that scan entry's own
+   presence in the recent-scans stack — kept exactly as long as its
+   thumbnail is visible there, discarded the moment that entry leaves
+   `recentScans` (LRU eviction past `RECENT_SCANS_LIMIT`, or "-" removing
+   it entirely), not on some separate timer. Note this is *not* quite
+   "session-only": per item 1, the recent-scans stack itself deliberately
+   persists across the scanner closing and reopening, so the captured
+   image needs to live wherever the `recentScans` array entries themselves
+   already live (state, not a short-lived ref that resets with the rest of
+   the hunting-phase state) to actually survive that same close/reopen.
+
+**Status: done.** See
+[scanner-pause-speed-details.md](scanner-pause-speed-details.md) for the
+full implementation plan/review. Each recent-scan thumbnail's image is a
+tap target again (a small corner `Info` badge signals it, reusing the
+`pathLabel` badge's own visual language, so it doesn't repeat the exact
+discoverability problem that got the image demoted from a tap target the
+first time around). Opens the existing `CardModal` (`CardItem.jsx`,
+already used from `DeckDetail.jsx`) with `image` overridden to the real
+captured photo when one exists — only `captureAndRecognize`'s confident
+auto-save branch (covering both the continuous auto-trigger and a
+confidently-resolved manual Scan Now tap) has a real full-card
+`cropCanvas` in scope at confirm time; a manual ambiguous-list pick or
+Path B's zoom-match auto-save fall back to catalog art. The captured
+photo is stored directly on the `recentScans` entry (`scan.capturedImage`),
+so it's discarded automatically whenever that entry itself leaves the
+stack — no separate cleanup path.
 
 ## 9. Detection outline jumps around too much
 
@@ -166,12 +186,83 @@ is unaffected.
 
 ---
 
+## 10. Pause/stop the continuous scanning
+
+**Current state:** as soon as the scanner opens (`phase === 'hunting'`),
+Path A's 90ms detection/capture-trigger loop and Path B's 700ms number-OCR
+loop both run continuously with no way to pause either — a card in frame
+that happens to hold still long enough gets captured, whether or not the
+user was actually still lining up the shot.
+
+**Status: done.** See
+[scanner-pause-speed-details.md](scanner-pause-speed-details.md) for the
+full implementation plan/review. A gear icon in the scanner's header opens
+a settings popup with a pause toggle: pausing suppresses only the
+auto-capture trigger on both Path A (stable-hold) and Path B (zoom-match)
+— detection and the overlay keep running live, so positioning feedback
+never stops. `handleScanNow`'s existing manual button is deliberately not
+gated by pause at all, matching the "line it up, then capture on demand"
+use case. Momentary, not persisted — resets every time the scanner
+reopens, so nobody who never touches the toggle sees any change in
+behavior, and nobody ends up with a silently-forgotten-paused scanner
+across an unrelated later session. The same settings popup also carries a
+5-position slider for the detection outline's own tracking speed
+(`OVERLAY_SMOOTHING_ALPHA` from item 9 above) — not originally scoped
+under this item, but shipped alongside it since both needed the same new
+settings surface.
+
+## 11. Configurable collection-add behavior when re-scanning a deck to verify it
+
+**Current state:** every confirmed scan adds to the collection
+(`add_to_collection`, gated by `deck_scan_status` for whether it *also*
+counts toward deck progress — see item 5 — but the collection add itself
+always happens). There's no way to scan a deck purely to verify it's still
+complete without each scan re-adding to the collection.
+
+**Ask (from real usage):** scanning one already-built deck repeatedly to
+confirm all 60 cards are still physically present shouldn't keep adding
+duplicates to the collection after the first pass. Two ideas raised,
+worth deciding between rather than assuming one:
+1. A toggle for whether a scanning session adds to the collection at all —
+   on for the first scan-through of a newly tracked deck, off for later
+   "just verifying it's still all there" passes.
+2. A different model entirely: once a deck is identified/added, auto-add
+   *all* of its cards to the collection immediately at the deck's expected
+   quantities. Each subsequent scan of a card in that deck then just
+   *verifies* it's present (deck progress / a "confirmed still here" mark)
+   rather than being a fresh collection add. This changes what a deck scan
+   even represents — verification of existing inventory, not acquisition —
+   and would need real rethinking of how `register_scan`/`add_to_collection`
+   relate for deck-scoped scans specifically, not just a UI toggle.
+
+Also worth designing regardless of which option above is chosen: if a
+scanned card isn't part of the *currently open* deck's template
+(`not_in_deck`), it could still belong to a *different* deck the user is
+also tracking. Rather than silently falling into the generic
+not_in_deck warning, consider matching against all of the user's tracked
+deck templates and, on a match elsewhere, asking whether to add it to the
+collection (and/or crediting the deck it actually belongs to) instead of
+just the one currently open.
+
+**Todo:**
+- Design decision on the core model (per-session toggle vs.
+  auto-add-at-deck-creation-then-verify) before implementing either.
+- UI decision on where a collection-add toggle would live if option 1 is
+  chosen: per-scan-session control in the scanner modal, a persistent
+  per-deck-instance setting, or a global default in Settings.
+- If pursuing the "check other tracked decks" idea: needs a lookup across
+  all of the current user's deck instances' templates, not just the one
+  `deckInstanceId` the scanner was opened against, plus a UI moment to ask
+  the user rather than deciding silently either way.
+
+---
+
 ## Suggested order
 
-**1, 2, 4, 5, 6, 7, and 9 are done.** Remaining: **8** (tap-for-details —
-needs a design decision on where a third tap target lives now that "+"/"-"
-already own the thumbnail's interactive surface) and **3** (multi-card
-table scanning — still the largest item; the multi-quad contour detection
-work is new and worth prototyping/validating on a real table of cards
-before committing to the capture-trigger and queueing design already
-sketched above).
+**1, 2, 4, 5, 6, 7, 8, 9, and 10 are done.** Remaining: **11**
+(configurable collection-add on re-scan — needs a real design decision on
+the underlying model before any UI work) and **3** (multi-card table
+scanning — still the largest item; the multi-quad contour detection work
+is new and worth prototyping/validating on a real table of cards before
+committing to the capture-trigger and queueing design already sketched
+above).

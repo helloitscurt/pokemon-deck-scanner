@@ -158,6 +158,32 @@ input:-webkit-autofill:focus {
     @apply btn-primary px-3 py-1.5 text-xs;
   }
 
+  /* Scanner settings popup's outline-tracking-speed slider
+     (docs/plans/scanner-pause-speed-details.md) — the only range input
+     anywhere in this app, so there's no existing precedent to extend.
+     accent-color alone only recolors the native thumb/track fill; it
+     sets nothing for size, so a browser-default thumb (~16-20px in most
+     engines) would be the one undersized touch target next to this
+     app's other 36px circular controls. -webkit-/-moz- thumb rules can't
+     share one selector (unsupported prefixes invalidate the whole rule),
+     so each vendor gets its own block. */
+  .scanner-speed-slider {
+    @apply cursor-pointer;
+  }
+  .scanner-speed-slider::-webkit-slider-runnable-track {
+    @apply h-2 rounded-full bg-white/15;
+  }
+  .scanner-speed-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    @apply appearance-none w-9 h-9 rounded-full bg-brand-red border-2 border-white/80 shadow -mt-3.5;
+  }
+  .scanner-speed-slider::-moz-range-track {
+    @apply h-2 rounded-full bg-white/15;
+  }
+  .scanner-speed-slider::-moz-range-thumb {
+    @apply appearance-none w-9 h-9 rounded-full bg-brand-red border-2 border-white/80 shadow;
+  }
+
   .btn-ghost {
     @apply inline-flex items-center justify-center gap-2
            bg-transparent

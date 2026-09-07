@@ -50,6 +50,19 @@ vi.mock('../contexts/SettingsContext', () => ({
   useSettings: () => ({ t: (key) => key }),
 }))
 
+// Item 8 (docs/plans/scanner-pause-speed-details.md) — a minimal stub, not
+// CardModal's own real rendering (tabs, price data fetching, etc.), just
+// enough to assert on the props DeckCardScanner.jsx passes it. Lives in
+// the same directory as CardItem.jsx (unlike DeckDetail.jsx, in pages/),
+// so the mock target is a relative './CardItem', not '../components/CardItem'.
+vi.mock('./CardItem', () => ({
+  CardModal: ({ card, image, onClose }) => (
+    <div data-testid="card-modal" data-card-id={card?.id} data-image={image}>
+      <button onClick={onClose}>close-card-modal</button>
+    </div>
+  ),
+}))
+
 // Defaults to "confirmed" — most tests exercising decrementRecentScan care
 // about what happens after confirmation, not the confirm step itself (see
 // the dedicated "-" confirmation tests below, which override this).
@@ -141,6 +154,10 @@ describe('DeckCardScanner', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     mockCameraStatus = 'streaming'
+    // outlineSmoothing.js reads/writes real localStorage — clear it so a
+    // slider test's persisted value can't leak into a later, unrelated
+    // test in this file.
+    localStorage.clear()
     stubMediaAndCanvas()
     detectCardQuad.mockResolvedValue(STABLE_QUAD)
     extractCard.mockResolvedValue(fakeCropCanvas())
@@ -1638,5 +1655,155 @@ describe('DeckCardScanner', () => {
 
     expect(screen.getByText('decks.scan.failed')).toBeInTheDocument()
     expect(context2d.clearRect).toHaveBeenCalledWith(0, 0, 640, 480)
+  })
+
+  describe('Settings popup — pause + outline speed (docs/plans/scanner-pause-speed-details.md)', () => {
+    const SHIFTED_QUAD = {
+      topLeftCorner: { x: 110, y: 10 },
+      topRightCorner: { x: 210, y: 10 },
+      bottomLeftCorner: { x: 110, y: 160 },
+      bottomRightCorner: { x: 210, y: 160 },
+    }
+
+    it('opens via the gear button and contains both the pause toggle and the speed slider, closable via its own X', async () => {
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      expect(screen.queryByLabelText('decks.scan.pauseScanning')).not.toBeInTheDocument()
+      fireEvent.click(screen.getByLabelText('decks.scan.settingsTitle'))
+
+      expect(screen.getByLabelText('decks.scan.pauseScanning')).toBeInTheDocument()
+      expect(screen.getByLabelText('decks.scan.outlineTrackingSpeed')).toBeInTheDocument()
+
+      // Modal's own header close button — distinct from the scanner's own
+      // header close button, which shares the 'common.close' label (both
+      // are stubbed identically by the SettingsContext mock).
+      const closeButtons = screen.getAllByLabelText('common.close')
+      fireEvent.click(closeButtons[closeButtons.length - 1])
+      expect(screen.queryByLabelText('decks.scan.pauseScanning')).not.toBeInTheDocument()
+    })
+
+    it('pause toggle suppresses auto-capture but not the manual Scan Now button', async () => {
+      recognizeCard.mockResolvedValue({ _identity_confident: false, matches: [] })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      fireEvent.click(screen.getByLabelText('decks.scan.settingsTitle'))
+      fireEvent.click(screen.getByLabelText('decks.scan.pauseScanning'))
+
+      // Held stable through the full streak while paused — must not
+      // auto-capture (the tick loop itself keeps running: this is what
+      // proves the guard suppresses only the trigger, not detection).
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).not.toHaveBeenCalled()
+
+      // The manual button is the intended way to capture on demand while
+      // paused — deliberately not gated by scanningPaused.
+      fireEvent.click(screen.getByText('decks.scan.scanNow'))
+      await act(async () => {
+        for (let i = 0; i < 10; i++) await Promise.resolve()
+      })
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+    })
+
+    it('resuming a card already held stable through the full streak while paused captures immediately, without needing a fresh streak', async () => {
+      recognizeCard.mockResolvedValue({ _identity_confident: false, matches: [] })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      fireEvent.click(screen.getByLabelText('decks.scan.settingsTitle'))
+      fireEvent.click(screen.getByLabelText('decks.scan.pauseScanning'))
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).not.toHaveBeenCalled()
+
+      // Un-pause without moving the card at all — pausing never touched
+      // stabilityTrackerRef's own streak count, so the very next tick
+      // should already be ready to submit.
+      fireEvent.click(screen.getByLabelText('decks.scan.pauseScanning'))
+      await advanceTicks(1)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+    })
+
+    it('moving the outline-speed slider persists the new index', async () => {
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      fireEvent.click(screen.getByLabelText('decks.scan.settingsTitle'))
+      const slider = screen.getByLabelText('decks.scan.outlineTrackingSpeed')
+      expect(slider).toHaveValue('2') // default index, 0.42 (today's shipped alpha)
+
+      fireEvent.change(slider, { target: { value: '4' } })
+
+      expect(slider).toHaveValue('4')
+      expect(localStorage.getItem('scannerSmoothingSpeedIndex')).toBe('4')
+    })
+
+    it('draws the outline further toward a repositioned card at the default smoothing speed (index 2, alpha 0.42)', async () => {
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(1) // seeds smoothedQuadRef to STABLE_QUAD exactly, no lerp yet
+
+      const context2d = HTMLCanvasElement.prototype.getContext()
+      detectCardQuad.mockResolvedValue(SHIFTED_QUAD)
+      context2d.moveTo.mockClear()
+      await advanceTicks(1)
+
+      // lerp(10, 110, 0.42) = 52, scaled by the overlay canvas's own
+      // width/detectionWidth ratio (640/480 in this stubbed environment).
+      const [x] = context2d.moveTo.mock.calls.at(-1)
+      expect(x).toBeCloseTo(52 * (640 / 480), 5)
+    })
+
+    it('draws the outline further toward a repositioned card at a faster stored smoothing speed (index 4, alpha 0.54)', async () => {
+      localStorage.setItem('scannerSmoothingSpeedIndex', '4')
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(1)
+
+      const context2d = HTMLCanvasElement.prototype.getContext()
+      detectCardQuad.mockResolvedValue(SHIFTED_QUAD)
+      context2d.moveTo.mockClear()
+      await advanceTicks(1)
+
+      // lerp(10, 110, 0.54) = 64 — further along than alpha 0.42's 52
+      // toward the same repositioned card, proving the stored index (not
+      // just the default) actually drives the drawn position.
+      const [x] = context2d.moveTo.mock.calls.at(-1)
+      expect(x).toBeCloseTo(64 * (640 / 480), 5)
+    })
+  })
+
+  describe('Recent-scan thumbnail details (item 8, docs/plans/scanner-pause-speed-details.md)', () => {
+    it('opens CardModal with the actual captured photo for a confidently auto-saved card', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-1',
+      })
+      extractCard.mockResolvedValue(fakeCropCanvas('captured-photo'))
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      fireEvent.click(screen.getByLabelText('decks.scan.viewScanDetails: Pikachu'))
+
+      const modal = screen.getByTestId('card-modal')
+      expect(modal).toHaveAttribute('data-card-id', 'p1')
+      expect(modal).toHaveAttribute('data-image', 'data:image/jpeg;base64,captured-photo')
+
+      fireEvent.click(screen.getByText('close-card-modal'))
+      expect(screen.queryByTestId('card-modal')).not.toBeInTheDocument()
+    })
+
+    it('falls back to catalog art in the detail view for a manual ambiguous-list pick, which has no captured photo left in scope', async () => {
+      recognizeCard.mockResolvedValue({
+        _identity_confident: false,
+        matches: [{ id: 'p2', name: 'Charmander' }],
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+      fireEvent.click(screen.getByText('Charmander'))
+      await act(async () => {
+        for (let i = 0; i < 10; i++) await Promise.resolve()
+      })
+
+      fireEvent.click(screen.getByLabelText('decks.scan.viewScanDetails: Charmander'))
+      const modal = screen.getByTestId('card-modal')
+      expect(modal.getAttribute('data-image')).not.toMatch(/^data:image\/jpeg;base64,/)
+    })
   })
 })

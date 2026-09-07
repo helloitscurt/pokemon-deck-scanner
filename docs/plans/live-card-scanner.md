@@ -1450,6 +1450,20 @@ above required an explicit choice between named alternatives.
 
 # Phase 4: user-configurable scanner tuning
 
+**Status: superseded by a much smaller feature, not built as designed
+below.** See [scanner-pause-speed-details.md](scanner-pause-speed-details.md) —
+what actually shipped is an in-scanner gear-icon popup with a pause
+toggle (`docs/plans/scanner-ux-todos.md` item 10) and a 5-position slider
+for just the outline-tracking-speed constant (`OVERLAY_SMOOTHING_ALPHA`,
+item 9), stored device-locally via `localStorage` only. None of this
+section's account-level `UserSetting` sync, two-layer device/account
+precedence, Fast/Balanced/Careful capture-trigger presets, or the
+diagnostics/auto-save toggles were built — the diagnostics debug block
+this section refers to was separately removed outright (item 6), and the
+capture-trigger constants (stable-hold frame count, tolerance, confidence
+threshold) remain hardcoded, untouched by either the pause toggle or the
+speed slider. Left below for historical context only.
+
 ### At a glance
 
 - **What:** Turn the hardcoded detection/OCR tuning constants (how long a

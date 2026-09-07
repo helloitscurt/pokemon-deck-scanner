@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
-import { AlertTriangle, Camera, Check, Loader2, Minus, Plus, X } from 'lucide-react'
+import { AlertTriangle, Camera, Check, Info, Loader2, Minus, Plus, Settings, X } from 'lucide-react'
 import { matchDeckImage, recognizeCard } from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { useConfirmDialog } from '../contexts/ConfirmDialogContext'
@@ -12,6 +12,13 @@ import { preloadCardOcr, preloadNumberOcr, recognizeCardText, recognizeNumberReg
 import { createStabilityTracker, quadsAreStable } from '../utils/quadStability'
 import { computeNumberBandRect } from '../utils/numberBand'
 import { computeSharpnessVariance, sharpnessVarianceToPercent } from '../utils/imageSharpness'
+import {
+  OVERLAY_SMOOTHING_ALPHA_VALUES,
+  getStoredSmoothingSpeedIndex,
+  setStoredSmoothingSpeedIndex,
+} from '../utils/outlineSmoothing'
+import { CardModal } from './CardItem'
+import Modal from './ui/Modal'
 
 // Real-device tuning, three passes: first (5 frames @ 2% tolerance @
 // 180ms = 900ms dwell) felt slow and twitchy — ordinary jitter from
@@ -118,8 +125,11 @@ function scaleQuad(quad, scaleX, scaleY) {
 // quad more closely (less smoothing, more jitter); lower lags further
 // behind a genuine reposition before catching up. History: 0.35 (initial)
 // lagged noticeably behind the actual card → raised to 0.5, which then
-// read as too jumpy again → settled here, between the two.
-const OVERLAY_SMOOTHING_ALPHA = 0.42
+// read as too jumpy again → settled here, between the two. Now
+// user-adjustable (docs/plans/scanner-pause-speed-details.md) via the
+// scanner's own settings popup — see OVERLAY_SMOOTHING_ALPHA_VALUES in
+// utils/outlineSmoothing.js, index DEFAULT_SMOOTHING_SPEED_INDEX (0.42)
+// preserving this exact history as the shipped default.
 
 function lerpQuad(prev, next, alpha) {
   const lerpPoint = (p, n) => ({ x: p.x + (n.x - p.x) * alpha, y: p.y + (n.y - p.y) * alpha })
@@ -255,21 +265,23 @@ function warningLabel(warning, t) {
 // One thumbnail in the recent-scans stack. Mounts at opacity-0/translated
 // down, then flips to its resting state a frame later — a plain mount
 // effect, not a library, so the newest card visibly slides/fades in at the
-// bottom of the stack rather than just popping into place. The image
-// itself still doubles as a quick-add button (Decision: reuse the exact
-// same confirmCard save path every other confirm uses, rather than a
-// separate lightweight call — see onQuickAdd below) for duplicates
-// (energy cards especially), where scanning each physical copy
-// individually is pure friction. The "+"/"-" now live in a side stepper
-// beside the image instead of a badge overlapping it (a corner bubble was
-// easy to miss as a real tap target and left no room for a matching "-"
-// to remove an over-tapped add) — the image itself is no longer a tap
-// target, so there's exactly one control per action instead of two
-// differently-labelled ways to do the same thing. The stepper also
-// carries the running count once quantity > 1, instead of a new thumbnail
-// per "+" tap (see quickAddRecentScan/bumpRecentScanQuantity) — a card
-// image only ever appears here because it was actually scanned.
-function RecentScanThumb({ scan, collapsing, onQuickAdd, onDecrement, quickAddDisabled, confirming, label, removeLabel, pathLabel }) {
+// bottom of the stack rather than just popping into place. The "+"/"-"
+// live in a side stepper beside the image instead of a badge overlapping
+// it (a corner bubble was easy to miss as a real tap target and left no
+// room for a matching "-" to remove an over-tapped add) — quick-add/
+// remove are the stepper's job, not the image's, so there's exactly one
+// control per action instead of two differently-labelled ways to do the
+// same thing. The stepper also carries the running count once quantity >
+// 1, instead of a new thumbnail per "+" tap (see quickAddRecentScan/
+// bumpRecentScanQuantity) — a card image only ever appears here because
+// it was actually scanned. The image itself IS a tap target again as of
+// item 8 (docs/plans/scanner-pause-speed-details.md) — but for a
+// DIFFERENT action (view details/the real captured photo) than the one
+// it was deliberately stripped of above, so it doesn't reintroduce the
+// "two ways to do the same thing" problem; see the small Info corner
+// badge below for why this one gets an explicit visual affordance the
+// stepper's own buttons don't need.
+function RecentScanThumb({ scan, collapsing, onQuickAdd, onDecrement, onViewDetails, quickAddDisabled, confirming, label, removeLabel, viewDetailsLabel, pathLabel }) {
   const [entered, setEntered] = useState(false)
   // collapsing (mid exit-animation, either RECENT_SCANS_LIMIT overflow or
   // decrementRecentScan hitting quantity 0) must also disable both
@@ -312,17 +324,39 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, onDecrement, quickAddDi
           }}
         >
           <div className="relative block">
-            <img
-              src={scan.image}
-              alt={scan.name}
-              // 3x the original h-10 (40px) — real-device feedback was that
-              // the card needed to actually be readable at a glance, not
-              // just present as a tiny icon.
-              className="h-[120px] w-auto rounded-lg border border-white/25 object-contain shadow-lg"
-            />
+            {/* Tap for card details + the actual captured photo (item 8,
+                docs/plans/scanner-pause-speed-details.md) — a plain <img>
+                with no visual cue was already tried on this exact
+                thumbnail for a DIFFERENT action (quick-add) and moved
+                away from for being easy to miss as a real tap target (see
+                this component's own doc comment above); the small Info
+                badge below, reusing the same corner-badge visual language
+                as the pathLabel badge, is deliberate so this new tap
+                target doesn't repeat that. */}
+            <button
+              type="button"
+              onClick={() => onViewDetails(scan)}
+              disabled={collapsing}
+              aria-label={viewDetailsLabel}
+              className="block rounded-lg focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50 disabled:cursor-not-allowed"
+            >
+              <img
+                src={scan.image}
+                alt={scan.name}
+                // 3x the original h-10 (40px) — real-device feedback was that
+                // the card needed to actually be readable at a glance, not
+                // just present as a tiny icon.
+                className="h-[120px] w-auto rounded-lg border border-white/25 object-contain shadow-lg"
+              />
+            </button>
             {confirming && (
               <span className="absolute inset-0 flex items-center justify-center rounded-lg bg-black/60">
                 <Loader2 size={20} className="animate-spin text-brand-red" />
+              </span>
+            )}
+            {!confirming && (
+              <span className="absolute top-1 left-1 rounded-full bg-black/75 p-1 pointer-events-none">
+                <Info size={11} className="text-white/90" />
               </span>
             )}
             {/* Which recognition path resolved this save (item 4,
@@ -401,7 +435,7 @@ function RecentScanThumb({ scan, collapsing, onQuickAdd, onDecrement, quickAddDi
 // card's auto-save is still in flight), so only the thumbnail actually
 // mid-save should show its own spinner and disable itself; the others
 // stay tappable.
-function RecentScansStack({ scans, collapsingKeys, label, onQuickAdd, onDecrement, quickAddDisabled, confirmingKeys, quickAddLabel, removeLabel, t }) {
+function RecentScansStack({ scans, collapsingKeys, label, onQuickAdd, onDecrement, onViewDetails, quickAddDisabled, confirmingKeys, quickAddLabel, removeLabel, viewDetailsLabel, t }) {
   if (!scans.length) return null
   return (
     <div
@@ -418,10 +452,12 @@ function RecentScansStack({ scans, collapsingKeys, label, onQuickAdd, onDecremen
             collapsing={collapsingKeys.has(scan.key)}
             onQuickAdd={onQuickAdd}
             onDecrement={onDecrement}
+            onViewDetails={onViewDetails}
             quickAddDisabled={quickAddDisabled || isConfirming}
             confirming={isConfirming}
             label={`${quickAddLabel}: ${scan.name}`}
             removeLabel={`${removeLabel}: ${scan.name}`}
+            viewDetailsLabel={`${viewDetailsLabel}: ${scan.name}`}
             pathLabel={pathLabelKey ? t(pathLabelKey) : null}
           />
         )
@@ -565,6 +601,39 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   useEffect(() => {
     if (showErrorPreview) errorPreviewCloseRef.current?.focus()
   }, [showErrorPreview])
+  // docs/plans/scanner-pause-speed-details.md item 10 — suppresses only
+  // the auto-capture trigger (both Path A's stable-hold submit and Path
+  // B's zoom-match auto-save below); detection and the overlay keep
+  // running live so the user can still see positioning feedback while
+  // lining a card up. Momentary, not a device preference — resets every
+  // time the scanner reopens (see the isOpen effect) rather than
+  // persisting, so nobody who never touches the toggle sees any change,
+  // and nobody accidentally leaves their scanner silently paused across
+  // an unrelated later session.
+  const [scanningPaused, setScanningPaused] = useState(false)
+  // Mirrors `scanningPaused` for the tick loops' own setInterval
+  // closures, same reasoning as phaseRef above — reading this via a ref
+  // (not the state directly) means toggling pause doesn't need to tear
+  // down and recreate either interval.
+  const scanningPausedRef = useRef(scanningPaused)
+  useEffect(() => {
+    scanningPausedRef.current = scanningPaused
+  }, [scanningPaused])
+  // Outline-tracking speed (docs/plans/scanner-pause-speed-details.md) —
+  // a device preference, unlike scanningPaused above: lazy-initialized
+  // from localStorage and NOT reset by the isOpen effect, so it survives
+  // the scanner closing and reopening.
+  const [smoothingSpeedIndex, setSmoothingSpeedIndex] = useState(() => getStoredSmoothingSpeedIndex())
+  const smoothingSpeedIndexRef = useRef(smoothingSpeedIndex)
+  useEffect(() => {
+    smoothingSpeedIndexRef.current = smoothingSpeedIndex
+  }, [smoothingSpeedIndex])
+  const [showSettings, setShowSettings] = useState(false)
+  // Which recent-scan entry's detail view (item 8) is open, if any —
+  // reset on isOpen alongside the other transient overlay flags above,
+  // same reasoning as showErrorPreview: a stale "open" shouldn't carry
+  // over into a freshly reopened scanner.
+  const [detailScan, setDetailScan] = useState(null)
   // Last RECENT_SCANS_LIMIT confirmed cards (any save through confirmCard,
   // auto or manual — never a quick-add re-save, see bumpRecentScanQuantity),
   // newest last — see RecentScansStack. collapsingScanKeys names every
@@ -677,6 +746,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
     setErrorCardImage(null)
     setShowErrorPreview(false)
     setConfirmError(null)
+    setScanningPaused(false)
+    setShowSettings(false)
+    setDetailScan(null)
     stabilityTrackerRef.current.reset()
     resetNumberOcrState()
     setPhase('hunting')
@@ -791,7 +863,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   // an energy card, say — still gets two distinct stack entries instead of
   // React treating the second as an update to the first; only the "+"
   // button folds repeats into one thumbnail's count.
-  const addRecentScan = (candidate, decision, resolvedCardId, deckScanStatus, traceId) => {
+  const addRecentScan = (candidate, decision, resolvedCardId, deckScanStatus, traceId, capturedImage = null) => {
     const entry = {
       key: `${candidate.id || 'card'}-${Date.now()}-${Math.random()}`,
       image: resolveCardImageUrl(candidate, 'small'),
@@ -799,6 +871,17 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       // Kept so a stack entry can be quick-added again later (see
       // quickAddRecentScan) without re-deriving it from image/name alone.
       candidate,
+      // The actual photo the camera captured for THIS save (item 8,
+      // docs/plans/scanner-pause-speed-details.md) — distinct from `image`
+      // above (catalog artwork, always present). Only ever set for a
+      // confidently-resolved live capture (Path A's captureAndRecognize
+      // has a real cropCanvas in scope there); a manual ambiguous-list
+      // pick or Path B's zoom-match auto-save have no full-card crop left
+      // by confirm time, so this stays null and the detail view falls
+      // back to catalog art instead. Lives and dies with this entry —
+      // no separate storage/cleanup path, so it's already correctly
+      // discarded whenever recentScans filters the entry out.
+      capturedImage,
       // Which tier resolved this save (see decisionLabelKey) — null for a
       // manual pick from the ambiguous list. Never overwritten by a later
       // quick-add bump, since that badge describes how THIS card was
@@ -874,7 +957,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
   // own call sites — rather than this function inferring it from ambient
   // phase, which could otherwise act on a stale value once concurrent jobs
   // are possible.
-  const confirmCard = async (candidate, key, isAutoSave = false, traceId = null, decision = null, quickAddTarget = null) => {
+  const confirmCard = async (candidate, key, isAutoSave = false, traceId = null, decision = null, quickAddTarget = null, capturedImage = null) => {
     setConfirmingKeys((current) => new Set(current).add(key))
     setConfirmError(null)
     // Whether THIS call will show its own not-in-deck/already-complete
@@ -892,9 +975,13 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       // reads this back to pick the right undo route.
       const deckScanStatus = response?.data?.deck_scan_status
       if (quickAddTarget) {
+        // capturedImage deliberately not forwarded here — it describes how
+        // THIS entry was originally identified (see addRecentScan's own
+        // comment), not the fact that a duplicate copy was just quick-added
+        // with no new photo of its own.
         bumpRecentScanQuantity(quickAddTarget.key, resolvedCardId, deckScanStatus, traceId)
       } else {
-        addRecentScan(candidate, decision, resolvedCardId, deckScanStatus, traceId)
+        addRecentScan(candidate, decision, resolvedCardId, deckScanStatus, traceId, capturedImage)
       }
       if (!hasLiveWarningOverlay) {
         // The fallback flow has no live video to float a warning toast
@@ -1163,7 +1250,14 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
       // same "one interactive result visible at a time" rule already
       // covered for successes by errorOthersStillScanning below.
       if (data?._identity_confident && topCandidate) {
-        const saved = await confirmCard(topCandidate, topCandidate.id || 'auto', true, data.trace_id, data._identity_decision)
+        // capturedImage (item 8, docs/plans/scanner-pause-speed-details.md):
+        // the only confirmCard call site with a real full-card cropCanvas
+        // still in scope — quickAddTarget's own slot (6th param) is passed
+        // explicitly as null to reach this trailing one.
+        const saved = await confirmCard(
+          topCandidate, topCandidate.id || 'auto', true, data.trace_id, data._identity_decision,
+          null, cropCanvas.toDataURL('image/jpeg', 0.7),
+        )
         if (!saved && phaseRef.current !== 'error' && phaseRef.current !== 'ambiguous') {
           setResult(data)
           setPhase('ambiguous')
@@ -1341,7 +1435,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
         // nothing, which would leave a stale outline lingering after a
         // card is actually removed.
         smoothedQuadRef.current = quad
-          ? (smoothedQuadRef.current ? lerpQuad(smoothedQuadRef.current, quad, OVERLAY_SMOOTHING_ALPHA) : quad)
+          ? (smoothedQuadRef.current
+            ? lerpQuad(smoothedQuadRef.current, quad, OVERLAY_SMOOTHING_ALPHA_VALUES[smoothingSpeedIndexRef.current])
+            : quad)
           : null
 
         const overlayScaleX = overlayCanvas.width / detectionWidth
@@ -1369,7 +1465,14 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
         if (matchedRegion) matchedRegion.quad = quad
         const isAwaitingRemoval = Boolean(matchedRegion)
 
-        if (readyToCapture && quad && !isAwaitingRemoval) {
+        // !scanningPausedRef.current: docs/plans/scanner-pause-speed-details.md
+        // item 10 — pausing suppresses only this auto-trigger, not
+        // detection/the overlay above, so positioning feedback stays live
+        // while lining a card up. handleScanNow's own manual submitCapture
+        // call (this same tick's sibling, above) is deliberately NOT
+        // gated here — it's the intended way to fire a capture on demand
+        // while paused.
+        if (readyToCapture && quad && !isAwaitingRemoval && !scanningPausedRef.current) {
           const captureCanvas = captureCanvasRef.current
           captureCanvas.width = video.videoWidth
           captureCanvas.height = video.videoHeight
@@ -1481,11 +1584,15 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
         if (highConfidenceStreakRef.current >= REQUIRED_HIGH_CONFIDENCE_PASSES) {
           // Skip (not queue — a stale number-crop isn't worth acting on
           // once a slot frees up later) when the concurrency cap is
-          // already full. The streak is left intact rather than reset, so
-          // the very next pass — still only ~NUMBER_OCR_INTERVAL_MS away —
-          // retries once a slot has hopefully opened, instead of losing
+          // already full, or scanning is paused (docs/plans/
+          // scanner-pause-speed-details.md item 10 — same "suppress only
+          // the auto-trigger" rule Path A's own submitCapture guard
+          // follows). The streak is left intact rather than reset in
+          // either case, so the very next pass — still only
+          // ~NUMBER_OCR_INTERVAL_MS away — retries once a slot has
+          // hopefully opened (or scanning resumes), instead of losing
           // progress toward the auto-trigger threshold.
-          if (activeJobsRef.current.length < MAX_CONCURRENT_JOBS) {
+          if (activeJobsRef.current.length < MAX_CONCURRENT_JOBS && !scanningPausedRef.current) {
             highConfidenceStreakRef.current = 0
             const snapshot = document.createElement('canvas')
             snapshot.width = cropCanvas.width
@@ -1575,14 +1682,24 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
     >
       <div className="flex items-center justify-between px-4 pt-4 pb-2 flex-shrink-0">
         <p className="text-[10px] text-text-muted uppercase tracking-[0.2em]">{t('decks.scan.title')}</p>
-        <button
-          onClick={handleClose}
-          aria-label={t('common.close')}
-          className="w-9 h-9 rounded-full flex items-center justify-center"
-          style={{ background: 'rgba(255,255,255,0.08)' }}
-        >
-          <X size={18} className="text-text-muted" />
-        </button>
+        <div className="flex items-center gap-2.5">
+          <button
+            onClick={() => setShowSettings(true)}
+            aria-label={t('decks.scan.settingsTitle')}
+            className="w-9 h-9 rounded-full flex items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+            style={{ background: 'rgba(255,255,255,0.08)' }}
+          >
+            <Settings size={18} className="text-text-muted" />
+          </button>
+          <button
+            onClick={handleClose}
+            aria-label={t('common.close')}
+            className="w-9 h-9 rounded-full flex items-center justify-center"
+            style={{ background: 'rgba(255,255,255,0.08)' }}
+          >
+            <X size={18} className="text-text-muted" />
+          </button>
+        </div>
       </div>
 
       {/* Phase 1's only visible sign that background jobs exist at all —
@@ -1656,10 +1773,12 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
                 label={t('decks.scan.recentScans')}
                 onQuickAdd={quickAddRecentScan}
                 onDecrement={decrementRecentScan}
+                onViewDetails={setDetailScan}
                 quickAddDisabled={phase !== 'hunting'}
                 confirmingKeys={confirmingKeys}
                 quickAddLabel={t('decks.scan.quickAdd')}
                 removeLabel={t('decks.scan.removeOne')}
+                viewDetailsLabel={t('decks.scan.viewScanDetails')}
                 t={t}
               />
 
@@ -1957,6 +2076,87 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           />
         </div>
       )}
+
+      {/* Item 8 (docs/plans/scanner-pause-speed-details.md) — reuses the
+          same CardModal/selectedCard pattern DeckDetail.jsx already uses
+          for browsing deck cards, rather than a new detail viewer.
+          `image` falls back to catalog art when this specific scan has no
+          real captured photo (a manual ambiguous-list pick, or Path B's
+          zoom-match — see addRecentScan's own capturedImage comment). */}
+      {detailScan && (
+        <CardModal
+          card={detailScan.candidate}
+          image={detailScan.capturedImage || detailScan.image}
+          onClose={() => setDetailScan(null)}
+          defaultLang={detailScan.candidate.lang || 'en'}
+          initialTab="overview"
+          readOnly
+        />
+      )}
+
+      {/* Settings popup (docs/plans/scanner-pause-speed-details.md,
+          items 10 + Phase 4) — mobileSheet=false and an explicit
+          overlayClassName are both required here, not just one: Modal's
+          mobile path (Sheet) hardcodes z-50 with no override at all, and
+          Modal's own desktop default (z-50) is below this scanner's own
+          z-[200] either way. z-[300] reuses the same tier the
+          error-preview lightbox above already established for "needs to
+          render above the scanner" — the two can never be open
+          simultaneously (the lightbox covers this header entirely while
+          open), so sharing the tier is safe. */}
+      <Modal
+        isOpen={showSettings}
+        onClose={() => setShowSettings(false)}
+        title={t('decks.scan.settingsTitle')}
+        size="sm"
+        mobileSheet={false}
+        overlayClassName="z-[300]"
+      >
+        <div className="p-5 space-y-5">
+          <div className="flex items-center justify-between gap-4">
+            <div>
+              <p className="text-sm font-semibold text-text-primary">{t('decks.scan.pauseScanning')}</p>
+              <p className="text-xs text-text-muted mt-0.5">{t('decks.scan.pauseScanningHint')}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setScanningPaused((current) => !current)}
+              aria-pressed={scanningPaused}
+              aria-label={t('decks.scan.pauseScanning')}
+              className={`relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-200 ${
+                scanningPaused ? 'bg-brand-red' : 'bg-bg-elevated border border-border'
+              }`}
+            >
+              <span
+                className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${
+                  scanningPaused ? 'translate-x-5' : 'translate-x-0'
+                }`}
+              />
+            </button>
+          </div>
+          <div>
+            <p className="text-sm font-semibold text-text-primary mb-2">{t('decks.scan.outlineTrackingSpeed')}</p>
+            <input
+              type="range"
+              min="0"
+              max={OVERLAY_SMOOTHING_ALPHA_VALUES.length - 1}
+              step="1"
+              value={smoothingSpeedIndex}
+              onChange={(event) => {
+                const newIndex = Number(event.target.value)
+                setSmoothingSpeedIndex(newIndex)
+                setStoredSmoothingSpeedIndex(newIndex)
+              }}
+              aria-label={t('decks.scan.outlineTrackingSpeed')}
+              className="scanner-speed-slider w-full h-9 accent-brand-red"
+            />
+            <div className="flex items-center justify-between text-xs text-text-muted mt-1">
+              <span>{t('decks.scan.smootherLabel')}</span>
+              <span>{t('decks.scan.fasterLabel')}</span>
+            </div>
+          </div>
+        </div>
+      </Modal>
     </div>,
     document.body,
   )
