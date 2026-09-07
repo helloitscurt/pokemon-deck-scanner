@@ -1469,9 +1469,9 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
         // item 10 — pausing suppresses only this auto-trigger, not
         // detection/the overlay above, so positioning feedback stays live
         // while lining a card up. handleScanNow's own manual submitCapture
-        // call (this same tick's sibling, above) is deliberately NOT
-        // gated here — it's the intended way to fire a capture on demand
-        // while paused.
+        // call — a separate button handler, not part of this tick loop —
+        // is deliberately NOT gated the same way; it's the intended way to
+        // fire a capture on demand while paused.
         if (readyToCapture && quad && !isAwaitingRemoval && !scanningPausedRef.current) {
           const captureCanvas = captureCanvasRef.current
           captureCanvas.width = video.videoWidth
@@ -1694,7 +1694,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           <button
             onClick={handleClose}
             aria-label={t('common.close')}
-            className="w-9 h-9 rounded-full flex items-center justify-center"
+            className="w-9 h-9 rounded-full flex items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
             style={{ background: 'rgba(255,255,255,0.08)' }}
           >
             <X size={18} className="text-text-muted" />

@@ -1721,6 +1721,46 @@ describe('DeckCardScanner', () => {
       expect(recognizeCard).toHaveBeenCalledTimes(1)
     })
 
+    it('pause also suppresses Path B\'s zoom-match auto-trigger without resetting its own confidence streak', async () => {
+      // Mirrors the Path A pause tests above, but for the separate guard
+      // added at the same time on attemptZoomMatch's own auto-trigger
+      // (DeckCardScanner.jsx's "activeJobsRef.current.length <
+      // MAX_CONCURRENT_JOBS && !scanningPausedRef.current" condition) — a
+      // regression isolated to just that guard wouldn't be caught by the
+      // Path A tests alone.
+      //
+      // detectCardQuad nulled for the same reason the "Path B" describe
+      // block above nulls it in its own beforeEach: advanceNumberOcrTicks's
+      // 700ms fake-timer advances also tick Path A's 90ms loop along the
+      // way, which — left at its default STABLE_QUAD mock — accumulates
+      // its OWN stability streak the whole time pause only suppresses
+      // submission, not counting. Un-pausing then let BOTH paths' guards
+      // clear on the very next tick, so Path A's own captureAndRecognize
+      // (via tryOcrMatch's deck-scoped match tier) called this same mocked
+      // matchDeckImage a second time — a real gotcha this test hit before
+      // this fix, not a hypothetical.
+      detectCardQuad.mockResolvedValue(null)
+      recognizeNumberRegion.mockResolvedValue({ number_local: '25', number_total: '198', confidence: 85 })
+      matchDeckImage.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-zoom-paused',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      fireEvent.click(screen.getByLabelText('decks.scan.settingsTitle'))
+      fireEvent.click(screen.getByLabelText('decks.scan.pauseScanning'))
+
+      await advanceNumberOcrTicks(REQUIRED_HIGH_CONFIDENCE_PASSES)
+      expect(matchDeckImage).not.toHaveBeenCalled()
+
+      // Un-pause without a fresh streak — highConfidenceStreakRef was left
+      // intact while paused, so the very next pass should already fire.
+      fireEvent.click(screen.getByLabelText('decks.scan.pauseScanning'))
+      await advanceNumberOcrTicks(1)
+      expect(matchDeckImage).toHaveBeenCalledTimes(1)
+    })
+
     it('moving the outline-speed slider persists the new index', async () => {
       render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
 

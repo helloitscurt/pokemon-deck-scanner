@@ -255,14 +255,46 @@ just the one currently open.
   `deckInstanceId` the scanner was opened against, plus a UI moment to ask
   the user rather than deciding silently either way.
 
+## 12. Path B's zoom-match auto-trigger can double-capture a card Path A already saved
+
+**Discovered while testing item 10's pause guard** (see a test's own debug
+history in `scanner-pause-speed-details.md`) — real, pre-existing, and
+independent of pause; pause just made it easy to reproduce by letting both
+paths' streaks accumulate simultaneously before releasing them at once.
+
+**Current state:** Path A's own auto-capture trigger checks
+`capturedRegionsRef`/`isAwaitingRemoval` before firing, specifically to
+avoid re-capturing a card its own region tracking already knows about (see
+item 3's "does not re-capture" tests). Path B's `attemptZoomMatch`
+auto-trigger has no equivalent check — its own condition is just
+`activeJobsRef.current.length < MAX_CONCURRENT_JOBS` (`DeckCardScanner.jsx`).
+If a physical card is held in frame long enough for BOTH paths' thresholds
+to be satisfied (Path A's ~720ms stable-hold is normally much faster than
+Path B's `REQUIRED_HIGH_CONFIDENCE_PASSES`-gated streak, so this is more
+likely on a slow/uncertain OCR read, or exactly the pause scenario that
+surfaced it), both can independently fire a confirmCard save for the same
+card.
+
+**Todo:**
+- Decide whether Path B's own trigger should consult
+  `capturedRegionsRef`/`isAwaitingRemoval` the same way Path A's does, or
+  whether a different guard makes more sense given Path B works from a
+  cropped number-region, not the same quad coordinates Path A's own region
+  tracking is keyed on.
+- Needs a regression test proving a card already captured by Path A can't
+  also be captured by Path B's own zoom-match while still held in frame —
+  today's Path A/Path B tests each cover their own trigger in isolation,
+  not this cross-path interaction.
+
 ---
 
 ## Suggested order
 
-**1, 2, 4, 5, 6, 7, 8, 9, and 10 are done.** Remaining: **11**
-(configurable collection-add on re-scan — needs a real design decision on
-the underlying model before any UI work) and **3** (multi-card table
-scanning — still the largest item; the multi-quad contour detection work
-is new and worth prototyping/validating on a real table of cards before
-committing to the capture-trigger and queueing design already sketched
-above).
+**1, 2, 4, 5, 6, 7, 8, 9, and 10 are done.** Remaining: **12** (Path
+A/Path B double-capture risk — newly discovered, real but narrow; worth
+fixing before it surfaces on a real device), **11** (configurable
+collection-add on re-scan — needs a real design decision on the underlying
+model before any UI work), and **3** (multi-card table scanning — still
+the largest item; the multi-quad contour detection work is new and worth
+prototyping/validating on a real table of cards before committing to the
+capture-trigger and queueing design already sketched above).

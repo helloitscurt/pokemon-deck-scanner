@@ -368,3 +368,22 @@ in-memory component state.
 | M-1 | LOW | "Path A auto-save" undersold captured-image scope — a confidently-resolved manual Scan Now tap goes through the identical code path | Item 8 section: clarified explicitly |
 | M-2 | LOW | Un-pausing a card already held stable through the full streak would capture immediately (pause never touches `stabilityTrackerRef`'s streak count) — could read as a bug during manual testing if not called out as intended | Test plan: added as an explicit, expected test case |
 | UI-4 | LOW | Gear + close buttons are distinguished only by icon glyph at small size | Gear icon section: `gap-2.5` instead of the default `gap-2`, flagged for an on-device spacing check |
+
+## Post-implementation review (multi-persona-review + ui-review, applied to commit `7de1f8d`)
+
+A second pass, against the actual shipped code rather than the plan — implementation-only bugs a
+plan-stage review can't catch by construction.
+
+| Tag | Sev | Finding | Addressed in |
+|---|---|---|---|
+| UI-1 | MED | The new gear button got `focus-visible` ring classes; the pre-existing Close button sitting right beside it (same size/style) didn't — a keyboard user tabbing through would see one of two visually-identical circular buttons light up and the other do nothing | Added the same `focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50` classes to the Close button |
+| Q-2 | MED | The pause-toggle's "resumes immediately without a fresh streak" behavior was tested for Path A only — a regression isolated to the parallel guard added on Path B's `attemptZoomMatch` trigger wouldn't have been caught | Added a dedicated Path B test — which itself surfaced item 12 below (see `scanner-ux-todos.md`): had to null `detectCardQuad` to stop Path A's own capture (still running with its default `STABLE_QUAD` mock) from independently firing the same mocked `matchDeckImage`, exactly the double-capture risk item 12 now tracks |
+| M-4 | LOW | A tick-loop comment described `handleScanNow` as "this same tick's sibling, above" — it's a separate button handler, not part of the tick loop itself | Reworded for accuracy |
+| UI-2 | LOW (accepted, not fixed) | The pause toggle's pill-switch markup duplicates `Settings.jsx`'s own `Toggle` component rather than reusing it | Deliberate per this doc's own scope — `Settings.jsx`'s version is a local, unexported component; extracting a shared one for a single new use site wasn't worth the abstraction |
+
+**New finding, not a defect in this diff:** debugging the Q-2 test surfaced a real, pre-existing
+gap — Path B's own auto-trigger never checks `capturedRegionsRef`/`isAwaitingRemoval` the way Path
+A's does, so a card held long enough for both paths' thresholds to be satisfied can be captured
+twice. Independent of pause (pause just made it easy to reproduce). Recorded as
+`scanner-ux-todos.md` item 12 rather than fixed here — out of scope for a pause/slider/details
+change, and deserves its own design pass on how Path B's region-matching should work.
