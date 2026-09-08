@@ -1674,11 +1674,31 @@ describe('DeckCardScanner', () => {
       expect(screen.getByLabelText('decks.scan.pauseScanning')).toBeInTheDocument()
       expect(screen.getByLabelText('decks.scan.outlineTrackingSpeed')).toBeInTheDocument()
 
-      // Modal's own header close button — distinct from the scanner's own
-      // header close button, which shares the 'common.close' label (both
-      // are stubbed identically by the SettingsContext mock).
+      // The panel's own header close button — distinct from the scanner's
+      // own header close button, which shares the 'common.close' label
+      // (both are stubbed identically by the SettingsContext mock).
       const closeButtons = screen.getAllByLabelText('common.close')
       fireEvent.click(closeButtons[closeButtons.length - 1])
+      expect(screen.queryByLabelText('decks.scan.pauseScanning')).not.toBeInTheDocument()
+    })
+
+    it('closes via tapping the transparent backdrop, and does not close on a tap inside the panel itself', async () => {
+      // Regression test for switching off ui/Modal.jsx (which had its own
+      // click-outside-to-close plumbing) to a bespoke non-blocking panel —
+      // this file now owns that interaction itself.
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+      fireEvent.click(screen.getByLabelText('decks.scan.settingsTitle'))
+      expect(screen.getByLabelText('decks.scan.pauseScanning')).toBeInTheDocument()
+
+      // A tap on the pause toggle itself (inside the panel) must not
+      // bubble up and close the whole panel.
+      fireEvent.click(screen.getByLabelText('decks.scan.pauseScanning'))
+      expect(screen.getByLabelText('decks.scan.pauseScanning')).toBeInTheDocument()
+
+      // The settings title text sits in the panel's own header, outside
+      // any interactive control — clicking its containing backdrop (not
+      // the panel) is what should close it.
+      fireEvent.click(screen.getByText('decks.scan.settingsTitle').closest('.fixed.inset-0'))
       expect(screen.queryByLabelText('decks.scan.pauseScanning')).not.toBeInTheDocument()
     })
 

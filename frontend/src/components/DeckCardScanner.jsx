@@ -18,7 +18,6 @@ import {
   setStoredSmoothingSpeedIndex,
 } from '../utils/outlineSmoothing'
 import { CardModal } from './CardItem'
-import Modal from './ui/Modal'
 
 // Real-device tuning, three passes: first (5 frames @ 2% tolerance @
 // 180ms = 900ms dwell) felt slow and twitchy — ordinary jitter from
@@ -2082,7 +2081,13 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           for browsing deck cards, rather than a new detail viewer.
           `image` falls back to catalog art when this specific scan has no
           real captured photo (a manual ambiguous-list pick, or Path B's
-          zoom-match — see addRecentScan's own capturedImage comment). */}
+          zoom-match — see addRecentScan's own capturedImage comment).
+          overlayClassName is required here — CardModal's underlying
+          UnifiedCardDialog defaults to z-50, below this scanner's own
+          z-[200] (verified live: without this, the detail view opened but
+          rendered completely hidden behind the scanner). z-[300] reuses
+          the same tier already established for the settings popup and
+          error-preview lightbox above, for the same reason. */}
       {detailScan && (
         <CardModal
           card={detailScan.candidate}
@@ -2090,73 +2095,93 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           onClose={() => setDetailScan(null)}
           defaultLang={detailScan.candidate.lang || 'en'}
           initialTab="overview"
+          overlayClassName="z-[300]"
           readOnly
         />
       )}
 
       {/* Settings popup (docs/plans/scanner-pause-speed-details.md,
-          items 10 + Phase 4) — mobileSheet=false and an explicit
-          overlayClassName are both required here, not just one: Modal's
-          mobile path (Sheet) hardcodes z-50 with no override at all, and
-          Modal's own desktop default (z-50) is below this scanner's own
-          z-[200] either way. z-[300] reuses the same tier the
-          error-preview lightbox above already established for "needs to
-          render above the scanner" — the two can never be open
-          simultaneously (the lightbox covers this header entirely while
-          open), so sharing the tier is safe. */}
-      <Modal
-        isOpen={showSettings}
-        onClose={() => setShowSettings(false)}
-        title={t('decks.scan.settingsTitle')}
-        size="sm"
-        mobileSheet={false}
-        overlayClassName="z-[300]"
-      >
-        <div className="p-5 space-y-5">
-          <div className="flex items-center justify-between gap-4">
-            <div>
-              <p className="text-sm font-semibold text-text-primary">{t('decks.scan.pauseScanning')}</p>
-              <p className="text-xs text-text-muted mt-0.5">{t('decks.scan.pauseScanningHint')}</p>
+          items 10 + Phase 4) — a small floating panel anchored under the
+          gear button, NOT the shared ui/Modal.jsx (dropped after
+          real-device feedback: Modal's full-screen bg-black/60 backdrop
+          hid the live video/outline entirely behind it, so a slider drag
+          had no visible feedback until the panel closed — the opposite of
+          what an "adjust live and see it move" control needs). The
+          backdrop here is a transparent click-catcher only (closes on
+          outside tap), not a darkening overlay, so the camera feed and
+          the outline stay fully visible while this is open. z-[300]
+          matches the tier already used by the error-preview lightbox and
+          the tap-for-details view above, for the same "above this
+          scanner's own z-[200]" reason. */}
+      {showSettings && (
+        <div className="fixed inset-0 z-[300]" onClick={() => setShowSettings(false)}>
+          <div
+            className="absolute top-16 right-3 w-72 max-w-[calc(100vw-1.5rem)] rounded-2xl border border-white/10 shadow-xl p-5 space-y-5"
+            style={{ background: 'rgba(15,15,26,0.95)' }}
+            onClick={(event) => event.stopPropagation()}
+          >
+            <div className="flex items-center justify-between">
+              <p className="text-sm font-semibold text-text-primary">{t('decks.scan.settingsTitle')}</p>
+              <button
+                type="button"
+                onClick={() => setShowSettings(false)}
+                aria-label={t('common.close')}
+                className="w-7 h-7 rounded-full flex items-center justify-center focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white/50"
+                style={{ background: 'rgba(255,255,255,0.08)' }}
+              >
+                <X size={14} className="text-text-muted" />
+              </button>
             </div>
-            <button
-              type="button"
-              onClick={() => setScanningPaused((current) => !current)}
-              aria-pressed={scanningPaused}
-              aria-label={t('decks.scan.pauseScanning')}
-              className={`relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-200 ${
-                scanningPaused ? 'bg-brand-red' : 'bg-bg-elevated border border-border'
-              }`}
-            >
-              <span
-                className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${
-                  scanningPaused ? 'translate-x-5' : 'translate-x-0'
+            <div className="flex items-center justify-between gap-4">
+              <div>
+                <p className="text-sm font-semibold text-text-primary">{t('decks.scan.pauseScanning')}</p>
+                <p className="text-xs text-text-muted mt-0.5">{t('decks.scan.pauseScanningHint')}</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setScanningPaused((current) => !current)}
+                aria-pressed={scanningPaused}
+                aria-label={t('decks.scan.pauseScanning')}
+                className={`relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-200 ${
+                  scanningPaused ? 'bg-brand-red' : 'bg-bg-elevated border border-border'
                 }`}
+              >
+                <span
+                  className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${
+                    scanningPaused ? 'translate-x-5' : 'translate-x-0'
+                  }`}
+                />
+              </button>
+            </div>
+            <div>
+              <p className="text-sm font-semibold text-text-primary mb-2">{t('decks.scan.outlineTrackingSpeed')}</p>
+              {/* onChange (not a separate "apply" step) fires setSmoothingSpeedIndex
+                  immediately, which smoothingSpeedIndexRef's own sync
+                  effect picks up before the tick loop's very next 90ms
+                  tick — the outline visibly changes speed while this
+                  panel is still open, not just after closing it. */}
+              <input
+                type="range"
+                min="0"
+                max={OVERLAY_SMOOTHING_ALPHA_VALUES.length - 1}
+                step="1"
+                value={smoothingSpeedIndex}
+                onChange={(event) => {
+                  const newIndex = Number(event.target.value)
+                  setSmoothingSpeedIndex(newIndex)
+                  setStoredSmoothingSpeedIndex(newIndex)
+                }}
+                aria-label={t('decks.scan.outlineTrackingSpeed')}
+                className="scanner-speed-slider w-full h-9 accent-brand-red"
               />
-            </button>
-          </div>
-          <div>
-            <p className="text-sm font-semibold text-text-primary mb-2">{t('decks.scan.outlineTrackingSpeed')}</p>
-            <input
-              type="range"
-              min="0"
-              max={OVERLAY_SMOOTHING_ALPHA_VALUES.length - 1}
-              step="1"
-              value={smoothingSpeedIndex}
-              onChange={(event) => {
-                const newIndex = Number(event.target.value)
-                setSmoothingSpeedIndex(newIndex)
-                setStoredSmoothingSpeedIndex(newIndex)
-              }}
-              aria-label={t('decks.scan.outlineTrackingSpeed')}
-              className="scanner-speed-slider w-full h-9 accent-brand-red"
-            />
-            <div className="flex items-center justify-between text-xs text-text-muted mt-1">
-              <span>{t('decks.scan.smootherLabel')}</span>
-              <span>{t('decks.scan.fasterLabel')}</span>
+              <div className="flex items-center justify-between text-xs text-text-muted mt-1">
+                <span>{t('decks.scan.smootherLabel')}</span>
+                <span>{t('decks.scan.fasterLabel')}</span>
+              </div>
             </div>
           </div>
         </div>
-      </Modal>
+      )}
     </div>,
     document.body,
   )

@@ -236,6 +236,12 @@ export function UnifiedCardDialog({
   closeButtonRef,
   children,
   className = '',
+  // Stacking class for the backdrop — default matches every existing
+  // caller's assumption of z-50. Override when this dialog needs to open
+  // from within a surface that already sits above z-50 itself (e.g.
+  // DeckCardScanner.jsx's own full-screen live scanner, at z-[200]) —
+  // same override pattern ui/Modal.jsx already uses for the same reason.
+  overlayClassName = 'z-50',
 }) {
   const { t } = useSettings()
   const internalCloseButtonRef = useRef(null)
@@ -300,7 +306,7 @@ export function UnifiedCardDialog({
   const setNumber = getCardSetNumber(card)
   const dialog = (
     <div
-      className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 p-3 backdrop-blur-sm sm:p-6"
+      className={`fixed inset-0 ${overlayClassName} flex items-center justify-center bg-black/80 p-3 backdrop-blur-sm sm:p-6`}
       onClick={onClose}
     >
       <div
