@@ -195,6 +195,8 @@ Current flow:
 
 Optional diagnostics live in `backend/services/scan_trace.py`. The server must set `SCAN_TRACE_DIR`, and each user must separately enable **Share scanner diagnostics** (off by default). Only opted-in attempts store a sanitized photo plus structured extraction/search/ranking data, including provider and model identifiers. Turning the toggle off stops future traces without deleting old ones; the adjacent delete action removes that user's trace subtree. `SCAN_TRACE_STORAGE_DIR` remains stable when collection is disabled so explicit and account deletion can still find old data. Account deletion writes a revocation marker before cleanup so an in-flight attempt cannot recreate the deleted user's files. No provider key or authentication credential is recorded.
 
+A second, separate scanner flow exists for deck tracking: `frontend/src/components/DeckCardScanner.jsx` runs a continuous, client-side live camera view (jscanify/OpenCV.js detection, client-side OCR, pHash against just the open deck's missing cards) that auto-saves without the capture-then-review-inbox cycle above. See `docs/FRONTEND.md`'s "Live continuous scanner" section and `docs/plans/live-card-scanner.md` for its own design.
+
 ## Frontend State
 
 Current frontend state layers:

@@ -10,6 +10,31 @@ Fork, branch, and submit a focused PR. Add or update tests and docs as needed. E
 
 Be kind. Be clear. Assume good intent. Keep feedback constructive.
 
+## 🍴 About This Fork
+
+This is a fork of the original [PokéCollector](https://github.com/Git-Romer/pokecollector) by [Gilles Romer](https://romerg.de/), with two major features added on top that don't exist upstream:
+
+### 🎯 Preconstructed-deck completion tracking
+
+Search Bulbapedia for a Battle Deck or Battle Academy product, auto-resolve its card list against the catalogue (with manual correction for anything ambiguous), then track scanned/owned copies against it with a missing-cards checklist — several decks tracked independently at once.
+
+**Different use case this unlocks:** rather than just growing a general collection, you can answer "is this specific preconstructed deck still complete?" or "what am I still missing to finish it?" — useful after buying a used deck, before lending one out, or restocking for an event.
+
+### 📷 Live, continuous-scan card scanner
+
+A full-screen live camera view that detects a held card client-side (no server round-trip just to find its outline), recognizes it through a tiered pipeline — client-side OCR, then a deck-scoped image match, then a paid vision API only as a last resort — and auto-saves a confident match with no per-card tap. Also includes a recent-scans stack with quick-add/undo for duplicates and tap-for-details on the actual captured photo, plus a pause toggle and an adjustable outline-tracking-speed slider.
+
+**Different use case this unlocks:** the original app's scanner is capture-then-review — take a photo, wait for recognition, confirm from a candidate list, one card at a time. This fork's live scanner is built for getting through a whole deck or binder in one sitting: hold cards up one after another under the camera and they save themselves, instead of a photo-per-card round trip.
+
+### Also included
+
+- A CI workflow for the backend test suite
+- Assorted nginx cache-header and image-cache-sharing fixes
+
+See [docs/plans/](docs/plans/) for the full design history of both features, and [docs/plans/upstream-contribution.md](docs/plans/upstream-contribution.md) for the (currently deferred) plan to contribute this work back upstream.
+
+---
+
 # 🃏 PokéCollector
 
 > A self-hosted, full-stack Pokémon TCG collection manager for cards, sealed products, binders, analytics, scanning, and multi-user collections.
@@ -77,6 +102,7 @@ Be kind. Be clear. Assume good intent. Keep feedback constructive.
 - Exact-copy quantities in collection binders, with cross-binder allocation limits and total/unique counts
 - Wishlist with Telegram price alerts
 - Preconstructed-deck completion tracking: search Bulbapedia to add a Battle Deck/Battle Academy product, auto-resolve its card list against the catalogue with manual correction for anything ambiguous, then scan cards against it to see what's still missing — track several decks at once, each independently
+- Live, continuous-scan camera mode for deck tracking: hold one card steady for automatic detection and recognition with no per-card tap, a recent-scans stack for quick duplicate add/undo and tap-to-view the actual captured photo, and a settings panel to pause auto-capture (e.g. while lining up a shot) or adjust the detection outline's tracking speed
 
 ### 📈 Prices, Portfolio & Analytics
 - Cardmarket EUR pricing and TCGPlayer USD pricing via TCGdex

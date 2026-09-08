@@ -202,6 +202,10 @@ Rate-limit countdowns distinguish daily quota from ordinary throttling. Photos r
 
 The AI/Card Scanner section in `pages/Settings.jsx` shows **Share scanner diagnostics** as an available control only when the server configured writable `SCAN_TRACE_DIR` storage. The toggle is off by default. Turning it off stops future tracing without deleting existing data; the adjacent confirmed delete button removes all stored diagnostics for the current user and remains available through the stable cleanup path when new collection is disabled.
 
+### Live continuous scanner (deck tracking)
+
+`components/DeckCardScanner.jsx` is a separate, second scanner entry point from `UnifiedCardScanner.jsx` above — a full-screen live camera view opened from `pages/DeckDetail.jsx` to scan cards against one tracked deck instance. Unlike the capture-then-review flow above, it runs a continuous client-side detection loop (jscanify/OpenCV.js via `utils/cardDetection.js`) and auto-saves a confidently recognized card with no per-card tap, through a tiered pipeline: client-side OCR (`utils/cardOcr.js`) and perceptual-hash matching against just this deck's own missing cards first, falling through to the same paid vision API as a last resort. Multiple captures can be in flight at once (`MAX_CONCURRENT_JOBS`); a recent-scans stack shows the last several confirmed cards with per-thumbnail quick-add/undo and a tap-for-details view (the real captured photo when one's available, catalog art otherwise) via the shared `CardModal` (`components/CardItem.jsx`). A settings panel (gear icon in the header) offers a pause toggle — freezes only the auto-capture trigger, not detection/the live outline — and a 5-position slider for how fast the drawn detection outline tracks a moving card (`utils/outlineSmoothing.js`, `localStorage`-persisted). See `docs/plans/live-card-scanner.md`, `docs/plans/scanner-continuous-scan.md`, `docs/plans/scanner-ux-todos.md`, and `docs/plans/scanner-pause-speed-details.md` for the phased design history.
+
 ## API Layer
 
 `frontend/src/api/client.js` is the central Axios client.
