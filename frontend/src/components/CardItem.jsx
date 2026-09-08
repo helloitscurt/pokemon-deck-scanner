@@ -545,7 +545,7 @@ function OwnedVersionRow({ item, onQuantityChange, onRemove, isUpdating, isRemov
   )
 }
 
-export function CardModal({ card, onClose, onEdit, defaultLang = 'en', ownedItems = null, initialTab = 'overview', isForeignTemplate = false, readOnly = false, onCopyTemplate, copyTemplatePending = false, image = null, imageOverlay = null, imageAccessory = null }) {
+export function CardModal({ card, onClose, onEdit, defaultLang = 'en', ownedItems = null, initialTab = 'overview', isForeignTemplate = false, readOnly = false, onCopyTemplate, copyTemplatePending = false, image = null, imageOverlay = null, imageAccessory = null, overlayClassName = 'z-50' }) {
   if (!card || !card.id) return null
 
   const [activeTab, setActiveTab] = useState(initialTab)
@@ -767,6 +767,7 @@ export function CardModal({ card, onClose, onEdit, defaultLang = 'en', ownedItem
       activeTab={activeTab}
       onTabChange={setActiveTab}
       onClose={onClose}
+      overlayClassName={overlayClassName}
     >
       <div className="min-w-0 space-y-4">
 
