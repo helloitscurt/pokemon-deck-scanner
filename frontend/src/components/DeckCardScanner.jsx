@@ -1262,8 +1262,23 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           setPhase('ambiguous')
         }
       } else if (phaseRef.current !== 'error' && phaseRef.current !== 'ambiguous') {
-        setResult(data)
-        setPhase('ambiguous')
+        // Zero candidates at all (not just "not confident enough to
+        // auto-save") routes through the same error UI as a thrown
+        // exception below, rather than the ambiguous picker's own
+        // separate "no match found" text on a bare background — from the
+        // user's side there's nothing to actually pick between either
+        // way, and real-device feedback was that the two different-looking
+        // dead ends for what's functionally the same outcome ("this scan
+        // didn't work, try again") were confusing. The picker still shows
+        // normally whenever there's at least one real candidate.
+        if (data?.matches?.length > 0) {
+          setResult(data)
+          setPhase('ambiguous')
+        } else {
+          setError(t('decks.scan.failed'))
+          setErrorCardImage(cropCanvas ? cropCanvas.toDataURL('image/jpeg', 0.7) : null)
+          setPhase('error')
+        }
       }
     } catch (err) {
       // Only ever unmount-driven now (see the cleanup effect) — there's no
@@ -1716,7 +1731,7 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
           transition, right as a card was being framed. */}
       <div className={`flex items-center justify-center gap-2 px-4 pb-2 flex-shrink-0 ${totalScanning > 0 ? '' : 'invisible'}`}>
         <Loader2 size={14} className="animate-spin text-brand-red" />
-        <p className="text-xs text-text-muted">{totalScanning} {t('decks.scan.scanning')}</p>
+        <p className="text-base text-text-muted">{totalScanning} {t('decks.scan.scanning')}</p>
       </div>
 
       <div className="flex-1 overflow-y-auto px-4 pb-8">
@@ -1840,20 +1855,22 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
                   own primary action (Try Again) — the two phases are
                   mutually exclusive, so there's never a clash.
 
-                  In 'hunting', right-[152px] (not inset-x-0) reserves the
-                  same corner RecentScansStack occupies before centering
-                  Scan Now in what's left — real-device feedback found the
-                  dead-center button actually overlapping the stack's own
-                  "+"/"-" stepper once a scan existed. That row's real width
-                  is ~136px (a 120px-tall thumbnail is ~86px wide at a
-                  standard card's ~0.716 aspect, +6px gap +44px stepper
-                  pill), plus the stack's own right-2 (8px) inset — 144px,
-                  rounded up with a small buffer. 'error' has no such
-                  neighbor (the failed-capture thumbnail below is narrower,
-                  no stepper, and doesn't reach this far in) so Try Again
-                  stays plain dead-center. */}
+                  Same fixed spot for both — an earlier attempt only
+                  shifted 'hunting' left (and only once a scan existed),
+                  which read as the buttons moving between phases; a later
+                  attempt centered both plumb dead-center (inset-x-0), but
+                  real-device testing found that overlapped
+                  RecentScansStack's own "+"/"-" stepper in both phases —
+                  worse than visual crowding, since RecentScansStack's z-10
+                  (this row has no explicit z-index) means the stack wins
+                  hit-testing in the overlap zone: a tap meant for this
+                  button could silently land on "-" instead. right-10 (a
+                  small, fixed, phase-independent nudge — not the earlier
+                  right-[152px], which read as "too far left") clears that
+                  overlap while keeping both buttons in the exact same
+                  place as each other. */}
               {(phase === 'hunting' || phase === 'error') && (
-                <div className={`absolute bottom-3 flex items-center justify-center pointer-events-none ${phase === 'hunting' ? 'left-0 right-[152px]' : 'inset-x-0'}`}>
+                <div className="absolute left-0 right-10 bottom-3 flex items-center justify-center pointer-events-none">
                   {phase === 'hunting' && (
                     <button
                       type="button"

@@ -196,6 +196,20 @@ describe('DeckCardScanner', () => {
     expect(preloadNumberOcr).toHaveBeenCalled()
   })
 
+  it('positions the Scan Now button the same way on a freshly opened scanner as once a recent scan exists', async () => {
+    // Regression test through two prior attempts: first, right-[152px]
+    // applied only once a scan existed, leaving the button in a different
+    // spot on a fresh scanner than a used one; then a plain inset-x-0
+    // dead-center for both, which turned out to overlap RecentScansStack's
+    // stepper in both phases. The fixed left-0/right-10 nudge here is
+    // meant to hold regardless of scan history — see the "auto-saves a
+    // confident match" test below for the same assertion once a scan
+    // actually exists, proving neither state shifts it.
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+    expect(screen.getByText('decks.scan.scanNow').closest('div')).toHaveClass('left-0', 'right-10')
+    expect(screen.getByText('decks.scan.scanNow').closest('div')).not.toHaveClass('right-[152px]', 'inset-x-0')
+  })
+
   it('does not capture before the card has been held steady for the required streak', async () => {
     recognizeCard.mockResolvedValue({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }] })
     render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
@@ -248,10 +262,10 @@ describe('DeckCardScanner', () => {
     // still in the normal hunting view, not bounced anywhere else.
     expect(screen.getByAltText('Pikachu')).toBeInTheDocument()
     expect(screen.getByText('decks.scan.scanNow')).toBeInTheDocument()
-    // Regression: dead-center (inset-x-0) overlapped RecentScansStack's own
-    // "+"/"-" stepper on a real device once a scan existed — Scan Now's
-    // wrapper reserves that corner instead of spanning the full width.
-    expect(screen.getByText('decks.scan.scanNow').closest('div')).toHaveClass('left-0', 'right-[152px]')
+    // Same fixed left-0/right-10 nudge once a scan exists too — see the
+    // "freshly opened" test above for the same invariant with no scans at
+    // all; neither scan history nor phase should move this button.
+    expect(screen.getByText('decks.scan.scanNow').closest('div')).toHaveClass('left-0', 'right-10')
 
     // The loop re-arms once the card is actually removed from frame — not
     // merely once cooldown elapses (see the next test: a still-sitting card
@@ -707,10 +721,11 @@ describe('DeckCardScanner', () => {
       // Card A is still in flight — the error screen should say so rather
       // than reading as if scanning had stopped entirely.
       expect(screen.getByText('decks.scan.errorOthersStillScanning')).toBeInTheDocument()
-      // Unlike Scan Now (see the earlier reservation test), Try Again has
-      // no wide neighbor to dodge — the failed-capture thumbnail is
-      // narrower and carries no stepper — so it stays plain dead-center.
-      expect(screen.getByText('decks.scan.tryAgain').closest('div')).toHaveClass('inset-x-0')
+      // Same fixed left-0/right-10 spot Scan Now uses in 'hunting' — kept
+      // identical across phases deliberately, not re-centered just because
+      // 'error' has a narrower neighbor (the failed-capture thumbnail, no
+      // stepper) than 'hunting' does.
+      expect(screen.getByText('decks.scan.tryAgain').closest('div')).toHaveClass('left-0', 'right-10')
 
       await act(async () => {
         resolveFirst({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }], trace_id: 'trace-first' })
@@ -857,6 +872,32 @@ describe('DeckCardScanner', () => {
     // Nothing else was ever captured in this test — no false "others still
     // scanning" hint when there's really only the one, now-failed job.
     expect(screen.queryByText('decks.scan.errorOthersStillScanning')).not.toBeInTheDocument()
+
+    fireEvent.click(screen.getByText('decks.scan.tryAgain'))
+    expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
+    expect(screen.queryByAltText('')).not.toBeInTheDocument()
+  })
+
+  it('treats a resolved response with zero candidates the same as a thrown failure, not the ambiguous picker', async () => {
+    // Regression test: a genuinely empty match list (recognizeCard/
+    // matchDeckImage resolving successfully but finding nothing at all)
+    // used to fall into the same 'ambiguous' phase as a real candidate
+    // list, rendering a bare "no match found" text block with no
+    // thumbnail — visually and structurally different from the
+    // recognizeCard-*throws* case just above, even though both mean the
+    // same thing to the user ("this scan didn't work, try again"). Real
+    // feedback: the second (error/thumbnail) presentation is preferred,
+    // so a resolved-but-empty result should look identical to a thrown one.
+    recognizeCard.mockResolvedValue({ _identity_confident: false, matches: [] })
+    render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+    await advanceTicks(REQUIRED_STABLE_FRAMES)
+
+    expect(screen.getByText('decks.scan.failed')).toBeInTheDocument()
+    expect(screen.getByAltText('')).toHaveAttribute('src', 'data:image/jpeg;base64,fake')
+    expect(screen.getByText('decks.scan.tryAgain')).toBeInTheDocument()
+    // Not the ambiguous picker's own separate copy/layout.
+    expect(screen.queryByText('decks.scan.noMatch')).not.toBeInTheDocument()
 
     fireEvent.click(screen.getByText('decks.scan.tryAgain'))
     expect(screen.getByText('decks.scan.liveHint')).toBeInTheDocument()
