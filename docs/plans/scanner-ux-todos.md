@@ -213,7 +213,26 @@ settings surface.
 
 ## 11. Configurable collection-add behavior when re-scanning a deck to verify it
 
-**Current state:** every confirmed scan adds to the collection
+**Status: done.** Implemented as a persistent per-deck-instance toggle
+(`DeckInstance.add_to_collection`, default `true`) — Option 1 below, decided
+with the user over the "auto-add everything at deck creation" alternative
+(Option 2), which would have incorrectly assumed every tracked deck is
+already owned complete. The cross-deck lookup idea (last paragraph below) was
+explicitly deferred to a separate task, not part of this change.
+
+Backend: `POST /decks/instances/{id}/settings` persists the toggle;
+`POST /decks/instances/{id}/scans/{card_id}/verify` and its `undo-verify`
+counterpart move deck progress via the existing `register_scan`/
+`unregister_scan` without ever touching `CollectionItem` — the same
+"split the two effects" pattern the app already used in the undo direction
+(`undo_scan` vs. `undo_scan_collection_only`, item 5), applied forward.
+Frontend: a toggle in `DeckDetail.jsx`'s header card; `scanMutation`,
+its inline auto-save Undo button, and `decrementMutation` all branch on the
+deck's *current* `add_to_collection` value (a deliberate simplification —
+this is a rarely-toggled persistent setting, not a per-scan flag).
+`DeckCardScanner.jsx` itself needed no changes.
+
+**Current state (before this change):** every confirmed scan adds to the collection
 (`add_to_collection`, gated by `deck_scan_status` for whether it *also*
 counts toward deck progress — see item 5 — but the collection add itself
 always happens). There's no way to scan a deck purely to verify it's still
@@ -275,26 +294,26 @@ likely on a slow/uncertain OCR read, or exactly the pause scenario that
 surfaced it), both can independently fire a confirmCard save for the same
 card.
 
-**Todo:**
-- Decide whether Path B's own trigger should consult
-  `capturedRegionsRef`/`isAwaitingRemoval` the same way Path A's does, or
-  whether a different guard makes more sense given Path B works from a
-  cropped number-region, not the same quad coordinates Path A's own region
-  tracking is keyed on.
-- Needs a regression test proving a card already captured by Path A can't
-  also be captured by Path B's own zoom-match while still held in frame —
-  today's Path A/Path B tests each cover their own trigger in isolation,
-  not this cross-path interaction.
+**Status: done.** Path B's own `quadInfo.quad` (from `latestQuadRef`) turned
+out to already live in the exact same detection-frame coordinate space
+`capturedRegionsRef`'s entries do — both come from the same Path A tick —
+so Path B's trigger reuses Path A's own `quadsAreStable` check directly,
+rather than a separate mechanism: before firing, it checks whether
+`capturedRegionsRef` already has a region matching `quadInfo.quad`, and
+skips (streak left intact, same as the existing paused/job-full cases) if
+so. No quad at all — Path B's own main case, zoomed in past a card's
+edges — has nothing to check against and is unaffected. A cross-path
+regression test proves a card Path A already captured (and is still
+holding a pending region for) can't also be captured by Path B's own
+zoom-match while still held in frame; mutation-tested (removing the guard
+turns the test red).
 
 ---
 
 ## Suggested order
 
-**1, 2, 4, 5, 6, 7, 8, 9, and 10 are done.** Remaining: **12** (Path
-A/Path B double-capture risk — newly discovered, real but narrow; worth
-fixing before it surfaces on a real device), **11** (configurable
-collection-add on re-scan — needs a real design decision on the underlying
-model before any UI work), and **3** (multi-card table scanning — still
-the largest item; the multi-quad contour detection work is new and worth
-prototyping/validating on a real table of cards before committing to the
-capture-trigger and queueing design already sketched above).
+**1, 2, 4, 5, 6, 7, 8, 9, 10, 11, and 12 are done.** Remaining: **3**
+(multi-card table scanning — still the largest item; the multi-quad contour
+detection work is new and worth prototyping/validating on a real table of
+cards before committing to the capture-trigger and queueing design already
+sketched above).

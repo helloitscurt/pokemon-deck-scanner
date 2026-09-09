@@ -595,6 +595,9 @@ def _run_migrations(conn):
         "CREATE INDEX IF NOT EXISTS ix_deck_cards_deck_id ON deck_cards(deck_id)",
         "CREATE INDEX IF NOT EXISTS ix_deck_instances_user_id ON deck_instances(user_id)",
         "CREATE INDEX IF NOT EXISTS ix_scanned_cards_deck_instance_id ON scanned_cards(deck_instance_id)",
+        # v61: per-deck toggle for whether scans add to the general collection
+        # or only verify/track deck progress.
+        "ALTER TABLE deck_instances ADD COLUMN IF NOT EXISTS add_to_collection BOOLEAN NOT NULL DEFAULT TRUE",
     ]
     for stmt in migrations:
         try:

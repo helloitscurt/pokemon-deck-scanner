@@ -682,6 +682,7 @@ class DeckInstance(Base):
     deck_id = Column(Integer, ForeignKey("decks.id", ondelete="CASCADE"), nullable=False)
     user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False)
     created_at = Column(DateTime, default=func.now())
+    add_to_collection = Column(Boolean, nullable=False, default=True)
 
     deck = relationship("Deck")
     scanned_cards = relationship("ScannedCard", back_populates="instance", cascade="all, delete-orphan")

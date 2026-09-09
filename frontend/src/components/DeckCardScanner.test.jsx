@@ -1698,6 +1698,59 @@ describe('DeckCardScanner', () => {
     expect(context2d.clearRect).toHaveBeenCalledWith(0, 0, 640, 480)
   })
 
+  describe('Cross-path double-capture guard (item 12, scanner-ux-todos.md)', () => {
+    it('does not let Path B zoom-match a card Path A already captured and is still holding a pending region for', async () => {
+      // Deliberately outside the "Path B" describe block above, which
+      // nulls detectCardQuad in its own beforeEach specifically to keep
+      // Path A out of the picture — this test needs the opposite: a real
+      // quad Path A can actually capture, at the SAME position Path B's
+      // own number-crop reads from (both come from the same
+      // latestQuadRef/detectionWidth/detectionHeight Path A's own tick
+      // sets), so the two paths' triggers can genuinely collide.
+      let resolvePathA
+      recognizeCard.mockImplementationOnce(() => new Promise((resolve) => { resolvePathA = resolve }))
+      recognizeNumberRegion.mockResolvedValue({ number_local: '25', number_total: '198', confidence: 85 })
+      // Path A's OWN capture also calls matchDeckImage internally (its
+      // free deck-scoped tier, tryOcrMatch, tried before ever reaching the
+      // paid recognizeCard below) — queued non-confident just for that
+      // first call, so Path A actually falls through to the pending
+      // recognizeCard instead of auto-saving via the free tier. The
+      // persistent confident default afterward is what Path B's own later
+      // call would get IF the guard failed to block it.
+      matchDeckImage.mockResolvedValueOnce({ _identity_confident: false, matches: [] })
+      matchDeckImage.mockResolvedValue({
+        _identity_confident: true,
+        matches: [{ id: 'p1', name: 'Pikachu' }],
+        trace_id: 'trace-would-be-duplicate',
+      })
+      render(<DeckCardScanner isOpen onClose={vi.fn()} onConfirm={onConfirm} deckInstanceId="3" />)
+
+      // Path A captures the card and is still waiting on its own
+      // (deliberately unresolved) recognizeCard call — capturedRegionsRef
+      // still holds this exact position's region. matchDeckImage was
+      // already called once here too, for Path A's own free-tier attempt
+      // (tryOcrMatch) — cleared below so the next assertion is purely
+      // about whether Path B's own window adds a SECOND call, not about
+      // the total count including Path A's own legitimate one.
+      await advanceTicks(REQUIRED_STABLE_FRAMES)
+      expect(recognizeCard).toHaveBeenCalledTimes(1)
+      matchDeckImage.mockClear()
+
+      // Path B's own loop keeps running throughout (its 700ms advances
+      // also tick Path A's 90ms interval along the way, re-reading the
+      // same still-held STABLE_QUAD each time) and reaches its own
+      // auto-trigger streak — without the guard, this would fire its own
+      // independent save for the identical physical card.
+      await advanceNumberOcrTicks(REQUIRED_HIGH_CONFIDENCE_PASSES)
+      expect(matchDeckImage).not.toHaveBeenCalled()
+
+      await act(async () => {
+        resolvePathA({ _identity_confident: true, matches: [{ id: 'p1', name: 'Pikachu' }], trace_id: 'trace-a' })
+        for (let i = 0; i < 10; i++) await Promise.resolve()
+      })
+    })
+  })
+
   describe('Settings popup — pause + outline speed (docs/plans/scanner-pause-speed-details.md)', () => {
     const SHIFTED_QUAD = {
       topLeftCorner: { x: 110, y: 10 },

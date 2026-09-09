@@ -3,7 +3,10 @@ import { useParams, useNavigate } from 'react-router-dom'
 import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query'
 import { AlertTriangle, ArrowLeft, Camera, RotateCcw, Trash2 } from 'lucide-react'
 import toast from 'react-hot-toast'
-import { getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection, undoLastScan, undoLastScanCollectionOnly } from '../api/client'
+import {
+  getDeckInstance, resetDeckInstance, deleteDeckInstance, addToCollection, undoLastScan, undoLastScanCollectionOnly,
+  updateDeckInstanceSettings, verifyDeckScan, undoVerifyDeckScan,
+} from '../api/client'
 import { useSettings } from '../contexts/SettingsContext'
 import { useConfirmDialog } from '../contexts/ConfirmDialogContext'
 import { resolveCardImageUrl } from '../utils/imageUrl'
@@ -62,6 +65,17 @@ export default function DeckDetail() {
     onError: () => toast.error(t('decks.detail.deleteFailed')),
   })
 
+  // docs/plans/scanner-ux-todos.md item 11 — a persistent per-deck toggle for
+  // whether a scan adds to the general collection (default) or only
+  // verifies/tracks deck progress, for re-scanning an already-built deck to
+  // confirm its cards are still physically present without adding
+  // duplicates every pass.
+  const settingsMutation = useMutation({
+    mutationFn: (addToCollectionValue) => updateDeckInstanceSettings(instanceId, { add_to_collection: addToCollectionValue }),
+    onSuccess: () => invalidate(),
+    onError: () => toast.error(t('decks.detail.settingsUpdateFailed')),
+  })
+
   const handleReset = async () => {
     const confirmed = await confirmDialog({
       title: t('decks.detail.reset'),
@@ -94,7 +108,11 @@ export default function DeckDetail() {
   // traceId (only present when the user has scan diagnostics enabled) is
   // just carried through to the undo call below, for correlation.
   const scanMutation = useMutation({
-    mutationFn: ({ candidate }) => addToCollection({ card_id: candidate.id, quantity: 1, deck_instance_id: Number(instanceId) }),
+    mutationFn: ({ candidate }) => (
+      data.add_to_collection === false
+        ? verifyDeckScan(Number(instanceId), candidate.id, 1)
+        : addToCollection({ card_id: candidate.id, quantity: 1, deck_instance_id: Number(instanceId) })
+    ),
     onSuccess: (response, { candidate, isAutoSave, traceId, hasLiveWarningOverlay }) => {
       invalidate()
       // deck_scan_status (see backend services/deck_progress.py's SCAN_*
@@ -163,7 +181,9 @@ export default function DeckDetail() {
               undoRequested = true
               toast.dismiss(toastInstance.id)
               try {
-                await undoLastScan(instanceId, cardId, traceId)
+                await (data.add_to_collection === false
+                  ? undoVerifyDeckScan(instanceId, cardId, traceId)
+                  : undoLastScan(instanceId, cardId, traceId))
                 invalidate()
                 toast.success(t('decks.scan.undone'))
               } catch {
@@ -190,11 +210,15 @@ export default function DeckDetail() {
   // lets the user try to remove either way, so this is the one place that
   // has to pick the right route rather than gating the button on it.
   const decrementMutation = useMutation({
-    mutationFn: ({ cardId, traceId, deckScanStatus }) => (
-      deckScanStatus === 'counted'
+    mutationFn: ({ cardId, traceId, deckScanStatus }) => {
+      // Verify-only mode never has a CollectionItem side to reverse — always
+      // undo-verify regardless of deckScanStatus, unlike the collection-mode
+      // branch below which depends on it.
+      if (data.add_to_collection === false) return undoVerifyDeckScan(instanceId, cardId, traceId)
+      return deckScanStatus === 'counted'
         ? undoLastScan(instanceId, cardId, traceId)
         : undoLastScanCollectionOnly(instanceId, cardId, traceId)
-    ),
+    },
     onSuccess: () => invalidate(),
     onError: () => toast.error(t('decks.scan.removeFailed')),
   })
@@ -264,6 +288,28 @@ export default function DeckDetail() {
           <div className="hp-bar-track">
             <div className={`hp-bar-fill ${data.scanned_count > 0 ? hpClass : ''}`} style={{ width: `${progress}%` }} />
           </div>
+        </div>
+
+        <div className="flex items-center justify-between gap-4 mt-4">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-text-primary">{t('decks.detail.addToCollectionToggle')}</p>
+            <p className="text-xs text-text-muted mt-0.5">{t('decks.detail.addToCollectionToggleHint')}</p>
+          </div>
+          <button
+            type="button"
+            onClick={() => settingsMutation.mutate(!(data.add_to_collection !== false))}
+            aria-pressed={data.add_to_collection !== false}
+            aria-label={t('decks.detail.addToCollectionToggle')}
+            className={`relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-200 ${
+              data.add_to_collection !== false ? 'bg-brand-red' : 'bg-bg-elevated border border-border'
+            }`}
+          >
+            <span
+              className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${
+                data.add_to_collection !== false ? 'translate-x-5' : 'translate-x-0'
+              }`}
+            />
+          </button>
         </div>
 
         <div className="flex flex-wrap gap-2 mt-4">

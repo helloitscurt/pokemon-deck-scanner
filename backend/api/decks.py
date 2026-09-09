@@ -13,10 +13,11 @@ from database import get_db
 from models import Card, Deck, DeckCard, DeckInstance, ScannedCard, User
 from schemas import (
     CollectionItemCreate, DeckCreate, DeckInstanceDetailResponse, DeckInstanceResponse, DeckCardResponse,
+    DeckInstanceSettingsUpdate, DeckScanVerifyResponse,
     DeckSearchResult, DeckParseRequest, DeckParseResponse, DeckParseBlock, DeckParseEntry,
 )
 from services import bulbapedia
-from services.deck_progress import unregister_scan
+from services.deck_progress import register_scan, unregister_scan
 from services.phash import download_candidate_images, phash_best_match
 from services.scan_storage import MAX_FILE_BYTES, ScanUploadError, read_limited_upload, sanitize_image_bytes
 from services.scan_trace import create_scan_trace, record_scan_reversed
@@ -72,6 +73,7 @@ def _instance_response(db: Session, instance: DeckInstance, detail: bool = False
         "scanned_count": scanned_count,
         "progress": round((scanned_count / total_count * 100) if total_count else 0, 1),
         "is_complete": total_count > 0 and scanned_count == total_count,
+        "add_to_collection": instance.add_to_collection,
     }
     if detail:
         payload["cards"] = card_rows
@@ -497,6 +499,80 @@ def reset_deck_instance(
         raise HTTPException(status_code=404, detail="Deck instance not found")
     db.query(ScannedCard).filter(ScannedCard.deck_instance_id == instance.id).delete()
     db.commit()
+    return _instance_response(db, instance, detail=True)
+
+
+@router.post("/instances/{instance_id}/settings", response_model=DeckInstanceDetailResponse)
+def update_deck_instance_settings(
+    instance_id: int,
+    settings: DeckInstanceSettingsUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Persistent per-deck toggle (docs/plans/scanner-ux-todos.md item 11) for
+    whether a scan against this instance adds to the general collection
+    (default, today's behavior) or only verifies/tracks deck progress via the
+    verify/undo-verify routes below, without ever touching CollectionItem."""
+    instance = _get_owned_instance(db, instance_id, current_user.id)
+    instance.add_to_collection = settings.add_to_collection
+    db.commit()
+    return _instance_response(db, instance, detail=True)
+
+
+@router.post("/instances/{instance_id}/scans/{card_id}/verify", response_model=DeckScanVerifyResponse)
+def verify_deck_scan(
+    instance_id: int,
+    card_id: str,
+    # Plain default, not Query(default=1): this route is called directly
+    # (bypassing FastAPI's own request handling) by tests in this file, and
+    # Query(default=1) stays a truthy sentinel object rather than 1 when
+    # called that way — same reasoning as undo_scan's trace_id above.
+    quantity: int = 1,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Count a scan toward this deck instance's progress ONLY — the
+    verify-only counterpart to add_to_collection's always-increment-the-
+    collection behavior (api/collection.py), for re-scanning an already-built
+    deck to confirm its cards are still physically present without adding
+    duplicates to the general collection. Never creates or touches a
+    CollectionItem row.
+    """
+    _get_owned_instance(db, instance_id, current_user.id)
+    status, expected_quantity = register_scan(db, current_user.id, instance_id, card_id, quantity)
+    return DeckScanVerifyResponse(
+        card_id=card_id,
+        deck_scan_status=status,
+        deck_scan_quantity=expected_quantity,
+    )
+
+
+@router.post("/instances/{instance_id}/scans/{card_id}/undo-verify", response_model=DeckInstanceDetailResponse)
+def undo_verify_deck_scan(
+    instance_id: int,
+    card_id: str,
+    # Same round-tripped, best-effort diagnostics field as undo_scan's own
+    # trace_id — see its docstring.
+    trace_id: str | None = None,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """Reverse one verify_deck_scan call. Mirrors undo_scan's shape but only
+    ever touches deck progress — there is no CollectionItem side to this
+    scan at all, so unlike undo_scan there's nothing to decrement there.
+    """
+    instance = _get_owned_instance(db, instance_id, current_user.id)
+
+    reversed_progress = unregister_scan(db, current_user.id, instance_id, card_id)
+    if not reversed_progress:
+        raise HTTPException(status_code=404, detail="No matching scan found to undo")
+    db.commit()
+
+    try:
+        record_scan_reversed(current_user.id, trace_id)
+    except Exception:
+        logger.exception("Failed to mark scan trace %s as undone", trace_id)
+
     return _instance_response(db, instance, detail=True)
 
 

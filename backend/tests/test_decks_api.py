@@ -15,6 +15,9 @@ try:
         reset_deck_instance,
         undo_scan,
         undo_scan_collection_only,
+        undo_verify_deck_scan,
+        update_deck_instance_settings,
+        verify_deck_scan,
     )
     from database import Base
     from models import Card, CollectionItem, Deck, DeckCard, DeckInstance, ScannedCard, User
@@ -23,6 +26,7 @@ try:
         CollectionItemCreate,
         DeckCardEntry,
         DeckCreate,
+        DeckInstanceSettingsUpdate,
     )
     from services.deck_progress import register_scan, unregister_scan
     API_TEST_DEPS_AVAILABLE = True
@@ -644,6 +648,211 @@ class UndoScanCollectionOnlyTests(unittest.TestCase):
             undo_scan_collection_only(instance.id, self.card_c.id, current_user=self.user, db=self.db)
 
         mock_record.assert_called_once_with(self.user.id, None)
+
+
+@unittest.skipUnless(API_TEST_DEPS_AVAILABLE, "FastAPI/SQLAlchemy are not installed in this lightweight test environment")
+class DeckInstanceSettingsTests(unittest.TestCase):
+    """docs/plans/scanner-ux-todos.md item 11 — the persistent per-deck
+    toggle for whether a scan adds to the general collection."""
+
+    def setUp(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        self.db = Session()
+        self.user = User(username="ash", hashed_password="x", role="trainer", is_active=True)
+        self.other_user = User(username="misty", hashed_password="x", role="trainer", is_active=True)
+        self.card_a = Card(id="sv1-1_en", tcg_card_id="sv1-1", name="Sprigatito", set_id="sv1", number="1", lang="en")
+        self.db.add_all([self.user, self.other_user, self.card_a])
+        self.db.commit()
+        self.db.refresh(self.user)
+        self.db.refresh(self.other_user)
+
+    def tearDown(self):
+        self.db.close()
+
+    def _create_deck(self, user=None):
+        return create_deck(
+            DeckCreate(
+                name="Test Deck", product_type="battle_deck",
+                source_url="https://bulbapedia.bulbagarden.net/wiki/Test_Deck",
+                cards=[DeckCardEntry(card_id=self.card_a.id, expected_quantity=1)],
+            ),
+            current_user=user or self.user,
+            db=self.db,
+        )
+
+    def test_defaults_to_true_preserving_todays_behavior(self):
+        instance = self._create_deck()
+        self.assertTrue(instance.add_to_collection)
+
+    def test_persists_the_toggle(self):
+        instance = self._create_deck()
+        updated = update_deck_instance_settings(
+            instance.id, DeckInstanceSettingsUpdate(add_to_collection=False),
+            current_user=self.user, db=self.db,
+        )
+        self.assertFalse(updated.add_to_collection)
+        refetched = get_deck_instance(instance.id, current_user=self.user, db=self.db)
+        self.assertFalse(refetched.add_to_collection)
+
+    def test_rejects_another_users_instance(self):
+        instance = self._create_deck(user=self.user)
+        with self.assertRaises(HTTPException):
+            update_deck_instance_settings(
+                instance.id, DeckInstanceSettingsUpdate(add_to_collection=False),
+                current_user=self.other_user, db=self.db,
+            )
+
+
+@unittest.skipUnless(API_TEST_DEPS_AVAILABLE, "FastAPI/SQLAlchemy are not installed in this lightweight test environment")
+class VerifyDeckScanTests(unittest.TestCase):
+    """verify_deck_scan is the verify-only counterpart to add_to_collection:
+    it must move deck progress exactly like register_scan (same three
+    outcomes) while NEVER creating or touching a CollectionItem row."""
+
+    def setUp(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        self.db = Session()
+        self.user = User(username="ash", hashed_password="x", role="trainer", is_active=True)
+        self.other_user = User(username="misty", hashed_password="x", role="trainer", is_active=True)
+        self.card_a = Card(id="sv1-1_en", tcg_card_id="sv1-1", name="Sprigatito", set_id="sv1", number="1", lang="en")
+        self.card_c = Card(id="sv1-3_en", tcg_card_id="sv1-3", name="Meowscarada", set_id="sv1", number="3", lang="en")
+        self.db.add_all([self.user, self.other_user, self.card_a, self.card_c])
+        self.db.commit()
+        self.db.refresh(self.user)
+        self.db.refresh(self.other_user)
+
+    def tearDown(self):
+        self.db.close()
+
+    def _create_deck(self, user=None):
+        # card_a only, expected_quantity 1 — card_c is deliberately never
+        # part of this template, for the not_in_deck case below.
+        return create_deck(
+            DeckCreate(
+                name="Test Deck", product_type="battle_deck",
+                source_url="https://bulbapedia.bulbagarden.net/wiki/Test_Deck",
+                cards=[DeckCardEntry(card_id=self.card_a.id, expected_quantity=1)],
+            ),
+            current_user=user or self.user,
+            db=self.db,
+        )
+
+    def test_counted_scan_moves_deck_progress_without_touching_collection(self):
+        instance = self._create_deck()
+        result = verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+        self.assertEqual(result.deck_scan_status, "counted")
+        self.assertIsNone(result.deck_scan_quantity)
+        self.assertEqual(self.db.query(CollectionItem).count(), 0)
+        progress = get_deck_instance(instance.id, current_user=self.user, db=self.db)
+        self.assertEqual(progress.scanned_count, 1)
+
+    def test_already_complete_scan_reports_status_without_touching_collection(self):
+        instance = self._create_deck()
+        verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+        result = verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+        self.assertEqual(result.deck_scan_status, "already_complete")
+        self.assertEqual(result.deck_scan_quantity, 1)
+        self.assertEqual(self.db.query(CollectionItem).count(), 0)
+
+    def test_not_in_deck_scan_reports_status_without_touching_collection(self):
+        instance = self._create_deck()
+        result = verify_deck_scan(instance.id, self.card_c.id, current_user=self.user, db=self.db)
+        self.assertEqual(result.deck_scan_status, "not_in_deck")
+        self.assertIsNone(result.deck_scan_quantity)
+        self.assertEqual(self.db.query(CollectionItem).count(), 0)
+
+    def test_rejects_another_users_instance(self):
+        instance = self._create_deck(user=self.user)
+        with self.assertRaises(HTTPException):
+            verify_deck_scan(instance.id, self.card_a.id, current_user=self.other_user, db=self.db)
+
+
+@unittest.skipUnless(API_TEST_DEPS_AVAILABLE, "FastAPI/SQLAlchemy are not installed in this lightweight test environment")
+class UndoVerifyDeckScanTests(unittest.TestCase):
+    def setUp(self):
+        engine = create_engine("sqlite:///:memory:")
+        Base.metadata.create_all(engine)
+        Session = sessionmaker(bind=engine)
+        self.db = Session()
+        self.user = User(username="ash", hashed_password="x", role="trainer", is_active=True)
+        self.other_user = User(username="misty", hashed_password="x", role="trainer", is_active=True)
+        self.card_a = Card(id="sv1-1_en", tcg_card_id="sv1-1", name="Sprigatito", set_id="sv1", number="1", lang="en")
+        self.card_b = Card(id="sv1-2_en", tcg_card_id="sv1-2", name="Floragato", set_id="sv1", number="2", lang="en")
+        self.db.add_all([self.user, self.other_user, self.card_a, self.card_b])
+        self.db.commit()
+        self.db.refresh(self.user)
+        self.db.refresh(self.other_user)
+
+    def tearDown(self):
+        self.db.close()
+
+    def _create_deck(self, user=None):
+        return create_deck(
+            DeckCreate(
+                name="Test Deck", product_type="battle_deck",
+                source_url="https://bulbapedia.bulbagarden.net/wiki/Test_Deck",
+                cards=[
+                    DeckCardEntry(card_id=self.card_a.id, expected_quantity=1),
+                    DeckCardEntry(card_id=self.card_b.id, expected_quantity=2),
+                ],
+            ),
+            current_user=user or self.user,
+            db=self.db,
+        )
+
+    def test_reverses_deck_progress_only(self):
+        instance = self._create_deck()
+        verify_deck_scan(instance.id, self.card_b.id, current_user=self.user, db=self.db)
+        verify_deck_scan(instance.id, self.card_b.id, current_user=self.user, db=self.db)  # scanned_quantity 2
+
+        result = undo_verify_deck_scan(instance.id, self.card_b.id, current_user=self.user, db=self.db)
+
+        card_b_row = next(c for c in result.cards if c.card_id == self.card_b.id)
+        self.assertEqual(card_b_row.scanned_quantity, 1)
+        self.assertEqual(self.db.query(CollectionItem).count(), 0)
+
+    def test_deletes_the_row_at_zero(self):
+        instance = self._create_deck()
+        verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+
+        undo_verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+
+        self.assertIsNone(self.db.query(ScannedCard).filter(
+            ScannedCard.deck_instance_id == instance.id, ScannedCard.card_id == self.card_a.id,
+        ).first())
+
+    def test_rejects_when_no_matching_scan_exists(self):
+        instance = self._create_deck()
+        with self.assertRaises(HTTPException):
+            undo_verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+
+    def test_rejects_another_users_instance(self):
+        instance = self._create_deck(user=self.user)
+        verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+        with self.assertRaises(HTTPException):
+            undo_verify_deck_scan(instance.id, self.card_a.id, current_user=self.other_user, db=self.db)
+
+    def test_passes_trace_id_through_to_scan_trace_when_given(self):
+        instance = self._create_deck()
+        verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+
+        with patch("api.decks.record_scan_reversed") as mock_record:
+            undo_verify_deck_scan(instance.id, self.card_a.id, trace_id="abc123def456", current_user=self.user, db=self.db)
+
+        mock_record.assert_called_once_with(self.user.id, "abc123def456")
+
+    def test_undo_succeeds_even_if_recording_the_trace_reversal_fails(self):
+        instance = self._create_deck()
+        verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+
+        with patch("api.decks.record_scan_reversed", side_effect=RuntimeError("boom")):
+            result = undo_verify_deck_scan(instance.id, self.card_a.id, current_user=self.user, db=self.db)
+
+        self.assertEqual(result.scanned_count, 0)
 
 
 if __name__ == "__main__":

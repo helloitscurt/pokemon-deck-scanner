@@ -596,6 +596,7 @@ class DeckInstanceResponse(BaseModel):
     scanned_count: int = 0
     progress: float = 0
     is_complete: bool = False
+    add_to_collection: bool = True
 
     class Config:
         from_attributes = True
@@ -603,6 +604,16 @@ class DeckInstanceResponse(BaseModel):
 
 class DeckInstanceDetailResponse(DeckInstanceResponse):
     cards: List[DeckCardResponse] = Field(default_factory=list)
+
+
+class DeckInstanceSettingsUpdate(BaseModel):
+    add_to_collection: bool
+
+
+class DeckScanVerifyResponse(BaseModel):
+    card_id: str
+    deck_scan_status: Optional[str] = None
+    deck_scan_quantity: Optional[int] = None
 
 
 class DeckSearchResult(BaseModel):

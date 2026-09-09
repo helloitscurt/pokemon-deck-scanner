@@ -449,6 +449,9 @@ const en = {
       deleted: 'Deck removed from your tracked decks.',
       deleteFailed: 'Failed to remove this deck.',
       removeConfirm: 'Stop tracking this deck? Your scan progress will be lost.',
+      addToCollectionToggle: 'Add scans to collection',
+      addToCollectionToggleHint: 'Turn off to verify this deck without adding duplicate cards to your collection.',
+      settingsUpdateFailed: 'Failed to update this deck’s settings.',
     },
     scan: {
       title: 'Scan a card',

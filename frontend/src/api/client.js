@@ -465,6 +465,26 @@ export const undoLastScanCollectionOnly = (instanceId, cardId, traceId) =>
     params: traceId ? { trace_id: traceId } : undefined,
   }).then(r => r.data)
 
+// Persistent per-deck toggle (docs/plans/scanner-ux-todos.md item 11) for
+// whether a scan adds to the general collection, or only verifies/tracks
+// deck progress via the two routes below without ever touching CollectionItem.
+export const updateDeckInstanceSettings = (instanceId, settings) =>
+  api.post(`/decks/instances/${instanceId}/settings`, settings).then(r => r.data)
+
+// Verify-only counterpart to addToCollection: moves deck progress but never
+// creates or touches a CollectionItem row. Not unwrapping .data here, same
+// as addToCollection's own raw-response return.
+export const verifyDeckScan = (instanceId, cardId, quantity = 1) =>
+  api.post(`/decks/instances/${instanceId}/scans/${encodeURIComponent(cardId)}/verify`, null, { params: { quantity } })
+
+// Same shape as undoLastScan, but reverses a verifyDeckScan call — there's
+// no CollectionItem side to a verify-only scan, so this only ever touches
+// deck progress.
+export const undoVerifyDeckScan = (instanceId, cardId, traceId) =>
+  api.post(`/decks/instances/${instanceId}/scans/${encodeURIComponent(cardId)}/undo-verify`, null, {
+    params: traceId ? { trace_id: traceId } : undefined,
+  }).then(r => r.data)
+
 // Social
 export const getLeaderboard = (params = {}) => api.get('/social/leaderboard', { params })
 export const compareUsers = (userId, params = {}) => api.get(`/social/compare/${userId}`, { params })

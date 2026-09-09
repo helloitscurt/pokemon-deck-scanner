@@ -20,7 +20,7 @@ import { act, cleanup, render, screen, waitFor } from '@testing-library/react'
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import DeckDetail from './DeckDetail'
-import { addToCollection, getDeckInstance } from '../api/client'
+import { addToCollection, getDeckInstance, updateDeckInstanceSettings, verifyDeckScan, undoVerifyDeckScan } from '../api/client'
 import toast from 'react-hot-toast'
 
 vi.mock('react-router-dom', () => ({
@@ -42,6 +42,10 @@ vi.mock('../api/client', () => ({
   deleteDeckInstance: vi.fn(),
   addToCollection: vi.fn(),
   undoLastScan: vi.fn(),
+  undoLastScanCollectionOnly: vi.fn(),
+  updateDeckInstanceSettings: vi.fn(),
+  verifyDeckScan: vi.fn(),
+  undoVerifyDeckScan: vi.fn(),
 }))
 
 vi.mock('react-hot-toast', () => {
@@ -56,9 +60,11 @@ vi.mock('react-hot-toast', () => {
 // onConfirm DeckDetail passes it so each test can call it directly with
 // the exact {isAutoSave, traceId} combination it's covering.
 let capturedOnConfirm = null
+let capturedOnDecrement = null
 vi.mock('../components/DeckCardScanner', () => ({
   default: (props) => {
     capturedOnConfirm = props.onConfirm
+    capturedOnDecrement = props.onDecrement
     return null
   },
 }))
@@ -86,6 +92,7 @@ async function renderLoaded() {
 describe('DeckDetail scan confirmation toasts', () => {
   beforeEach(() => {
     capturedOnConfirm = null
+    capturedOnDecrement = null
     getDeckInstance.mockResolvedValue({
       name: 'Test Deck', progress: 50, total_count: 2, scanned_count: 1,
       is_complete: false, cards: [],
@@ -194,5 +201,85 @@ describe('DeckDetail scan confirmation toasts', () => {
     })
 
     expect(addToCollection).toHaveBeenCalledWith({ card_id: 'p1', quantity: 1, deck_instance_id: 3 })
+  })
+})
+
+// docs/plans/scanner-ux-todos.md item 11 — the persistent per-deck toggle
+// for whether a scan adds to the general collection or only verifies/tracks
+// deck progress. addToCollection/undoLastScan/undoLastScanCollectionOnly
+// cover the (default) collection-mode routing above; these cover the
+// verify-only branch and the toggle control itself.
+describe('DeckDetail verify-only scanning (item 11)', () => {
+  beforeEach(() => {
+    capturedOnConfirm = null
+    capturedOnDecrement = null
+  })
+
+  afterEach(() => {
+    cleanup()
+    vi.clearAllMocks()
+  })
+
+  it('persists a toggle change to false', async () => {
+    getDeckInstance.mockResolvedValue({
+      name: 'Test Deck', progress: 50, total_count: 2, scanned_count: 1,
+      is_complete: false, cards: [], add_to_collection: true,
+    })
+    updateDeckInstanceSettings.mockResolvedValue({})
+    await renderLoaded()
+
+    await act(async () => {
+      screen.getByLabelText('decks.detail.addToCollectionToggle').click()
+    })
+
+    expect(updateDeckInstanceSettings).toHaveBeenCalledWith('3', { add_to_collection: false })
+  })
+
+  it('routes a scan through verifyDeckScan instead of addToCollection when add_to_collection is false', async () => {
+    getDeckInstance.mockResolvedValue({
+      name: 'Test Deck', progress: 50, total_count: 2, scanned_count: 1,
+      is_complete: false, cards: [], add_to_collection: false,
+    })
+    verifyDeckScan.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
+    await renderLoaded()
+
+    await act(async () => {
+      await capturedOnConfirm({ id: 'p1', name: 'Pikachu' }, { isAutoSave: true, traceId: null })
+    })
+
+    expect(verifyDeckScan).toHaveBeenCalledWith(3, 'p1', 1)
+    expect(addToCollection).not.toHaveBeenCalled()
+  })
+
+  it('still calls addToCollection when add_to_collection is true (or unset)', async () => {
+    getDeckInstance.mockResolvedValue({
+      name: 'Test Deck', progress: 50, total_count: 2, scanned_count: 1,
+      is_complete: false, cards: [],
+    })
+    addToCollection.mockResolvedValue({ data: { card_id: 'p1', deck_scan_status: 'counted' } })
+    await renderLoaded()
+
+    await act(async () => {
+      await capturedOnConfirm({ id: 'p1', name: 'Pikachu' }, { isAutoSave: true, traceId: null })
+    })
+
+    expect(addToCollection).toHaveBeenCalledWith({ card_id: 'p1', quantity: 1, deck_instance_id: 3 })
+    expect(verifyDeckScan).not.toHaveBeenCalled()
+  })
+
+  it('routes a decrement through undoVerifyDeckScan regardless of deckScanStatus when add_to_collection is false', async () => {
+    getDeckInstance.mockResolvedValue({
+      name: 'Test Deck', progress: 50, total_count: 2, scanned_count: 1,
+      is_complete: false, cards: [], add_to_collection: false,
+    })
+    undoVerifyDeckScan.mockResolvedValue({})
+    await renderLoaded()
+    await waitFor(() => expect(capturedOnDecrement).toBeInstanceOf(Function))
+
+    await act(async () => {
+      await capturedOnDecrement('p1', null, 'counted')
+    })
+
+    expect(undoVerifyDeckScan).toHaveBeenCalledWith('3', 'p1', null)
   })
 })

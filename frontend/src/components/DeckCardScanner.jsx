@@ -1598,15 +1598,29 @@ export default function DeckCardScanner({ isOpen, onClose, onConfirm, onDecremen
         if (highConfidenceStreakRef.current >= REQUIRED_HIGH_CONFIDENCE_PASSES) {
           // Skip (not queue — a stale number-crop isn't worth acting on
           // once a slot frees up later) when the concurrency cap is
-          // already full, or scanning is paused (docs/plans/
+          // already full, scanning is paused (docs/plans/
           // scanner-pause-speed-details.md item 10 — same "suppress only
           // the auto-trigger" rule Path A's own submitCapture guard
-          // follows). The streak is left intact rather than reset in
-          // either case, so the very next pass — still only
-          // ~NUMBER_OCR_INTERVAL_MS away — retries once a slot has
-          // hopefully opened (or scanning resumes), instead of losing
-          // progress toward the auto-trigger threshold.
-          if (activeJobsRef.current.length < MAX_CONCURRENT_JOBS && !scanningPausedRef.current) {
+          // follows), or this exact card is one Path A already captured
+          // (item 12, scanner-ux-todos.md — quadInfo.quad lives in the
+          // same detection-frame coordinate space capturedRegionsRef's own
+          // entries do, both derived from the same Path A tick's
+          // latestQuadRef, so this reuses Path A's own isAwaitingRemoval
+          // check below rather than a separate mechanism; without it, a
+          // card Path A already captured — and is still holding a
+          // pending/resolved region for — could independently trigger Path
+          // B's own zoom-match too, saving the same physical card twice.
+          // No quad at all, Path B's own main case (zoomed in past the
+          // card's edges), has nothing to check against and is
+          // unaffected). The streak is left intact rather than reset in
+          // any of these cases, so the very next pass — still only
+          // ~NUMBER_OCR_INTERVAL_MS away — retries once the block has
+          // hopefully cleared, instead of losing progress toward the
+          // auto-trigger threshold.
+          const alreadyCapturedByPathA = quadInfo && capturedRegionsRef.current.some((region) => (
+            quadsAreStable(region.quad, quadInfo.quad, quadInfo.detectionWidth, quadInfo.detectionHeight, STABILITY_TOLERANCE_PROPORTION)
+          ))
+          if (activeJobsRef.current.length < MAX_CONCURRENT_JOBS && !scanningPausedRef.current && !alreadyCapturedByPathA) {
             highConfidenceStreakRef.current = 0
             const snapshot = document.createElement('canvas')
             snapshot.width = cropCanvas.width
