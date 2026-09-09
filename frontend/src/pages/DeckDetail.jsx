@@ -248,6 +248,9 @@ export default function DeckDetail() {
 
   const progress = Math.min(100, Math.max(0, Number(data.progress) || 0))
   const hpClass = progress >= 66 ? 'healthy' : progress >= 33 ? 'medium' : 'low'
+  // undefined (a deck instance predating item 11) reads as "on", matching
+  // the backend column's own DEFAULT TRUE.
+  const isAddingToCollection = data.add_to_collection !== false
   const cards = data.cards || []
   const visibleCards = selectVisibleDeckCards(cards, filter, sortBy)
   // Tab counts are physical-card sums, matching the header's "X / 60" —
@@ -297,16 +300,16 @@ export default function DeckDetail() {
           </div>
           <button
             type="button"
-            onClick={() => settingsMutation.mutate(!(data.add_to_collection !== false))}
-            aria-pressed={data.add_to_collection !== false}
+            onClick={() => settingsMutation.mutate(!isAddingToCollection)}
+            aria-pressed={isAddingToCollection}
             aria-label={t('decks.detail.addToCollectionToggle')}
             className={`relative w-11 h-6 flex-shrink-0 rounded-full transition-colors duration-200 ${
-              data.add_to_collection !== false ? 'bg-brand-red' : 'bg-bg-elevated border border-border'
+              isAddingToCollection ? 'bg-brand-red' : 'bg-bg-elevated border border-border'
             }`}
           >
             <span
               className={`absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform duration-200 ${
-                data.add_to_collection !== false ? 'translate-x-5' : 'translate-x-0'
+                isAddingToCollection ? 'translate-x-5' : 'translate-x-0'
               }`}
             />
           </button>
